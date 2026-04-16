@@ -1,0 +1,20 @@
+{
+  "name": "ai-trading-company-os",
+  "private": true,
+  "version": "0.3.0",
+  "workspaces": [
+    "apps/web",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:web": "npm run dev --workspace apps/web",
+    "dev:api": "cd apps/api && uvicorn app.main:app --reload --port 8000",
+    "db:up": "docker compose -f infrastructure/docker/docker-compose.yml up -d postgres",
+    "db:down": "docker compose -f infrastructure/docker/docker-compose.yml down",
+    "db:migrate": "cd apps/api && alembic upgrade head",
+    "db:seed": "cd apps/api && python seed.py",
+    "smoke:phase4": "python apps/api/smoke_phase4_patch.py",
+    "smoke:phase5": "python apps/api/smoke_phase5_memory.py",
+    "smoke:phase6": "python apps/api/smoke_phase6_hardening.py"
+  }
+}

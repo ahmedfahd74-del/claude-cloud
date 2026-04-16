@@ -1,0 +1,5 @@
+{
+  "paperTradingOnly": true,
+  "liveExecutionEnabled": false,
+  "defaultCurrency": "USD"
+}
