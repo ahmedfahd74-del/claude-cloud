@@ -2,13 +2,14 @@ import { Card, ErrorState } from "@trading-os/ui";
 
 import { loadCandidateDetail } from "../../../lib/api";
 
-export default async function CandidateDetailPage({ params }: { params: { candidateId: string } }) {
-  const { detail, degraded } = await loadCandidateDetail(params.candidateId);
+export default async function CandidateDetailPage({ params }: { params: Promise<{ candidateId: string }> }) {
+  const { candidateId } = await params;
+  const { detail, degraded } = await loadCandidateDetail(candidateId);
   const candidate = detail.candidate;
 
   return (
     <main style={{ fontFamily: "sans-serif", padding: "2rem", display: "grid", gap: "1rem" }}>
-      <h1>Candidate Detail: {params.candidateId}</h1>
+      <h1>Candidate Detail: {candidateId}</h1>
       {degraded && <ErrorState title="Degraded Mode" message="Showing fallback candidate detail data." />}
 
       <Card title="Context Summary">

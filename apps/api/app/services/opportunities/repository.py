@@ -195,7 +195,26 @@ class OpportunityRepository:
             pass
 
     def get_challenge(self, candidate_id: str) -> dict | None:
-        return self._memory_challenges.get(candidate_id)
+        if candidate_id in self._memory_challenges:
+            return self._memory_challenges[candidate_id]
+        SessionLocal, _, ChallengeReport, _, _, _ = self._get_db_handles()
+        if SessionLocal:
+            try:
+                with SessionLocal() as session:
+                    row = session.query(ChallengeReport).filter(ChallengeReport.candidate_ref == candidate_id).first()
+                    if row:
+                        result = {
+                            "candidate_id": candidate_id,
+                            "decision": row.decision,
+                            "confidence": float(row.confidence),
+                            "challenge_summary": row.challenge_summary,
+                            "risk_flags": [f for f in row.risk_flags.split(", ") if f],
+                        }
+                        self._memory_challenges[candidate_id] = result
+                        return result
+            except Exception:
+                pass
+        return None
 
     def save_review(self, output: RiskReviewOutput) -> None:
         payload = {
@@ -225,4 +244,24 @@ class OpportunityRepository:
             pass
 
     def get_review(self, candidate_id: str) -> dict | None:
-        return self._memory_reviews.get(candidate_id)
+        if candidate_id in self._memory_reviews:
+            return self._memory_reviews[candidate_id]
+        SessionLocal, _, _, RiskReview, _, _ = self._get_db_handles()
+        if SessionLocal:
+            try:
+                with SessionLocal() as session:
+                    row = session.query(RiskReview).filter(RiskReview.candidate_ref == candidate_id).first()
+                    if row:
+                        result = {
+                            "candidate_id": candidate_id,
+                            "outcome": row.outcome,
+                            "reason": row.reason,
+                            "size_adjustment": float(row.size_adjustment),
+                            "paper_trading_only": True,
+                            "live_execution_enabled": False,
+                        }
+                        self._memory_reviews[candidate_id] = result
+                        return result
+            except Exception:
+                pass
+        return None
