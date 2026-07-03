@@ -1136,6 +1136,12 @@ minRR         = input.float(2.0, "Min Reward:Risk", minval = 1.0, maxval = 10.0,
 minScoreT     = input.int(60, "Min S/R Confidence", minval = 0, maxval = 100, group = grpTrade)
 accRiskPct    = input.float(1.0, "Account Risk %", minval = 0.1, maxval = 10.0, step = 0.1, group = grpTrade)
 
+grpAlert        = "Alert Engine"
+alertTradeReady = input.bool(true,  "Alert: validated trade plan ready", group = grpAlert,
+     tooltip = "Fires when the full validation gate flips to READY. Create a TradingView alert on this indicator with 'Any alert() function call'.")
+alertLvlBreak   = input.bool(false, "Alert: S/R level break", group = grpAlert)
+alertSweep      = input.bool(false, "Alert: liquidity sweep at S/R", group = grpAlert)
+
 // Collect un-broken levels strictly above (dir 1) or below (dir -1) a price,
 // sorted nearest-first. Reuses the level book — no new detection.
 f_gather(float px, int dir) =>
@@ -1184,46 +1190,70 @@ f_trow(int r, string k, string v, color vc) =>
 f_diag(int r, string name, bool pass, string detail) =>
     f_trow(r, name, (pass ? "PASS" : "FAIL") + (detail == "" ? "" : "  " + detail), pass ? color.lime : color.red)
 
+// --- Plan computation (pure decision layer — runs every bar, no drawing) ----
+//     One computation feeds the chart render, Alert Engine, Scanner and the
+//     JSON export. Nothing downstream recomputes any of it.
+dirLong  = bias == "LONG"
+dirShort = bias == "SHORT"
+dirSign  = dirLong ? 1 : -1
+dirProb  = dirLong ? bullProb : dirShort ? bearProb : 0.0
+srConf   = dirLong ? scoreSup : dirShort ? scoreRes : 0.0
+// Entry: nearest opposing structure (buy support / sell resistance).
+sups  = f_gather(close, -1)
+ress  = f_gather(close, 1)
+entry = dirLong ? (sups.size() > 0 ? sups.get(0) : na) : dirShort ? (ress.size() > 0 ? ress.get(0) : na) : na
+// Structural stop: beyond the next level past entry, ATR-buffered, bounded to
+// [0.5 .. 3.0] ATR from entry — no degenerate micro-risk, no unrealistic
+// far-structure stop (beyond 3 ATR the structural premise is stale anyway).
+float stop = na
+if dirLong and not na(entry)
+    s0 = (sups.size() > 1 ? sups.get(1) : entry - atrFast * 1.5) - atrFast * 0.25
+    stop := f_clamp(s0, entry - atrFast * 3.0, entry - atrFast * 0.5)
+if dirShort and not na(entry)
+    s0 = (ress.size() > 1 ? ress.get(1) : entry + atrFast * 1.5) + atrFast * 0.25
+    stop := f_clamp(s0, entry + atrFast * 0.5, entry + atrFast * 3.0)
+// Targets: next levels in trade direction, ATR-expansion fallback.
+tgt = na(entry) ? array.new<float>() : (dirLong ? f_gather(entry, 1) : f_gather(entry, -1))
+tp1 = tgt.size() > 0 ? tgt.get(0) : na
+tp2 = tgt.size() > 1 ? tgt.get(1) : na
+tp3 = tgt.size() > 2 ? tgt.get(2) : na
+tp1 := na(tp1) and not na(entry) ? entry + dirSign * atrFast * 1.5 : tp1
+tp2 := na(tp2) and not na(tp1)   ? tp1   + dirSign * atrFast * 1.5 : tp2
+tp3 := na(tp3) and not na(tp2)   ? tp2   + dirSign * atrFast * 1.5 : tp3
+finalTP = tp3
+risk    = na(entry) or na(stop)    ? na : math.abs(entry - stop)
+reward  = na(entry) or na(finalTP) ? na : math.abs(finalTP - entry)
+rrVal   = na(risk) or risk == 0 ? 0.0 : reward / risk
+stopPct = na(entry) or entry == 0 or na(stop) ? na : math.abs(entry - stop) / entry * 100
+posPct  = na(stopPct) or stopPct == 0 ? na : accRiskPct / stopPct * 100
+// Validation gate — never force a trade.
+qOK      = tradeQuality == "Excellent" or tradeQuality == "High Quality"
+probOK   = dirProb >= minProbT
+alignOK  = dirLong ? htfAlign > 0 : dirShort ? htfAlign < 0 : false
+srOK     = srConf >= minScoreT
+// "Reversal Risk" only blocks trades AGAINST the expected reversal. A reversal
+// back into the HTF trend at our own entry structure IS the setup, not a veto.
+revFavors = dirLong ? nearSup and htfBull : dirShort ? nearRes and htfBear : false
+structOK  = marketState != "Reversal Risk" or revFavors
+lvlsOK   = not na(entry) and not na(stop) and not na(tp1)
+rrOK     = rrVal >= minRR
+valid    = (dirLong or dirShort) and qOK and probOK and alignOK and srOK and structOK and lvlsOK and rrOK
+
+// --- Alert Engine (confirmed bars only — consumes the same plan/state) ------
+if barstate.isconfirmed
+    if alertTradeReady and valid and not valid[1]
+        alert("IA-SR " + syminfo.ticker + " " + timeframe.period + " · " + bias + " plan ready · entry " + f_px(entry) + " · SL " + f_px(stop) + " · TP1 " + f_px(tp1) + " · R:R " + str.tostring(rrVal, "#.#") + " · " + tradeQuality, alert.freq_once_per_bar)
+    if alertLvlBreak and brkEvents > 0
+        alert("IA-SR " + syminfo.ticker + " " + timeframe.period + " · S/R level break (" + str.tostring(brkEvents) + ")", alert.freq_once_per_bar)
+    if alertSweep and sweepBar
+        alert("IA-SR " + syminfo.ticker + " " + timeframe.period + " · liquidity sweep at " + (sweepRes ? "resistance" : "support"), alert.freq_once_per_bar)
+
+// Static hooks for the Create Alert dialog (no webhook payload needed).
+alertcondition(valid and not valid[1], "IA-SR: Trade Plan Ready", "IA-SR validated institutional trade plan available")
+alertcondition(sweepBar, "IA-SR: Liquidity Sweep", "IA-SR liquidity sweep at S/R level")
+
 if barstate.islast and showTradePlan
-    dirLong  = bias == "LONG"
-    dirShort = bias == "SHORT"
-    dirSign  = dirLong ? 1 : -1
-    dirProb  = dirLong ? bullProb : dirShort ? bearProb : 0.0
-    srConf   = dirLong ? scoreSup : dirShort ? scoreRes : 0.0
-    // Entry: nearest opposing structure (buy support / sell resistance).
-    sups = f_gather(close, -1)
-    ress = f_gather(close, 1)
-    entry = dirLong ? (sups.size() > 0 ? sups.get(0) : na) : dirShort ? (ress.size() > 0 ? ress.get(0) : na) : na
-    // Structural stop: beyond the next level past entry, ATR-buffered.
-    float stop = na
-    if dirLong and not na(entry)
-        stop := (sups.size() > 1 ? sups.get(1) : entry - atrFast * 1.5) - atrFast * 0.25
-    if dirShort and not na(entry)
-        stop := (ress.size() > 1 ? ress.get(1) : entry + atrFast * 1.5) + atrFast * 0.25
-    // Targets: next levels in trade direction, ATR-expansion fallback.
-    tgt = na(entry) ? array.new<float>() : (dirLong ? f_gather(entry, 1) : f_gather(entry, -1))
-    tp1 = tgt.size() > 0 ? tgt.get(0) : na
-    tp2 = tgt.size() > 1 ? tgt.get(1) : na
-    tp3 = tgt.size() > 2 ? tgt.get(2) : na
-    tp1 := na(tp1) and not na(entry) ? entry + dirSign * atrFast * 1.5 : tp1
-    tp2 := na(tp2) and not na(tp1)   ? tp1   + dirSign * atrFast * 1.5 : tp2
-    tp3 := na(tp3) and not na(tp2)   ? tp2   + dirSign * atrFast * 1.5 : tp3
-    finalTP = tp3
-    risk    = na(entry) or na(stop)    ? na : math.abs(entry - stop)
-    reward  = na(entry) or na(finalTP) ? na : math.abs(finalTP - entry)
-    rrVal   = na(risk) or risk == 0 ? 0.0 : reward / risk
-    stopPct = na(entry) or entry == 0 or na(stop) ? na : math.abs(entry - stop) / entry * 100
-    posPct  = na(stopPct) or stopPct == 0 ? na : accRiskPct / stopPct * 100
-    // Validation gate — never force a trade.
-    qOK      = tradeQuality == "Excellent" or tradeQuality == "High Quality"
-    probOK   = dirProb >= minProbT
-    alignOK  = dirLong ? htfAlign > 0 : dirShort ? htfAlign < 0 : false
-    srOK     = srConf >= minScoreT
-    structOK = marketState != "Reversal Risk"
-    lvlsOK   = not na(entry) and not na(stop) and not na(tp1)
-    rrOK     = rrVal >= minRR
-    valid    = (dirLong or dirShort) and qOK and probOK and alignOK and srOK and structOK and lvlsOK and rrOK
-    // --- Chart plan -----------------------------------------------------------
+    // --- Chart plan (visualization only — consumes the plan globals) ---------
     x1 = bar_index
     x2 = bar_index + 15
     if na(tEntry)
@@ -1271,8 +1301,9 @@ if barstate.islast and showTradePlan
     table.cell(tPanel, 1, 15, valid ? mgmt : "—", text_color = color.silver, text_size = size.tiny, text_halign = text.align_right)
     table.cell(tPanel, 0, 16, "Invalid if", text_color = color.new(color.gray, 0), text_size = size.tiny, text_halign = text.align_left)
     table.cell(tPanel, 1, 16, valid ? inval : "—", text_color = color.silver, text_size = size.tiny, text_halign = text.align_right)
-    // --- Validation diagnostic: why the trade passed / was rejected ----------
-    reason = not (dirLong or dirShort) ? "No directional bias" : not qOK ? "Quality below High" : not probOK ? "Prob " + str.tostring(math.round(dirProb)) + "% < " + str.tostring(minProbT) + "%" : not alignOK ? "HTF not aligned" : not structOK ? "Reversal-risk structure" : not srOK ? "S/R conf " + str.tostring(math.round(srConf)) + " < " + str.tostring(minScoreT) : not lvlsOK ? "Entry/Stop/TP unavailable" : not rrOK ? "R:R " + str.tostring(rrVal, "#.#") + " < " + str.tostring(minRR, "#.#") : "All conditions met"
+    // --- Validation diagnostic: EVERY failed condition, not just the first ---
+    fails = (qOK ? "" : "quality=" + tradeQuality + " · ") + (probOK ? "" : "prob " + str.tostring(math.round(dirProb)) + "<" + str.tostring(minProbT) + " · ") + (alignOK ? "" : "HTF align " + str.tostring(htfAlign) + " · ") + (structOK ? "" : "reversal-risk · ") + (srOK ? "" : "S/R " + str.tostring(math.round(srConf)) + "<" + str.tostring(minScoreT) + " · ") + (lvlsOK ? "" : "no levels · ") + (rrOK ? "" : "R:R " + str.tostring(rrVal, "#.#") + "<" + str.tostring(minRR, "#.#") + " · ")
+    reason = valid ? "All conditions met" : not (dirLong or dirShort) ? "No directional bias" : "FAIL: " + str.substring(fails, 0, math.max(str.length(fails) - 3, 0))
     if showDiag
         f_trow(17, "── DIAGNOSTIC ──", "", color.gray)
         f_diag(18, "Direction",    dirLong or dirShort, dirLong ? "LONG" : dirShort ? "SHORT" : "none")
@@ -1302,9 +1333,8 @@ var table scanT = table.new(position.top_left, 2, 4, border_width = 1,
      frame_color = color.new(color.gray, 60), frame_width = 1)
 
 if barstate.islast and showScan
-    dirProbG = bias == "LONG" ? bullProb : bias == "SHORT" ? bearProb : 0.0
-    ready    = (tradeQuality == "Excellent" or tradeQuality == "High Quality") and bias != "NEUTRAL" and dirProbG >= minProbT
-    chartTxt = ready ? bias + "  " + str.tostring(math.round(dirProbG)) + "%  " + tradeQuality : "No Confirmed Setup"
+    ready    = qOK and bias != "NEUTRAL" and dirProb >= minProbT
+    chartTxt = valid ? bias + "  " + str.tostring(math.round(dirProb)) + "%  READY" : ready ? bias + "  " + str.tostring(math.round(dirProb)) + "%  " + tradeQuality : "No Confirmed Setup"
     chartCol = ready ? (bias == "LONG" ? color.lime : color.red) : color.gray
     table.cell(scanT, 0, 0, "INSTITUTIONAL SCANNER", text_color = color.white, text_size = size.small, text_halign = text.align_left)
     table.cell(scanT, 1, 0, "", text_color = color.white)
@@ -1326,5 +1356,5 @@ enableExport = input.bool(false, "Emit JSON decision alert (per bar close)", gro
      tooltip = "Sends the canonical decision state to a webhook for the external Python intelligence layer. See sr_engine_ARCHITECTURE_V2.md.")
 
 if enableExport and barstate.isconfirmed
-    payload = '{"v":1,"sym":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","state":"' + marketState + '","bias":"' + bias + '","bull":' + str.tostring(math.round(bullProb)) + ',"bear":' + str.tostring(math.round(bearProb)) + ',"quality":"' + tradeQuality + '","htfAlign":' + str.tostring(htfAlign) + ',"supConf":' + str.tostring(math.round(scoreSup)) + ',"resConf":' + str.tostring(math.round(scoreRes)) + '}'
+    payload = '{"v":1,"sym":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","state":"' + marketState + '","bias":"' + bias + '","bull":' + str.tostring(math.round(bullProb)) + ',"bear":' + str.tostring(math.round(bearProb)) + ',"quality":"' + tradeQuality + '","htfAlign":' + str.tostring(htfAlign) + ',"supConf":' + str.tostring(math.round(scoreSup)) + ',"resConf":' + str.tostring(math.round(scoreRes)) + ',"regime":"' + regimeTxt + '","valid":' + (valid ? 'true' : 'false') + ',"entry":' + f_jnum(entry) + ',"stop":' + f_jnum(stop) + ',"tp1":' + f_jnum(tp1) + ',"tp2":' + f_jnum(tp2) + ',"tp3":' + f_jnum(tp3) + ',"rr":' + str.tostring(rrVal, "#.##") + ',"power":' + f_jnum(powerPrice) + ',"atr":' + f_jnum(atrFast) + '}'
     alert(payload, alert.freq_once_per_bar_close)
