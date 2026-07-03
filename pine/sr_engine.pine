@@ -30,10 +30,41 @@ indicator("Institutional Adaptive S/R Engine", "IA-SR", overlay = true,
 // #############################################################################
 // # SECTION 1 — INPUTS
 // #############################################################################
+grpMode = "Engine Mode"
+engineMode = input.string("Balanced", "Market Sensitivity Mode", group = grpMode,
+     options = ["Conservative", "Balanced", "Aggressive", "Ultra Aggressive"],
+     tooltip = "One switch that retunes the whole engine: probability thresholds, S/R sensitivity, liquidity sensitivity and confirmation strictness. Conservative = fewer/higher-accuracy signals; Ultra Aggressive = scalping bias.")
+
 grpAdapt = "Adaptive Engine (auto — leave default)"
 sensBias = input.float(1.0, "Sensitivity Bias", minval = 0.5, maxval = 2.0, step = 0.1,
      group = grpAdapt,
      tooltip = "Global nudge on adaptive sensitivity. 1.0 = fully automatic. Only touch if you want the engine broadly tighter/looser.")
+
+grpSR2 = "S/R Engine"
+lvlSens    = input.float(1.0, "Level Sensitivity ×",              minval = 0.5,  maxval = 2.0, step = 0.1,  group = grpSR2, tooltip = "Higher = shorter adaptive pivot legs = more levels.")
+touchWMult = input.float(1.0, "Touch Weight ×",                   minval = 0.2,  maxval = 3.0, step = 0.1,  group = grpSR2)
+reactWMult = input.float(1.0, "Reaction Weight ×",                minval = 0.2,  maxval = 3.0, step = 0.1,  group = grpSR2)
+brkConf    = input.float(1.0, "Break Confirmation Strength ×",    minval = 0.5,  maxval = 2.5, step = 0.1,  group = grpSR2, tooltip = "Higher = a close must travel further beyond a level to count as a break.")
+zoneScale  = input.float(1.0, "Zone Width ×",                     minval = 0.3,  maxval = 3.0, step = 0.1,  group = grpSR2)
+decaySpd   = input.float(1.0, "Time Decay Speed ×",               minval = 0.25, maxval = 4.0, step = 0.25, group = grpSR2, tooltip = "Higher = untouched levels lose freshness faster.")
+htfInfl    = input.float(1.0, "HTF Confluence Influence ×",       minval = 0.3,  maxval = 2.5, step = 0.1,  group = grpSR2)
+ltfNoise   = input.float(1.0, "LTF Noise Filter ×",               minval = 0.5,  maxval = 2.0, step = 0.1,  group = grpSR2, tooltip = "Higher = 15m/5m levels carry less weight in scoring and confluence.")
+
+grpProb2 = "Probability Engine"
+wStruct = input.float(1.0, "Trend / Structure Weight ×",  minval = 0.0, maxval = 2.0, step = 0.1, group = grpProb2)
+wSRW    = input.float(1.0, "S/R Weight ×",                minval = 0.0, maxval = 2.0, step = 0.1, group = grpProb2)
+wLiq    = input.float(1.0, "Liquidity / SMC Weight ×",    minval = 0.0, maxval = 2.0, step = 0.1, group = grpProb2)
+wMom    = input.float(1.0, "Momentum Weight ×",           minval = 0.0, maxval = 2.0, step = 0.1, group = grpProb2)
+volAdjF = input.float(0.5, "Volatility Dampening",        minval = 0.0, maxval = 1.0, step = 0.1, group = grpProb2, tooltip = "Shrinks probability edge when volatility expands beyond normal (uncertainty discount).")
+
+// --- Mode-derived tuning (single source; every engine reads these) ----------
+modeIdx   = engineMode == "Conservative" ? 0 : engineMode == "Balanced" ? 1 : engineMode == "Aggressive" ? 2 : 3
+mProbAdj  = modeIdx == 0 ? 5.0  : modeIdx == 1 ? 0.0 : modeIdx == 2 ? -5.0  : -10.0
+mScoreAdj = modeIdx == 0 ? 10.0 : modeIdx == 1 ? 0.0 : modeIdx == 2 ? -10.0 : -20.0
+mQualAdj  = modeIdx == 0 ? 8.0  : modeIdx == 1 ? 0.0 : modeIdx == 2 ? -8.0  : -14.0
+mSens     = modeIdx == 0 ? 0.85 : modeIdx == 1 ? 1.0 : modeIdx == 2 ? 1.2   : 1.5
+mWick     = modeIdx == 0 ? 1.0  : modeIdx == 1 ? 0.8 : modeIdx == 2 ? 0.7   : 0.6
+effSens   = sensBias * mSens * lvlSens
 
 grpTF = "Higher-Timeframe Sources"
 useMN = input.bool(false, "Monthly", group = grpTF, inline = "tf")
@@ -75,8 +106,9 @@ colPower      = input.color(color.new(#ffd600, 0), "Power Line Color", group = g
 powerWidth    = input.int(2, "Power Line Width", minval = 1, maxval = 6, group = grpPower)
 
 grpSMC = "Liquidity / SMC"
-showSMCZones = input.bool(false, "Draw FVG + Order-Block Zones", group = grpSMC,
-     tooltip = "Off (default) keeps the chart clean — SMC still feeds the confidence score. On draws unfilled FVGs and order blocks as faint boxes.")
+showFVGZones = input.bool(false, "Draw FVG (imbalance) Zones", group = grpSMC,
+     tooltip = "Off (default) keeps the chart clean — SMC still feeds the confidence score.")
+showOBZones  = input.bool(false, "Draw Order-Block Zones", group = grpSMC)
 colFVG       = input.color(color.new(#ffb300, 78), "FVG (imbalance) Zone", group = grpSMC)
 colOBbull    = input.color(color.new(#26a69a, 80), "Bullish Order Block",  group = grpSMC)
 colOBbear    = input.color(color.new(#ef5350, 80), "Bearish Order Block",  group = grpSMC)
@@ -86,6 +118,27 @@ showPanel = input.bool(true, "Show Market-Structure Panel", group = grpUI)
 showLabel = input.bool(true, "Show Level Labels (side · price · score%)", group = grpUI)
 panelPos  = input.string("Top Right", "Panel Position", group = grpUI,
      options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"])
+dashCompact   = input.bool(false, "Compact Dashboard", group = grpUI, tooltip = "Hides the adaptive/diagnostic detail rows; keeps regime, state, bias and scenario.")
+showEviPanel  = input.bool(true, "Dashboard: Evidence Rows", group = grpUI)
+showCalPanel  = input.bool(true, "Dashboard: Calibration Rows", group = grpUI)
+showPerfPanel = input.bool(true, "Dashboard: Performance Rows", group = grpUI)
+
+grpVizL = "Visibility — Levels"
+showStrongLvl = input.bool(true,  "Strong Levels (score ≥ 70)", group = grpVizL)
+showMedLvl    = input.bool(true,  "Medium Levels (50-69)",      group = grpVizL)
+showWeakLvl   = input.bool(true,  "Weak Levels (< 50)",         group = grpVizL)
+showBrokenLvl = input.bool(true,  "Broken Levels (Dim mode)",   group = grpVizL)
+showFlipMark  = input.bool(false, "Polarity Flip Markers",      group = grpVizL)
+
+grpVizS = "Visibility — Structure"
+showBOSMark   = input.bool(false, "BOS / CHOCH Markers",        group = grpVizS)
+showSweepMark = input.bool(false, "Liquidity Sweep Markers",    group = grpVizS)
+
+grpVizT = "Visibility — Trade Plan"
+showEntryLn = input.bool(true, "Entry Line", group = grpVizT)
+showSLLn    = input.bool(true, "Stop Line",  group = grpVizT)
+showTPLn    = input.bool(true, "TP Lines",   group = grpVizT)
+showRiskBx  = input.bool(true, "Risk / Reward Boxes", group = grpVizT)
 
 // #############################################################################
 // # SECTION 2 — UTILITY FUNCTIONS   (single-responsibility helpers)
@@ -187,10 +240,10 @@ regimeTxt  = newsDriven ? "NEWS / SHOCK"          :
 // cleaner swings). Calm/low-vol → shorter leg (more responsive). Custom swing
 // detector in Phase 2 will consume this as a *series* int (impossible with
 // ta.pivothigh — that's why we roll our own).
-adPivotLen = int(f_clamp(math.round(5 * volMult / sensBias), 3, MAXLEG))
+adPivotLen = int(f_clamp(math.round(5 * volMult / effSens), 3, MAXLEG))
 
 // Zone half-width multiplier (× HTF ATR). Wider in expansion, tighter in squeeze.
-adZoneMult = f_clamp(volMult * (isExpand ? 1.4 : isCompress ? 0.7 : 1.0) * sensBias, 0.4, 3.0)
+adZoneMult = f_clamp(volMult * (isExpand ? 1.4 : isCompress ? 0.7 : 1.0) * effSens, 0.4, 3.0)
 
 // ATR multiplier for break/rejection thresholds.
 adAtrMult  = f_clamp(1.0 * volMult, 0.6, 2.5)
@@ -255,7 +308,7 @@ f_htfPack() =>
     aF   = ta.atr(14)
     aS   = ta.atr(50)
     vM   = f_clamp(f_div(aF, aS), 0.5, 2.5)
-    leg  = int(f_clamp(math.round(5 * vM / sensBias), 3, MAXLEG))
+    leg  = int(f_clamp(math.round(5 * vM / effSens), 3, MAXLEG))
     [ph, pl] = f_swing(leg)
     // Hold last confirmed pivot + keep arrays of the last maxLvl pivots per side.
     // The arrays let the chart seed full HTF history on bar 1 regardless of how
@@ -363,6 +416,8 @@ var int gFalse  = 0
 var array<float> fbPrice = array.new<float>()
 var array<int>   fbDir   = array.new<int>()
 var array<int>   fbBar   = array.new<int>()
+// Polarity-flip markers (Keep mode), capped at 20 on-chart labels.
+var array<label> flipMarks = array.new<label>()
 var int   predTotal   = 0
 var int   predWins    = 0
 var float predProbSum = 0.0
@@ -389,12 +444,13 @@ type Store
     array<box>   bx          // its zone band (optional)
     array<label> lb          // its score label
     array<bool>  isRes       // resistance (true) vs support (false)
-    array<int>   touches     // # debounced reactions
+    array<float> touches     // GRAVITY-WEIGHTED touch mass (prox × rejection × momentum)
     array<float> reactSum    // sum of rejection strength (ATR units)
     array<float> volSum      // sum of volume ratio at touches
     array<int>   lastTouch   // bar_index of last activity (also birth)
     array<float> score       // current 0-100 confidence
     array<int>   sweeps       // # liquidity sweeps / stop-hunts at this level
+    array<int>   breaks       // break-quality mass: clean close-through=2, marginal/wick=1
     array<bool>  broken       // broken & kept (dash-dim mode) → frozen from scoring
     float        w           // timeframe importance weight
     float        atrTF       // this store's OWN timeframe ATR (updated each bar)
@@ -402,9 +458,9 @@ type Store
 
 f_newStore(float w, float tfMin) =>
     Store.new(array.new<float>(), array.new<line>(), array.new<box>(), array.new<label>(),
-         array.new<bool>(), array.new<int>(), array.new<float>(),
+         array.new<bool>(), array.new<float>(), array.new<float>(),
          array.new<float>(), array.new<int>(), array.new<float>(), array.new<int>(),
-         array.new<bool>(), w, 0.0, f_clamp(500.0 * tfMin / math.max(chartMin, 1.0), 500.0, 5000.0))
+         array.new<int>(), array.new<bool>(), w, 0.0, f_clamp(500.0 * tfMin / math.max(chartMin, 1.0), 500.0, 5000.0))
 
 // Remove a level from every parallel array at index i (keeps them in lockstep).
 f_removeAt(Store s, int i) =>
@@ -426,6 +482,7 @@ f_removeAt(Store s, int i) =>
     s.lastTouch.remove(i)
     s.score.remove(i)
     s.sweeps.remove(i)
+    s.breaks.remove(i)
     s.broken.remove(i)
 
 // Add a confirmed swing: skip if within adaptive merge distance; else draw a
@@ -455,12 +512,13 @@ f_addLevel(Store s, float p, bool isRes, color col, int wdt, string lstyle) =>
             s.bx.unshift(bx)
             s.lb.unshift(lb)
             s.isRes.unshift(isRes)
-            s.touches.unshift(0)
+            s.touches.unshift(0.0)
             s.reactSum.unshift(0.0)
             s.volSum.unshift(0.0)
             s.lastTouch.unshift(bar_index)
             s.score.unshift(50.0)
             s.sweeps.unshift(0)
+            s.breaks.unshift(0)
             s.broken.unshift(false)
             while s.price.size() > maxLvl
                 // Evict weakest, never the just-added level (index 0). Broken
@@ -495,7 +553,7 @@ f_updateBreaks(Store s) =>
                 lvl     = s.price.get(i)
                 // Break buffer honours the level's OWN timeframe scale — a 5m
                 // close cannot "break" a Weekly level on Weekly terms.
-                buf     = math.max(atrSafe * 0.25, s.atrTF * 0.15) * adAtrMult
+                buf     = math.max(atrSafe * 0.25, s.atrTF * 0.15) * adAtrMult * brkConf
                 crossed = math.abs(close - lvl) > buf and math.sign(close - lvl) != math.sign(close[1] - lvl)
                 if crossed
                     // Debounced stats: one event per level per 3 bars, and a
@@ -503,6 +561,8 @@ f_updateBreaks(Store s) =>
                     if barstate.isconfirmed and bar_index - s.lastTouch.get(i) >= 3
                         bc += 1
                         s.lastTouch.set(i, bar_index)
+                        // Break quality: decisive close-through (2) vs marginal/wick break (1).
+                        s.breaks.set(i, s.breaks.get(i) + (f_div(math.abs(close - lvl), atrFast) > 0.6 ? 2 : 1))
                         fbPrice.push(lvl)
                         fbDir.push(close > lvl ? 1 : -1)
                         fbBar.push(bar_index)
@@ -514,11 +574,19 @@ f_updateBreaks(Store s) =>
                         f_removeAt(s, i)
                     else if brkMode == "Keep"
                         // Institutional polarity flip: broken support acts as
-                        // resistance from now on, and vice versa.
+                        // resistance from now on, and vice versa. History kept.
+                        flipped = s.isRes.get(i) != (close < lvl)
                         s.isRes.set(i, close < lvl)
+                        if flipped and showFlipMark and barstate.isconfirmed
+                            fm = label.new(bar_index, lvl, "⇄", xloc = xloc.bar_index,
+                                 style = close < lvl ? label.style_label_up : label.style_label_down,
+                                 color = color.new(color.gray, 55), textcolor = color.white, size = size.tiny)
+                            flipMarks.unshift(fm)
+                            if flipMarks.size() > 20
+                                label.delete(flipMarks.pop())
                     else if brkMode == "Dim"
                         s.broken.set(i, true)
-                        line.set_color(s.ln.get(i), colBrk)
+                        line.set_color(s.ln.get(i), showBrokenLvl ? colBrk : color.new(colBrk, 100))
                         line.set_style(s.ln.get(i), line.style_dashed)
                         line.set_width(s.ln.get(i), 1)
                         lbo = s.lb.get(i)
@@ -541,26 +609,37 @@ f_nearCount(Store o, float p, float band) =>
                 c += 1
     c
 
-// Update per-level touch stats each bar (debounced by 3 bars).
+// TOUCH GRAVITY (v2 core mechanic): every interaction adds weighted touch
+// mass instead of a raw count. Weight = proximity (near-misses are partial
+// touches) × rejection strength (rejections matter more than touches) ×
+// momentum at interaction (defended against fast tape = stronger level).
+// Debounced by 3 bars per level.
 f_touchUpdate(Store s) =>
     hc = 0
+    momX = f_clamp(f_div(math.abs(close - close[3]), atrFast), 0.0, 2.0)
     if s.price.size() > 0
         for i = 0 to s.price.size() - 1
             lvl = s.price.get(i)
-            buf = atrSafe * adReactThr
-            if not s.broken.get(i) and high >= lvl - buf and low <= lvl + buf and (bar_index - s.lastTouch.get(i) >= 3)
-                res   = s.isRes.get(i)
-                rej   = res ? high - close : close - low
-                react = f_clamp(f_div(rej, atrFast), 0.0, 3.0)
-                s.touches.set(i, s.touches.get(i) + 1)
-                s.reactSum.set(i, s.reactSum.get(i) + react)
-                s.volSum.set(i, s.volSum.get(i) + volRatio)
-                s.lastTouch.set(i, bar_index)
-                if barstate.isconfirmed
-                    hc += 1
-                // Liquidity sweep / stop-hunt: wick pierces the level then closes back.
-                if (res ? high > lvl + buf and close < lvl : low < lvl - buf and close > lvl)
-                    s.sweeps.set(i, s.sweeps.get(i) + 1)
+            if not s.broken.get(i)
+                buf  = atrSafe * adReactThr
+                hit  = high >= lvl - buf and low <= lvl + buf
+                dist = math.min(math.abs(high - lvl), math.abs(low - lvl))
+                near = not hit and dist <= buf * 2.0
+                if (hit or near) and bar_index - s.lastTouch.get(i) >= 3
+                    res   = s.isRes.get(i)
+                    rej   = res ? high - close : close - low
+                    react = f_clamp(f_div(rej, atrFast), 0.0, 3.0)
+                    prox  = hit ? 1.0 : f_clamp(1.0 - (dist - buf) / buf, 0.2, 0.6)
+                    tw    = prox * (1.0 + 0.5 * f_clamp(react, 0.0, 1.0)) * (0.75 + 0.25 * momX) * touchWMult
+                    s.touches.set(i, s.touches.get(i) + tw)
+                    s.reactSum.set(i, s.reactSum.get(i) + react * (hit ? 1.0 : 0.4) * reactWMult)
+                    s.volSum.set(i, s.volSum.get(i) + volRatio * prox)
+                    s.lastTouch.set(i, bar_index)
+                    if barstate.isconfirmed and hit
+                        hc += 1
+                    // Liquidity sweep / stop-hunt: wick pierces, close rejects.
+                    if hit and (res ? high > lvl + buf and close < lvl : low < lvl - buf and close > lvl)
+                        s.sweeps.set(i, s.sweeps.get(i) + 1)
     hc
 
 // #############################################################################
@@ -594,7 +673,7 @@ if bullFVG or bearFVG
     fvgTop.unshift(tp)
     fvgBot.unshift(bt)
     fvgBull.unshift(bullFVG)
-    bx = showSMCZones ? box.new(bar_index - 3, tp, bar_index, bt, xloc = xloc.bar_index, border_width = 0, border_color = color.new(colFVG, 100), bgcolor = colFVG) : na
+    bx = showFVGZones ? box.new(bar_index - 3, tp, bar_index, bt, xloc = xloc.bar_index, border_width = 0, border_color = color.new(colFVG, 100), bgcolor = colFVG) : na
     fvgBx.unshift(bx)
     while fvgTop.size() > 30
         b = fvgBx.pop()
@@ -625,14 +704,14 @@ disp      = body1 > atrSafe * 1.2
 if disp and close[1] > open[1] and close[2] < open[2]
     obBullTop := high[2]
     obBullBot := low[2]
-    if showSMCZones
+    if showOBZones
         if not na(obBullBx)
             box.delete(obBullBx)
         obBullBx := box.new(bar_index - 2, obBullTop, bar_index + 3, obBullBot, xloc = xloc.bar_index, border_width = 0, border_color = color.new(colOBbull, 100), bgcolor = colOBbull)
 if disp and close[1] < open[1] and close[2] > open[2]
     obBearTop := high[2]
     obBearBot := low[2]
-    if showSMCZones
+    if showOBZones
         if not na(obBearBx)
             box.delete(obBearBx)
         obBearBx := box.new(bar_index - 2, obBearTop, bar_index + 3, obBearBot, xloc = xloc.bar_index, border_width = 0, border_color = color.new(colOBbear, 100), bgcolor = colOBbear)
@@ -701,19 +780,25 @@ f_scoreAndRender(Store s, color baseCol, Store o1, Store o2, Store o3, Store o4,
             eqCount  = f_sameSideNear(s, lvl, res, atrRef * 0.2, i)
             fTouch   = f_norm01(t, 3)
             fReact   = f_norm01(avgReact, 1.0)
-            fConf    = f_norm01(conf, 2.0)
+            fConf    = f_norm01(conf * htfInfl, 2.0)
             fTrend   = isTrending ? (aligned ? 1.0 : 0.35) : 0.6
             fVol     = f_norm01(avgVol, 1.0)
-            fFresh   = f_clamp(1.0 - recency / s.fhor, 0.0, 1.0)
+            fFresh   = f_clamp(1.0 - recency * decaySpd / s.fhor, 0.0, 1.0)
             fSweep   = f_norm01(s.sweeps.get(i), 2)
             fSMC     = f_clamp(f_smcBonus(lvl) + f_norm01(eqCount, 1) * 0.5, 0.0, 1.0)
             raw      = W_TOUCH * fTouch + W_REACT * fReact + W_CONF * fConf + W_TREND * fTrend + W_VOL * fVol + W_FRESH * fFresh + W_SWEEP * fSweep + W_SMC * fSMC
-            // Scale by timeframe importance (0.6..1.0 band) → final 0-100.
+            // Scale by timeframe importance (0.6..1.0 band) → final 0-100,
+            // then apply the lifecycle break penalty (clean breaks hurt most).
             sc       = f_clamp(100.0 * raw * (0.6 + 0.4 * s.w), 0.0, 100.0)
+            sc      *= f_clamp(1.0 - 0.12 * math.min(s.breaks.get(i), 3), 0.5, 1.0)
             s.score.set(i, sc)
             weak     = sc < adMinScore
-            // Touch-count filter: hide levels reacted to fewer than minTouches times.
-            show     = t >= minTouches
+            // Strength class drives VISIBILITY only — never recalculation.
+            clsStrong = sc >= 70
+            clsMed    = sc >= 50 and sc < 70
+            vizOK    = clsStrong ? showStrongLvl : clsMed ? showMedLvl : showWeakLvl
+            // Touch-mass filter: hide levels with insufficient weighted touches.
+            show     = t >= minTouches and vizOK
             // Lines keep their Phase-3 look; filter hides them via transparency.
             line.set_color(s.ln.get(i), show ? baseCol : color.new(baseCol, 100))
             // --- Zone band: width ∝ chart ATR × adaptive mult; visible fill ---
@@ -721,7 +806,7 @@ f_scoreAndRender(Store s, color baseCol, Store o1, Store o2, Store o3, Store o4,
             if not na(bxo)
                 if show
                     // Chart-ATR based → zone stays in proportion on EVERY timeframe.
-                    half = atrRef * zoneWidthK * adZoneMult
+                    half = atrRef * zoneWidthK * adZoneMult * zoneScale
                     box.set_top(bxo, lvl + half)
                     box.set_bottom(bxo, lvl - half)
                     ztr = int(f_clamp(84.0 - sc * 0.14, 70.0, 86.0))
@@ -747,8 +832,8 @@ var Store stW  = f_newStore(1.00, 10080)
 var Store stD  = f_newStore(0.80, 1440)
 var Store stH4 = f_newStore(0.60, 240)
 var Store stH1 = f_newStore(0.45, 60)
-var Store stM15 = f_newStore(0.35, 15)
-var Store stM5  = f_newStore(0.30, 5)
+var Store stM15 = f_newStore(0.35 * f_clamp(1.0 / ltfNoise, 0.5, 2.0), 15)
+var Store stM5  = f_newStore(0.30 * f_clamp(1.0 / ltfNoise, 0.5, 2.0), 5)
 
 // HTF-Only gating: a TF is shown only if it's >= the chart TF (when htfOnly on).
 f_eff(bool use, float tfMin) => use and (not htfOnly or tfMin >= chartMin)
@@ -892,9 +977,20 @@ distCond   = rangeEnv and pos > 0.60 and highLiq
 
 wickUp     = f_div(high - math.max(open, close), atrFast)
 wickDn     = f_div(math.min(open, close) - low, atrFast)
-sweepRes   = wickUp > 0.8 and nearRes
-sweepSup   = wickDn > 0.8 and nearSup
+sweepRes   = wickUp > mWick and nearRes
+sweepSup   = wickDn > mWick and nearSup
 sweepBar   = sweepRes or sweepSup
+
+// Structure shifts from the held 1H swings (same level data — no re-detection).
+bosUp   = not na(lastPhH1) and close > lastPhH1 and close[1] <= lastPhH1
+bosDn   = not na(lastPlH1) and close < lastPlH1 and close[1] >= lastPlH1
+chochUp = bosUp and htfBear   // break AGAINST the HTF trend = character change
+chochDn = bosDn and htfBull
+plotchar(showBOSMark and bosUp and not chochUp, "BOS up",    "▲", location.belowbar, color.lime,    size = size.tiny)
+plotchar(showBOSMark and bosDn and not chochDn, "BOS down",  "▼", location.abovebar, color.red,     size = size.tiny)
+plotchar(showBOSMark and chochUp,               "CHoCH up",  "◆", location.belowbar, color.orange,  size = size.tiny)
+plotchar(showBOSMark and chochDn,               "CHoCH down","◆", location.abovebar, color.orange,  size = size.tiny)
+plotchar(showSweepMark and sweepBar,            "Sweep",     "×", location.abovebar, color.fuchsia, size = size.tiny)
 
 // --- Market State classification (priority-ordered, all explainable) --------
 marketState = "Range"
@@ -992,20 +1088,22 @@ if fvgTop.size() > 0
 
 // Weighted signed evidence toward bullish (negative = bearish).
 // sweepSup / sweepRes come from the Decision Engine (Section 10) — one source.
-netBull = 18.0 * f_trendSign(trW) + 15.0 * f_trendSign(trD) + 12.0 * f_trendSign(trH4) + 6.0 * f_trendSign(trH1)
-netBull += nearSup ? scoreSup * 0.14 : 0.0
-netBull -= nearRes ? scoreRes * 0.14 : 0.0
-netBull += obBullNear ? 10.0 : 0.0
-netBull -= obBearNear ? 10.0 : 0.0
-netBull += fvgBullNear ? 9.0 : 0.0
-netBull -= fvgBearNear ? 9.0 : 0.0
-netBull += sweepSup ? 12.0 : 0.0
-netBull -= sweepRes ? 12.0 : 0.0
-netBull += 10.0 * f_clamp(mom, -1.0, 1.0)
-netBull += accumCond ? 8.0 : 0.0
-netBull -= distCond ? 8.0 : 0.0
+netBull = (18.0 * f_trendSign(trW) + 15.0 * f_trendSign(trD) + 12.0 * f_trendSign(trH4) + 6.0 * f_trendSign(trH1)) * wStruct
+netBull += nearSup ? scoreSup * 0.14 * wSRW : 0.0
+netBull -= nearRes ? scoreRes * 0.14 * wSRW : 0.0
+netBull += obBullNear ? 10.0 * wLiq : 0.0
+netBull -= obBearNear ? 10.0 * wLiq : 0.0
+netBull += fvgBullNear ? 9.0 * wLiq : 0.0
+netBull -= fvgBearNear ? 9.0 * wLiq : 0.0
+netBull += sweepSup ? 12.0 * wLiq : 0.0
+netBull -= sweepRes ? 12.0 * wLiq : 0.0
+netBull += 10.0 * wMom * f_clamp(mom, -1.0, 1.0)
+netBull += accumCond ? 8.0 * wStruct : 0.0
+netBull -= distCond ? 8.0 * wStruct : 0.0
 
-bullProb = f_clamp(50.0 + netBull * 0.6, 2.0, 98.0)
+// Volatility dampening: expanding volatility discounts the probability edge.
+probScale = f_clamp(1.0 - volAdjF * math.max(volRegime - 1.3, 0.0), 0.5, 1.0)
+bullProb = f_clamp(50.0 + netBull * 0.6 * probScale, 2.0, 98.0)
 bearProb = 100.0 - bullProb
 
 edge      = math.abs(bullProb - 50.0)
@@ -1016,25 +1114,28 @@ qPts      = badRegime ? 0.0 : edge * 0.9 + confl * 0.35 + math.abs(htfAlign) * 7
 tradeQuality = qPts < 18 ? "No Trade" : qPts < 30 ? "Poor" : qPts < 45 ? "Average" : qPts < 62 ? "Good" : qPts < 80 ? "High Quality" : "Excellent"
 qualCol   = qPts < 20 ? color.gray : qPts < 50 ? color.orange : qPts < 65 ? color.yellow : color.lime
 bias      = bullProb >= 58 ? "LONG" : bullProb <= 42 ? "SHORT" : "NEUTRAL"
+// Mode-shifted quality bar — the ONE tradeable-quality test every consumer
+// (trade gate, prediction logger, scanner) reads. 62 = High Quality boundary.
+qualityHQ = qPts >= 62 + mQualAdj
 
 // Explainable evidence — formats the SAME signals/weights that build netBull.
 // Single source for the dashboard, trade panel, journal and predictions.
 f_evidence(string sep) =>
-    e = f_trendSign(trW) > 0 ? "+18 Weekly bull" + sep : f_trendSign(trW) < 0 ? "-18 Weekly bear" + sep : ""
-    e += f_trendSign(trD) > 0 ? "+15 Daily bull" + sep : f_trendSign(trD) < 0 ? "-15 Daily bear" + sep : ""
-    e += f_trendSign(trH4) > 0 ? "+12 4H bull" + sep : f_trendSign(trH4) < 0 ? "-12 4H bear" + sep : ""
-    e += f_trendSign(trH1) > 0 ? "+6 1H bull" + sep : f_trendSign(trH1) < 0 ? "-6 1H bear" + sep : ""
-    e += nearSup ? "+" + str.tostring(math.round(scoreSup * 0.14)) + " Support(" + str.tostring(math.round(scoreSup)) + ")" + sep : ""
-    e += nearRes ? "-" + str.tostring(math.round(scoreRes * 0.14)) + " Resistance(" + str.tostring(math.round(scoreRes)) + ")" + sep : ""
-    e += obBullNear ? "+10 Bull OB" + sep : ""
-    e += obBearNear ? "-10 Bear OB" + sep : ""
-    e += fvgBullNear ? "+9 Bull FVG" + sep : ""
-    e += fvgBearNear ? "-9 Bear FVG" + sep : ""
-    e += sweepSup ? "+12 Sweep down" + sep : ""
-    e += sweepRes ? "-12 Sweep up" + sep : ""
-    e += mom > 0.3 ? "+" + str.tostring(math.round(10 * f_clamp(mom, -1, 1))) + " Momentum" + sep : mom < -0.3 ? str.tostring(math.round(10 * f_clamp(mom, -1, 1))) + " Momentum" + sep : ""
-    e += accumCond ? "+8 Accumulation" + sep : ""
-    e += distCond ? "-8 Distribution" + sep : ""
+    e = f_trendSign(trW) > 0 ? "+" + str.tostring(math.round(18 * wStruct)) + " Weekly bull" + sep : f_trendSign(trW) < 0 ? "-" + str.tostring(math.round(18 * wStruct)) + " Weekly bear" + sep : ""
+    e += f_trendSign(trD) > 0 ? "+" + str.tostring(math.round(15 * wStruct)) + " Daily bull" + sep : f_trendSign(trD) < 0 ? "-" + str.tostring(math.round(15 * wStruct)) + " Daily bear" + sep : ""
+    e += f_trendSign(trH4) > 0 ? "+" + str.tostring(math.round(12 * wStruct)) + " 4H bull" + sep : f_trendSign(trH4) < 0 ? "-" + str.tostring(math.round(12 * wStruct)) + " 4H bear" + sep : ""
+    e += f_trendSign(trH1) > 0 ? "+" + str.tostring(math.round(6 * wStruct)) + " 1H bull" + sep : f_trendSign(trH1) < 0 ? "-" + str.tostring(math.round(6 * wStruct)) + " 1H bear" + sep : ""
+    e += nearSup ? "+" + str.tostring(math.round(scoreSup * 0.14 * wSRW)) + " Support(" + str.tostring(math.round(scoreSup)) + ")" + sep : ""
+    e += nearRes ? "-" + str.tostring(math.round(scoreRes * 0.14 * wSRW)) + " Resistance(" + str.tostring(math.round(scoreRes)) + ")" + sep : ""
+    e += obBullNear ? "+" + str.tostring(math.round(10 * wLiq)) + " Bull OB" + sep : ""
+    e += obBearNear ? "-" + str.tostring(math.round(10 * wLiq)) + " Bear OB" + sep : ""
+    e += fvgBullNear ? "+" + str.tostring(math.round(9 * wLiq)) + " Bull FVG" + sep : ""
+    e += fvgBearNear ? "-" + str.tostring(math.round(9 * wLiq)) + " Bear FVG" + sep : ""
+    e += sweepSup ? "+" + str.tostring(math.round(12 * wLiq)) + " Sweep down" + sep : ""
+    e += sweepRes ? "-" + str.tostring(math.round(12 * wLiq)) + " Sweep up" + sep : ""
+    e += mom > 0.3 ? "+" + str.tostring(math.round(10 * wMom * f_clamp(mom, -1, 1))) + " Momentum" + sep : mom < -0.3 ? str.tostring(math.round(10 * wMom * f_clamp(mom, -1, 1))) + " Momentum" + sep : ""
+    e += accumCond ? "+" + str.tostring(math.round(8 * wStruct)) + " Accumulation" + sep : ""
+    e += distCond ? "-" + str.tostring(math.round(8 * wStruct)) + " Distribution" + sep : ""
     str.length(e) >= str.length(sep) and str.length(e) > 0 ? str.substring(e, 0, str.length(e) - str.length(sep)) : e
 
 // #############################################################################
@@ -1056,8 +1157,7 @@ if fbBar.size() > 0
         fi := fi - 1
 
 // Log a high-quality directional prediction (one per PRED_WIN window).
-isHQ = tradeQuality == "Excellent" or tradeQuality == "High Quality"
-if barstate.isconfirmed and isHQ and bias != "NEUTRAL" and bar_index - lastPredBar >= PRED_WIN
+if barstate.isconfirmed and qualityHQ and bias != "NEUTRAL" and bar_index - lastPredBar >= PRED_WIN
     pPrice.push(close)
     pProb.push(bias == "LONG" ? bullProb : bearProb)
     pBar.push(bar_index)
