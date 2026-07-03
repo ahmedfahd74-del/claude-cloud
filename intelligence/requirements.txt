@@ -1,0 +1,3 @@
+# ia_sr core is pure stdlib — nothing required.
+# Optional live data feed:
+# yfinance>=0.2
