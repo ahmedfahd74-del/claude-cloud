@@ -371,6 +371,10 @@ var array<float> pPrice = array.new<float>()
 var array<float> pProb  = array.new<float>()
 var array<int>   pBar   = array.new<int>()
 var array<int>   pDir   = array.new<int>()
+// Calibration buckets: predicted <70 / 70-80 / 80+ vs realised win rate.
+var array<int>   calN = array.new<int>(3, 0)
+var array<int>   calW = array.new<int>(3, 0)
+var array<float> calP = array.new<float>(3, 0.0)
 
 // #############################################################################
 // # SECTION 7 — LEVEL STORE + SCORING   (managed, scored multi-level arrays)
@@ -1013,6 +1017,26 @@ tradeQuality = qPts < 18 ? "No Trade" : qPts < 30 ? "Poor" : qPts < 45 ? "Averag
 qualCol   = qPts < 20 ? color.gray : qPts < 50 ? color.orange : qPts < 65 ? color.yellow : color.lime
 bias      = bullProb >= 58 ? "LONG" : bullProb <= 42 ? "SHORT" : "NEUTRAL"
 
+// Explainable evidence — formats the SAME signals/weights that build netBull.
+// Single source for the dashboard, trade panel, journal and predictions.
+f_evidence(string sep) =>
+    e = f_trendSign(trW) > 0 ? "+18 Weekly bull" + sep : f_trendSign(trW) < 0 ? "-18 Weekly bear" + sep : ""
+    e += f_trendSign(trD) > 0 ? "+15 Daily bull" + sep : f_trendSign(trD) < 0 ? "-15 Daily bear" + sep : ""
+    e += f_trendSign(trH4) > 0 ? "+12 4H bull" + sep : f_trendSign(trH4) < 0 ? "-12 4H bear" + sep : ""
+    e += f_trendSign(trH1) > 0 ? "+6 1H bull" + sep : f_trendSign(trH1) < 0 ? "-6 1H bear" + sep : ""
+    e += nearSup ? "+" + str.tostring(math.round(scoreSup * 0.14)) + " Support(" + str.tostring(math.round(scoreSup)) + ")" + sep : ""
+    e += nearRes ? "-" + str.tostring(math.round(scoreRes * 0.14)) + " Resistance(" + str.tostring(math.round(scoreRes)) + ")" + sep : ""
+    e += obBullNear ? "+10 Bull OB" + sep : ""
+    e += obBearNear ? "-10 Bear OB" + sep : ""
+    e += fvgBullNear ? "+9 Bull FVG" + sep : ""
+    e += fvgBearNear ? "-9 Bear FVG" + sep : ""
+    e += sweepSup ? "+12 Sweep down" + sep : ""
+    e += sweepRes ? "-12 Sweep up" + sep : ""
+    e += mom > 0.3 ? "+" + str.tostring(math.round(10 * f_clamp(mom, -1, 1))) + " Momentum" + sep : mom < -0.3 ? str.tostring(math.round(10 * f_clamp(mom, -1, 1))) + " Momentum" + sep : ""
+    e += accumCond ? "+8 Accumulation" + sep : ""
+    e += distCond ? "-8 Distribution" + sep : ""
+    str.length(e) >= str.length(sep) and str.length(e) > 0 ? str.substring(e, 0, str.length(e) - str.length(sep)) : e
+
 // #############################################################################
 // # SECTION 12 — PERFORMANCE / SELF-REVIEW ENGINE
 // #   Compares predictions against outcomes. Predictions logged on confirmed
@@ -1046,10 +1070,15 @@ if pBar.size() > 0
     while pi >= 0
         if bar_index - pBar.get(pi) >= PRED_WIN
             moved = (close - pPrice.get(pi)) * pDir.get(pi)
+            prob  = pProb.get(pi)
+            bkt   = prob >= 80 ? 2 : prob >= 70 ? 1 : 0
             predTotal   += 1
-            predProbSum += pProb.get(pi)
+            predProbSum += prob
+            calN.set(bkt, calN.get(bkt) + 1)
+            calP.set(bkt, calP.get(bkt) + prob)
             if moved >= atrFast
                 predWins += 1
+                calW.set(bkt, calW.get(bkt) + 1)
             pPrice.remove(pi)
             pProb.remove(pi)
             pBar.remove(pi)
@@ -1080,7 +1109,7 @@ volatTxt    = isExpand ? "EXPANSION" : isCompress ? "COMPRESSION" : "NORMAL"
 expTxt      = marketState + (bias == "LONG" ? " → higher" : bias == "SHORT" ? " → lower" : "")
 altTxt      = bias == "LONG" ? "Fail → drop to support" : bias == "SHORT" ? "Fail → rally to resistance" : "Break either side"
 
-var table panel = table.new(f_panelPos(panelPos), 2, 44, border_width = 1,
+var table panel = table.new(f_panelPos(panelPos), 2, 47, border_width = 1,
      frame_color = color.new(color.gray, 60), frame_width = 1)
 
 f_prow(int r, string k, string v, color vc) =>
@@ -1140,10 +1169,14 @@ if showPanel and barstate.islast
     f_prow(40, "False Breaks", na(falseRate) ? "—" : str.tostring(math.round(falseRate)) + "% of breaks", color.silver)
     f_prow(41, "Pred Win",    na(winRate) ? "—" : str.tostring(math.round(winRate)) + "%  (" + str.tostring(predTotal) + " preds)", na(winRate) ? color.silver : winRate >= 55 ? color.lime : color.orange)
     f_prow(42, "Calibration", na(calibGap) ? "—" : (calibGap > 0 ? "+" : "") + str.tostring(math.round(calibGap)) + "% overconf", na(calibGap) ? color.silver : math.abs(calibGap) <= 10 ? color.lime : color.orange)
-    // Explainable evidence (built from the same signals that drive Bull Prob).
-    evi = (f_trendSign(trW) > 0 ? "+18 Weekly bull\n" : f_trendSign(trW) < 0 ? "-18 Weekly bear\n" : "") + (f_trendSign(trD) > 0 ? "+15 Daily bull\n" : f_trendSign(trD) < 0 ? "-15 Daily bear\n" : "") + (f_trendSign(trH4) > 0 ? "+12 4H bull\n" : f_trendSign(trH4) < 0 ? "-12 4H bear\n" : "") + (f_trendSign(trH1) > 0 ? "+6 1H bull\n" : f_trendSign(trH1) < 0 ? "-6 1H bear\n" : "") + (nearSup ? "+ Support " + str.tostring(math.round(scoreSup)) + "\n" : "") + (nearRes ? "- Resistance " + str.tostring(math.round(scoreRes)) + "\n" : "") + (obBullNear ? "+10 Bull OB\n" : "") + (obBearNear ? "-10 Bear OB\n" : "") + (fvgBullNear ? "+9 Bull FVG\n" : "") + (fvgBearNear ? "-9 Bear FVG\n" : "") + (sweepSup ? "+12 Sweep down\n" : "") + (sweepRes ? "-12 Sweep up\n" : "") + (mom > 0.3 ? "+" + str.tostring(math.round(10 * f_clamp(mom, -1, 1))) + " Momentum\n" : mom < -0.3 ? str.tostring(math.round(10 * f_clamp(mom, -1, 1))) + " Momentum\n" : "") + (accumCond ? "+8 Accumulation\n" : "") + (distCond ? "-8 Distribution" : "")
-    table.cell(panel, 0, 43, "Evidence", text_color = color.new(color.gray, 0), text_size = size.small, text_halign = text.align_left)
-    table.cell(panel, 1, 43, evi == "" ? "—" : evi, text_color = color.silver, text_size = size.tiny, text_halign = text.align_left)
+    // Calibration by probability bucket: expected vs realised win rate.
+    f_prow(43, "Cal <70%",   calN.get(0) > 0 ? "exp " + str.tostring(math.round(calP.get(0) / calN.get(0))) + " · act " + str.tostring(math.round(100.0 * calW.get(0) / calN.get(0))) + " (" + str.tostring(calN.get(0)) + ")" : "—", color.silver)
+    f_prow(44, "Cal 70-80%", calN.get(1) > 0 ? "exp " + str.tostring(math.round(calP.get(1) / calN.get(1))) + " · act " + str.tostring(math.round(100.0 * calW.get(1) / calN.get(1))) + " (" + str.tostring(calN.get(1)) + ")" : "—", color.silver)
+    f_prow(45, "Cal 80%+",   calN.get(2) > 0 ? "exp " + str.tostring(math.round(calP.get(2) / calN.get(2))) + " · act " + str.tostring(math.round(100.0 * calW.get(2) / calN.get(2))) + " (" + str.tostring(calN.get(2)) + ")" : "—", color.silver)
+    // Explainable evidence — same weights that build Bull Prob (one source).
+    evi = f_evidence("\n")
+    table.cell(panel, 0, 46, "Evidence", text_color = color.new(color.gray, 0), text_size = size.small, text_halign = text.align_left)
+    table.cell(panel, 1, 46, evi == "" ? "—" : evi, text_color = color.silver, text_size = size.tiny, text_halign = text.align_left)
 
 // #############################################################################
 // # SECTION 14 — INSTITUTIONAL TRADE EXECUTION ENGINE
@@ -1202,7 +1235,7 @@ var line  tTp3   = na
 var box   tRisk  = na
 var box   tRew   = na
 var label tRR    = na
-var table tPanel = table.new(position.bottom_right, 2, 27, border_width = 1,
+var table tPanel = table.new(position.bottom_right, 2, 28, border_width = 1,
      frame_color = color.new(color.gray, 60), frame_width = 1)
 
 f_trow(int r, string k, string v, color vc) =>
@@ -1274,6 +1307,111 @@ if barstate.isconfirmed
 alertcondition(valid and not valid[1], "IA-SR: Trade Plan Ready", "IA-SR validated institutional trade plan available")
 alertcondition(sweepBar, "IA-SR: Liquidity Sweep", "IA-SR liquidity sweep at S/R level")
 
+// #############################################################################
+// # SECTION 14B — TRADE REPLAY / POST-MORTEM JOURNAL
+// #   Records every validated plan with its evidence snapshot, simulates the
+// #   limit-order lifecycle on confirmed bars (fill → stop/target race,
+// #   conservative stop-first), and journals WHY each trade was taken and how
+// #   it ended. Debugging + continuous-improvement tool; also yields the real
+// #   plan win rate shown on the trade panel and exported to Python.
+// #############################################################################
+grpJrn      = "Trade Journal"
+showJournal = input.bool(true, "Show Trade Journal (plan post-mortem)", group = grpJrn)
+
+JRN_FILL_WIN = 40    // bars a pending limit entry stays working
+JRN_LIFE     = 200   // bars a filled trade may run before force-close
+
+var array<int>    jDir   = array.new<int>()
+var array<float>  jEntry = array.new<float>()
+var array<float>  jStop  = array.new<float>()
+var array<float>  jTp    = array.new<float>()
+var array<int>    jBar   = array.new<int>()
+var array<int>    jFill  = array.new<int>()     // fill bar, -1 = pending
+var array<float>  jProb  = array.new<float>()
+var array<string> jEvi   = array.new<string>()
+var array<string> jLog   = array.new<string>()  // resolved records, newest first
+var int planTotal = 0
+var int planWins  = 0
+
+if barstate.isconfirmed
+    // 1) New validated plan → open a record (one per READY flip).
+    if valid and not valid[1]
+        jDir.push(dirLong ? 1 : -1)
+        jEntry.push(entry)
+        jStop.push(stop)
+        jTp.push(tp1)
+        jBar.push(bar_index)
+        jFill.push(-1)
+        jProb.push(dirProb)
+        jEvi.push(f_evidence(", "))
+        if jDir.size() > 10
+            jDir.remove(0)
+            jEntry.remove(0)
+            jStop.remove(0)
+            jTp.remove(0)
+            jBar.remove(0)
+            jFill.remove(0)
+            jProb.remove(0)
+            jEvi.remove(0)
+    // 2) Lifecycle: fill first, then a conservative stop-before-target race.
+    if jDir.size() > 0
+        k = jDir.size() - 1
+        while k >= 0
+            d       = jDir.get(k)
+            side    = d == 1 ? "LONG " : "SHORT "
+            ep      = jEntry.get(k)
+            done    = false
+            win     = false
+            counted = true
+            txt     = ""
+            if jFill.get(k) < 0
+                if (d == 1 ? low <= ep : high >= ep)
+                    jFill.set(k, bar_index)
+                else if bar_index - jBar.get(k) > JRN_FILL_WIN
+                    txt := "— " + side + f_px(ep) + " never filled"
+                    done := true
+                    counted := false
+            if not done and jFill.get(k) >= 0
+                rMult = f_div(math.abs(jTp.get(k) - ep), math.abs(ep - jStop.get(k)))
+                if (d == 1 ? low <= jStop.get(k) : high >= jStop.get(k))
+                    txt := "✖ " + side + f_px(ep) + " → SL (-1R)"
+                    done := true
+                else if (d == 1 ? high >= jTp.get(k) : low <= jTp.get(k))
+                    txt := "✔ " + side + f_px(ep) + " → TP1 (+" + str.tostring(rMult, "#.#") + "R)"
+                    win := true
+                    done := true
+                else if bar_index - jFill.get(k) > JRN_LIFE
+                    pnlR = f_div((close - ep) * d, math.abs(ep - jStop.get(k)))
+                    win := pnlR > 0
+                    txt := (win ? "✔ " : "✖ ") + side + f_px(ep) + " → timeout (" + (pnlR > 0 ? "+" : "") + str.tostring(pnlR, "#.#") + "R)"
+                    done := true
+            if done
+                if counted
+                    planTotal += 1
+                    if win
+                        planWins += 1
+                jLog.unshift(txt + " · " + str.tostring(math.round(jProb.get(k))) + "% · " + jEvi.get(k))
+                if jLog.size() > 8
+                    jLog.pop()
+                jDir.remove(k)
+                jEntry.remove(k)
+                jStop.remove(k)
+                jTp.remove(k)
+                jBar.remove(k)
+                jFill.remove(k)
+                jProb.remove(k)
+                jEvi.remove(k)
+            k := k - 1
+
+var table jrnT = table.new(position.bottom_left, 1, 10, border_width = 1,
+     frame_color = color.new(color.gray, 60), frame_width = 1)
+if barstate.islast and showJournal
+    planRate = planTotal > 0 ? str.tostring(math.round(100.0 * planWins / planTotal)) + "%" : "—"
+    table.cell(jrnT, 0, 0, "TRADE JOURNAL — PLAN POST-MORTEM", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(jrnT, 0, 1, "Plans " + str.tostring(planTotal) + " · Wins " + str.tostring(planWins) + " · Win rate " + planRate + " · Open " + str.tostring(jDir.size()), text_color = color.silver, text_size = size.small, text_halign = text.align_left)
+    for r = 0 to 7
+        table.cell(jrnT, 0, r + 2, r < jLog.size() ? jLog.get(r) : "", text_color = color.silver, text_size = size.tiny, text_halign = text.align_left)
+
 if barstate.islast and showTradePlan
     // --- Chart plan (visualization only — consumes the plan globals) ---------
     x1 = bar_index
@@ -1316,7 +1454,7 @@ if barstate.islast and showTradePlan
     f_trow(9,  "Position",    valid and not na(posPct) ? str.tostring(posPct, "#.#") + "% notional" : "—", color.silver)
     f_trow(10, "Trade Quality", tradeQuality, qualCol)
     f_trow(11, "Probability", str.tostring(math.round(dirProb)) + "%", dirProb >= minProbT ? color.lime : color.silver)
-    f_trow(12, "Exp. Success", na(winRate) ? "—" : str.tostring(math.round(winRate)) + "%", color.silver)
+    f_trow(12, "Exp. Success", planTotal > 0 ? str.tostring(math.round(100.0 * planWins / planTotal)) + "% (plans)" : na(winRate) ? "—" : str.tostring(math.round(winRate)) + "% (bias)", color.silver)
     f_trow(13, "Expected",    expTxt, stateCol)
     f_trow(14, "Risk Level",  riskLvl, riskCol)
     table.cell(tPanel, 0, 15, "Manage", text_color = color.new(color.gray, 0), text_size = size.tiny, text_halign = text.align_left)
@@ -1337,6 +1475,9 @@ if barstate.islast and showTradePlan
         f_diag(24, "Entry/Stop/TP", lvlsOK, "")
         f_diag(25, "Risk:Reward",  rrOK, str.tostring(rrVal, "#.#") + "/" + str.tostring(minRR, "#.#"))
         f_trow(26, "REASON", reason, valid ? color.lime : color.orange)
+    // Weighted evidence behind this recommendation (from the Probability Engine).
+    table.cell(tPanel, 0, 27, "Evidence", text_color = color.new(color.gray, 0), text_size = size.tiny, text_halign = text.align_left)
+    table.cell(tPanel, 1, 27, f_evidence("\n"), text_color = color.silver, text_size = size.tiny, text_halign = text.align_right)
 
 
 // #############################################################################
@@ -1378,5 +1519,5 @@ enableExport = input.bool(false, "Emit JSON decision alert (per bar close)", gro
      tooltip = "Sends the canonical decision state to a webhook for the external Python intelligence layer. See sr_engine_ARCHITECTURE_V2.md.")
 
 if enableExport and barstate.isconfirmed
-    payload = '{"v":1,"sym":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","state":"' + marketState + '","bias":"' + bias + '","bull":' + str.tostring(math.round(bullProb)) + ',"bear":' + str.tostring(math.round(bearProb)) + ',"quality":"' + tradeQuality + '","htfAlign":' + str.tostring(htfAlign) + ',"supConf":' + str.tostring(math.round(scoreSup)) + ',"resConf":' + str.tostring(math.round(scoreRes)) + ',"regime":"' + regimeTxt + '","valid":' + (valid ? 'true' : 'false') + ',"entry":' + f_jnum(entry) + ',"stop":' + f_jnum(stop) + ',"tp1":' + f_jnum(tp1) + ',"tp2":' + f_jnum(tp2) + ',"tp3":' + f_jnum(tp3) + ',"rr":' + str.tostring(rrVal, "#.##") + ',"power":' + f_jnum(powerPrice) + ',"atr":' + f_jnum(atrFast) + '}'
+    payload = '{"v":1,"sym":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","state":"' + marketState + '","bias":"' + bias + '","bull":' + str.tostring(math.round(bullProb)) + ',"bear":' + str.tostring(math.round(bearProb)) + ',"quality":"' + tradeQuality + '","htfAlign":' + str.tostring(htfAlign) + ',"supConf":' + str.tostring(math.round(scoreSup)) + ',"resConf":' + str.tostring(math.round(scoreRes)) + ',"regime":"' + regimeTxt + '","valid":' + (valid ? 'true' : 'false') + ',"entry":' + f_jnum(entry) + ',"stop":' + f_jnum(stop) + ',"tp1":' + f_jnum(tp1) + ',"tp2":' + f_jnum(tp2) + ',"tp3":' + f_jnum(tp3) + ',"rr":' + str.tostring(rrVal, "#.##") + ',"power":' + f_jnum(powerPrice) + ',"atr":' + f_jnum(atrFast) + ',"planN":' + str.tostring(planTotal) + ',"planWin":' + (planTotal > 0 ? str.tostring(math.round(100.0 * planWins / planTotal)) : "null") + '}'
     alert(payload, alert.freq_once_per_bar_close)
