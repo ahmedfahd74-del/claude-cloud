@@ -15,14 +15,17 @@
 //    [x] Phase 9  Performance / Self-Review Engine
 //    [x] Phase 10 Professional Dashboard
 //    [x] Phase 14 Institutional Trade Execution Engine
-//    [x] Phase 15 Diagnostic + MTF/Multi-Symbol Scanners   <-- THIS FILE
-//    [ ] Phase 7  Dashboards + probability estimates
-//    [ ] Phase 8  Alert engine
-//    [ ] Phase 9  Performance + self-review
+//    [x] Phase 15 Diagnostic + MTF/Multi-Symbol Scanners
+//    [x] Phase 16 Alert Engine + JSON Data Export (Pine → Python bridge)
+// -----------------------------------------------------------------------------
+//  CODE LAYERS (Python-migration boundaries)
+//    PURE CALC : Sections 2-5, 8-9 helpers  — stateless math, direct port
+//    DECISION  : Sections 10-12, 14 (plan)  — consumes calc outputs only
+//    VISUAL    : Sections 13, 14 (render), 15 — Pine-only, never ported
 // =============================================================================
 
 indicator("Institutional Adaptive S/R Engine", "IA-SR", overlay = true,
-     max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+     max_lines_count = 200, max_labels_count = 200, max_boxes_count = 250)
 
 // #############################################################################
 // # SECTION 1 — INPUTS
@@ -107,6 +110,9 @@ f_tick(float p) => na(p) ? p : math.round(p / syminfo.mintick) * syminfo.mintick
 // Price → display string, tick-formatted; em-dash when absent.
 f_px(float p) => na(p) ? "—" : str.tostring(p, format.mintick)
 
+// Float → JSON number string (tick precision); "null" when absent.
+f_jnum(float x) => na(x) ? "null" : str.tostring(x, format.mintick)
+
 // Map a style-name string to a line.style_* constant.
 f_lstyle(string s) => s == "Dashed" ? line.style_dashed : s == "Dotted" ? line.style_dotted : line.style_solid
 
@@ -136,6 +142,9 @@ atrFast    = ta.atr(14)
 atrSlow    = ta.atr(50)
 volRegime  = f_div(atrFast, atrSlow)                 // >1 expanding, <1 compressing
 volMult    = f_clamp(volRegime, 0.5, 2.5)
+
+// Single safe-ATR used by every module (fallback before ta.atr(14) resolves).
+atrSafe    = na(atrFast) ? close * 0.001 : atrFast
 
 // --- 3.2 Trend strength (normalized EMA slope in ATR units) ----------------
 emaTrend   = ta.ema(close, 34)
@@ -178,7 +187,7 @@ regimeTxt  = newsDriven ? "NEWS / SHOCK"          :
 // cleaner swings). Calm/low-vol → shorter leg (more responsive). Custom swing
 // detector in Phase 2 will consume this as a *series* int (impossible with
 // ta.pivothigh — that's why we roll our own).
-adPivotLen = int(f_clamp(math.round(5 * volMult / sensBias), 3, 14))
+adPivotLen = int(f_clamp(math.round(5 * volMult / sensBias), 3, MAXLEG))
 
 // Zone half-width multiplier (× HTF ATR). Wider in expansion, tighter in squeeze.
 adZoneMult = f_clamp(volMult * (isExpand ? 1.4 : isCompress ? 0.7 : 1.0) * sensBias, 0.4, 3.0)
@@ -217,11 +226,12 @@ f_swing(int leg) =>
     isHigh  = not na(hi)
     isLow   = not na(lo)
     for i = 0 to 2 * MAXLEG
-        if i <= win
-            if high[i] > hi
-                isHigh := false
-            if low[i] < lo
-                isLow := false
+        if i > win or (not isHigh and not isLow)
+            break
+        if high[i] > hi
+            isHigh := false
+        if low[i] < lo
+            isLow := false
     phVal = hi * (1.0 - anchorA) + math.max(open[leg], close[leg]) * anchorA
     plVal = lo * (1.0 - anchorA) + math.min(open[leg], close[leg]) * anchorA
     [isHigh ? phVal : na, isLow ? plVal : na]
@@ -230,10 +240,10 @@ f_swing(int leg) =>
 f_changed(float v) => not na(v) and (na(v[1]) or v != v[1])
 
 // #############################################################################
-// # SECTION 6 — HTF FETCH   (5 bundled, non-repaint request.security calls)
+// # SECTION 6 — HTF FETCH   (7 bundled, non-repaint request.security calls)
 // #   Each HTF computes its OWN regime → its OWN adaptive leg → its OWN swings,
 // #   so every timeframe is independent (per spec). One tuple per TF keeps us
-// #   at 5 security() calls total, well under the ~40 budget.
+// #   at 7 security() calls total, well under the ~40 budget.
 // #############################################################################
 
 // Self-contained per-TF pack: adaptive leg + confirmed swings + ATR + leg +
@@ -332,6 +342,15 @@ colH1 = color.new(#fb8c00, 0)
 colM15 = color.new(#00bcd4, 0)
 colM5  = color.new(#ec407a, 0)
 
+// Per-TF line styles resolved once (consumed by seeding + level commits).
+lsMN  = f_lstyle(styleMN)
+lsW   = f_lstyle(styleW)
+lsD   = f_lstyle(styleD)
+lsH4  = f_lstyle(styleH4)
+lsH1  = f_lstyle(styleH1)
+lsM15 = f_lstyle(styleM15)
+lsM5  = f_lstyle(styleM5)
+
 // --- Performance / self-review state (Phase 9) ------------------------------
 FB_WIN   = 10
 PRED_WIN = 20
@@ -382,7 +401,7 @@ f_newStore(float w) =>
 // line, seed its stats, and trim the oldest beyond the cap.
 f_addLevel(Store s, float p, bool isRes, color col, int wdt, string lstyle) =>
     if not na(p)
-        md  = (na(atrFast) ? p * 0.001 : atrFast) * adMergeMult
+        md  = atrSafe * adMergeMult
         dup = false
         if s.price.size() > 0
             for i = 0 to s.price.size() - 1
@@ -394,9 +413,9 @@ f_addLevel(Store s, float p, bool isRes, color col, int wdt, string lstyle) =>
                  extend = extend.both, color = col, width = wdt, style = lstyle)
             bx = showZones ? box.new(bar_index - 1, p, bar_index, p, xloc = xloc.bar_index,
                  extend = extend.both, border_width = 0, border_color = color.new(col, 100), bgcolor = color.new(col, 80)) : na
-            lb = label.new(bar_index, p, "", xloc = xloc.bar_index,
+            lb = showLabel ? label.new(bar_index, p, "", xloc = xloc.bar_index,
                  style = label.style_label_left,
-                 color = color.new(col, 30), textcolor = color.white, size = size.small)
+                 color = color.new(col, 30), textcolor = color.white, size = size.small) : na
             s.price.unshift(p)
             s.ln.unshift(ln)
             s.bx.unshift(bx)
@@ -414,7 +433,9 @@ f_addLevel(Store s, float p, bool isRes, color col, int wdt, string lstyle) =>
                 bxo = s.bx.pop()
                 if not na(bxo)
                     box.delete(bxo)
-                label.delete(s.lb.pop())
+                lbo = s.lb.pop()
+                if not na(lbo)
+                    label.delete(lbo)
                 s.price.pop()
                 s.isRes.pop()
                 s.touches.pop()
@@ -442,7 +463,9 @@ f_removeAt(Store s, int i) =>
     bxo = s.bx.get(i)
     if not na(bxo)
         box.delete(bxo)
-    label.delete(s.lb.get(i))
+    lbo = s.lb.get(i)
+    if not na(lbo)
+        label.delete(lbo)
     s.price.remove(i)
     s.ln.remove(i)
     s.bx.remove(i)
@@ -464,7 +487,7 @@ f_updateBreaks(Store s) =>
         while i >= 0
             if not s.broken.get(i)
                 lvl     = s.price.get(i)
-                buf     = (na(atrFast) ? lvl * 0.001 : atrFast) * 0.25 * adAtrMult
+                buf     = atrSafe * 0.25 * adAtrMult
                 crossed = math.abs(close - lvl) > buf and math.sign(close - lvl) != math.sign(close[1] - lvl)
                 if crossed
                     if barstate.isconfirmed and not s.broken.get(i)
@@ -483,8 +506,10 @@ f_updateBreaks(Store s) =>
                         line.set_color(s.ln.get(i), colBrk)
                         line.set_style(s.ln.get(i), line.style_dashed)
                         line.set_width(s.ln.get(i), 1)
-                        label.set_text(s.lb.get(i), "")
-                        label.set_color(s.lb.get(i), color.new(color.white, 100))
+                        lbo = s.lb.get(i)
+                        if not na(lbo)
+                            label.set_text(lbo, "")
+                            label.set_color(lbo, color.new(color.white, 100))
                         bxo = s.bx.get(i)
                         if not na(bxo)
                             box.delete(bxo)
@@ -507,7 +532,7 @@ f_touchUpdate(Store s) =>
     if s.price.size() > 0
         for i = 0 to s.price.size() - 1
             lvl = s.price.get(i)
-            buf = (na(atrFast) ? lvl * 0.001 : atrFast) * adReactThr
+            buf = atrSafe * adReactThr
             if not s.broken.get(i) and high >= lvl - buf and low <= lvl + buf and (bar_index - s.lastTouch.get(i) >= 3)
                 res   = s.isRes.get(i)
                 rej   = res ? high - close : close - low
@@ -581,7 +606,7 @@ if fvgTop.size() > 0
 
 // Order Block: displacement on bar[1]; OB candle is the opposite bar[2].
 body1     = math.abs(close[1] - open[1])
-disp      = body1 > (na(atrFast) ? 0 : atrFast) * 1.2
+disp      = body1 > atrSafe * 1.2
 if disp and close[1] > open[1] and close[2] < open[2]
     obBullTop := high[2]
     obBullBot := low[2]
@@ -640,7 +665,7 @@ W_SMC   = 0.10
 
 f_scoreAndRender(Store s, color baseCol, Store o1, Store o2, Store o3, Store o4, Store o5, Store o6) =>
     if s.price.size() > 0
-        band = (na(atrFast) ? close * 0.002 : atrFast) * adMergeMult * 1.5
+        band = atrSafe * adMergeMult * 1.5
         for i = 0 to s.price.size() - 1
             if s.broken.get(i)
                 continue
@@ -655,7 +680,7 @@ f_scoreAndRender(Store s, color baseCol, Store o1, Store o2, Store o3, Store o4,
             // Trend alignment: support favours uptrend, resistance favours down.
             aligned  = res ? not trendUp : trendUp
             // Liquidity-pool (equal highs/lows) + SMC footprint (FVG / order block).
-            eqCount  = f_sameSideNear(s, lvl, res, (na(atrFast) ? lvl * 0.001 : atrFast) * 0.2, i)
+            eqCount  = f_sameSideNear(s, lvl, res, atrSafe * 0.2, i)
             fTouch   = f_norm01(t, 3)
             fReact   = f_norm01(avgReact, 1.0)
             fConf    = f_norm01(conf, 2.0)
@@ -678,7 +703,7 @@ f_scoreAndRender(Store s, color baseCol, Store o1, Store o2, Store o3, Store o4,
             if not na(bxo)
                 if show
                     // Chart-ATR based → zone stays in proportion on EVERY timeframe.
-                    half = (na(atrFast) ? lvl * 0.001 : atrFast) * zoneWidthK * adZoneMult
+                    half = atrSafe * zoneWidthK * adZoneMult
                     box.set_top(bxo, lvl + half)
                     box.set_bottom(bxo, lvl - half)
                     ztr = int(f_clamp(84.0 - sc * 0.14, 70.0, 86.0))
@@ -686,16 +711,17 @@ f_scoreAndRender(Store s, color baseCol, Store o1, Store o2, Store o3, Store o4,
                 else
                     box.set_bgcolor(bxo, color.new(baseCol, 100))
             // --- Label: grade · side · price · score% (right edge) -----------
-            grade = sc >= 90 ? "A+" : sc >= 80 ? "A" : sc >= 70 ? "B" : sc >= 55 ? "C" : "D"
             lb = s.lb.get(i)
-            if showLabel and not weak and show
-                label.set_xy(lb, bar_index, lvl)
-                label.set_text(lb, grade + "  " + (res ? "R" : "S") + "  " + f_px(lvl) + "  " + str.tostring(math.round(sc)) + "%")
-                label.set_color(lb, color.new(baseCol, 25))
-                label.set_textcolor(lb, sc >= 80 ? color.white : color.new(color.white, 25))
-            else
-                label.set_text(lb, "")
-                label.set_color(lb, color.new(color.white, 100))
+            if not na(lb)
+                if showLabel and not weak and show
+                    grade = sc >= 90 ? "A+" : sc >= 80 ? "A" : sc >= 70 ? "B" : sc >= 55 ? "C" : "D"
+                    label.set_xy(lb, bar_index, lvl)
+                    label.set_text(lb, grade + "  " + (res ? "R" : "S") + "  " + f_px(lvl) + "  " + str.tostring(math.round(sc)) + "%")
+                    label.set_color(lb, color.new(baseCol, 25))
+                    label.set_textcolor(lb, sc >= 80 ? color.white : color.new(color.white, 25))
+                else
+                    label.set_text(lb, "")
+                    label.set_color(lb, color.new(color.white, 100))
 
 // --- Per-timeframe stores (w = importance) + commit new swings --------------
 var Store stMN = f_newStore(1.00)
@@ -720,60 +746,50 @@ effUseM5  = f_eff(useM5,  5)
 // Seed full HTF pivot history over the first few bars (arrays are na until the
 // HTF context resolves; merge-dedup keeps repeats harmless). Works on short LTF charts.
 if bar_index <= 3
-    f_seed(stMN,  hiMN,  loMN,  effUseMN,  colMN,  2, f_lstyle(styleMN))
-    f_seed(stW,   hiW,   loW,   effUseW,   colW,   3, f_lstyle(styleW))
-    f_seed(stD,   hiD,   loD,   effUseD,   colD,   2, f_lstyle(styleD))
-    f_seed(stH4,  hiH4,  loH4,  effUseH4,  colH4,  1, f_lstyle(styleH4))
-    f_seed(stH1,  hiH1,  loH1,  effUseH1,  colH1,  1, f_lstyle(styleH1))
-    f_seed(stM15, hiM15, loM15, effUseM15, colM15, 1, f_lstyle(styleM15))
-    f_seed(stM5,  hiM5,  loM5,  effUseM5,  colM5,  1, f_lstyle(styleM5))
+    f_seed(stMN,  hiMN,  loMN,  effUseMN,  colMN,  2, lsMN)
+    f_seed(stW,   hiW,   loW,   effUseW,   colW,   3, lsW)
+    f_seed(stD,   hiD,   loD,   effUseD,   colD,   2, lsD)
+    f_seed(stH4,  hiH4,  loH4,  effUseH4,  colH4,  1, lsH4)
+    f_seed(stH1,  hiH1,  loH1,  effUseH1,  colH1,  1, lsH1)
+    f_seed(stM15, hiM15, loM15, effUseM15, colM15, 1, lsM15)
+    f_seed(stM5,  hiM5,  loM5,  effUseM5,  colM5,  1, lsM5)
 
 // Line style per timeframe — user controlled (defaults all solid).
 if effUseMN and chgPhMN
-    f_addLevel(stMN, f_tick(phMN), true,  colMN, 2, f_lstyle(styleMN))
+    f_addLevel(stMN, f_tick(phMN), true,  colMN, 2, lsMN)
 if effUseMN and chgPlMN
-    f_addLevel(stMN, f_tick(plMN), false, colMN, 2, f_lstyle(styleMN))
+    f_addLevel(stMN, f_tick(plMN), false, colMN, 2, lsMN)
 if effUseW and chgPhW
-    f_addLevel(stW, f_tick(phW), true,  colW, 3, f_lstyle(styleW))
+    f_addLevel(stW, f_tick(phW), true,  colW, 3, lsW)
 if effUseW and chgPlW
-    f_addLevel(stW, f_tick(plW), false, colW, 3, f_lstyle(styleW))
+    f_addLevel(stW, f_tick(plW), false, colW, 3, lsW)
 if effUseD and chgPhD
-    f_addLevel(stD, f_tick(phD), true,  colD, 2, f_lstyle(styleD))
+    f_addLevel(stD, f_tick(phD), true,  colD, 2, lsD)
 if effUseD and chgPlD
-    f_addLevel(stD, f_tick(plD), false, colD, 2, f_lstyle(styleD))
+    f_addLevel(stD, f_tick(plD), false, colD, 2, lsD)
 if effUseH4 and chgPhH4
-    f_addLevel(stH4, f_tick(phH4), true,  colH4, 1, f_lstyle(styleH4))
+    f_addLevel(stH4, f_tick(phH4), true,  colH4, 1, lsH4)
 if effUseH4 and chgPlH4
-    f_addLevel(stH4, f_tick(plH4), false, colH4, 1, f_lstyle(styleH4))
+    f_addLevel(stH4, f_tick(plH4), false, colH4, 1, lsH4)
 if effUseH1 and chgPhH1
-    f_addLevel(stH1, f_tick(phH1), true,  colH1, 1, f_lstyle(styleH1))
+    f_addLevel(stH1, f_tick(phH1), true,  colH1, 1, lsH1)
 if effUseH1 and chgPlH1
-    f_addLevel(stH1, f_tick(plH1), false, colH1, 1, f_lstyle(styleH1))
+    f_addLevel(stH1, f_tick(plH1), false, colH1, 1, lsH1)
 if effUseM15 and chgPhM15
-    f_addLevel(stM15, f_tick(phM15), true,  colM15, 1, f_lstyle(styleM15))
+    f_addLevel(stM15, f_tick(phM15), true,  colM15, 1, lsM15)
 if effUseM15 and chgPlM15
-    f_addLevel(stM15, f_tick(plM15), false, colM15, 1, f_lstyle(styleM15))
+    f_addLevel(stM15, f_tick(plM15), false, colM15, 1, lsM15)
 if effUseM5 and chgPhM5
-    f_addLevel(stM5, f_tick(phM5), true,  colM5, 1, f_lstyle(styleM5))
+    f_addLevel(stM5, f_tick(phM5), true,  colM5, 1, lsM5)
 if effUseM5 and chgPlM5
-    f_addLevel(stM5, f_tick(plM5), false, colM5, 1, f_lstyle(styleM5))
+    f_addLevel(stM5, f_tick(plM5), false, colM5, 1, lsM5)
 
-// Break handling → touch stats → score + render (order matters).
-gBreaks += f_updateBreaks(stMN)
-gBreaks += f_updateBreaks(stW)
-gBreaks += f_updateBreaks(stD)
-gBreaks += f_updateBreaks(stH4)
-gBreaks += f_updateBreaks(stH1)
-gBreaks += f_updateBreaks(stM15)
-gBreaks += f_updateBreaks(stM5)
-
-gHolds += f_touchUpdate(stMN)
-gHolds += f_touchUpdate(stW)
-gHolds += f_touchUpdate(stD)
-gHolds += f_touchUpdate(stH4)
-gHolds += f_touchUpdate(stH1)
-gHolds += f_touchUpdate(stM15)
-gHolds += f_touchUpdate(stM5)
+// Break handling → touch stats → score + render (order matters). Per-bar event
+// counts are kept as globals so the Alert Engine reuses them without rescans.
+brkEvents = f_updateBreaks(stMN) + f_updateBreaks(stW) + f_updateBreaks(stD) + f_updateBreaks(stH4) + f_updateBreaks(stH1) + f_updateBreaks(stM15) + f_updateBreaks(stM5)
+touchEvents = f_touchUpdate(stMN) + f_touchUpdate(stW) + f_touchUpdate(stD) + f_touchUpdate(stH4) + f_touchUpdate(stH1) + f_touchUpdate(stM15) + f_touchUpdate(stM5)
+gBreaks += brkEvents
+gHolds  += touchEvents
 
 f_scoreAndRender(stMN,  colMN,  stW,  stD,  stH4, stH1, stM15, stM5)
 f_scoreAndRender(stW,   colW,   stMN, stD,  stH4, stH1, stM15, stM5)
@@ -850,7 +866,9 @@ distCond   = rangeEnv and pos > 0.60 and highLiq
 
 wickUp     = f_div(high - math.max(open, close), atrFast)
 wickDn     = f_div(math.min(open, close) - low, atrFast)
-sweepBar   = (wickUp > 0.8 and nearRes) or (wickDn > 0.8 and nearSup)
+sweepRes   = wickUp > 0.8 and nearRes
+sweepSup   = wickDn > 0.8 and nearSup
+sweepBar   = sweepRes or sweepSup
 
 // --- Market State classification (priority-ordered, all explainable) --------
 marketState = "Range"
@@ -945,10 +963,9 @@ if fvgTop.size() > 0
             else
                 fvgBearNear := true
             break
-sweepSup = wickDn > 0.8 and nearSup
-sweepRes = wickUp > 0.8 and nearRes
 
 // Weighted signed evidence toward bullish (negative = bearish).
+// sweepSup / sweepRes come from the Decision Engine (Section 10) — one source.
 netBull = 18.0 * f_trendSign(trW) + 15.0 * f_trendSign(trD) + 12.0 * f_trendSign(trH4) + 6.0 * f_trendSign(trH1)
 netBull += nearSup ? scoreSup * 0.14 : 0.0
 netBull -= nearRes ? scoreRes * 0.14 : 0.0
@@ -973,7 +990,6 @@ qPts      = badRegime ? 0.0 : edge * 0.9 + confl * 0.35 + math.abs(htfAlign) * 7
 tradeQuality = qPts < 18 ? "No Trade" : qPts < 30 ? "Poor" : qPts < 45 ? "Average" : qPts < 62 ? "Good" : qPts < 80 ? "High Quality" : "Excellent"
 qualCol   = qPts < 20 ? color.gray : qPts < 50 ? color.orange : qPts < 65 ? color.yellow : color.lime
 bias      = bullProb >= 58 ? "LONG" : bullProb <= 42 ? "SHORT" : "NEUTRAL"
-biasCol   = bias == "LONG" ? color.lime : bias == "SHORT" ? color.red : color.silver
 
 // #############################################################################
 // # SECTION 12 — PERFORMANCE / SELF-REVIEW ENGINE
@@ -1038,12 +1054,11 @@ riskCol     = riskLvl == "HIGH" ? color.red : riskLvl == "LOW" ? color.lime : co
 trendStrTxt = trendStr > 1.5 ? "STRONG" : trendStr > 1.0 ? "MODERATE" : trendStr > 0.4 ? "WEAK" : "FLAT"
 momTxt      = mom > 0.3 ? "UP" : mom < -0.3 ? "DOWN" : "FLAT"
 momCol      = mom > 0.3 ? color.lime : mom < -0.3 ? color.red : color.silver
-volTxt      = highLiq ? "HIGH" : lowLiq ? "LOW" : "NORMAL"
 volatTxt    = isExpand ? "EXPANSION" : isCompress ? "COMPRESSION" : "NORMAL"
 expTxt      = marketState + (bias == "LONG" ? " → higher" : bias == "SHORT" ? " → lower" : "")
 altTxt      = bias == "LONG" ? "Fail → drop to support" : bias == "SHORT" ? "Fail → rally to resistance" : "Break either side"
 
-var table panel = table.new(f_panelPos(panelPos), 2, 49, border_width = 1,
+var table panel = table.new(f_panelPos(panelPos), 2, 44, border_width = 1,
      frame_color = color.new(color.gray, 60), frame_width = 1)
 
 f_prow(int r, string k, string v, color vc) =>
@@ -1087,22 +1102,26 @@ if showPanel and barstate.islast
     f_prow(26, "1D Trend", f_trendState(trD),  f_trendCol(trD))
     f_prow(27, "4H Trend", f_trendState(trH4), f_trendCol(trH4))
     f_prow(28, "1H Trend", f_trendState(trH1), f_trendCol(trH1))
-    f_prow(37, "15M Trend", f_trendState(trM15), f_trendCol(trM15))
-    f_prow(38, "5M Trend",  f_trendState(trM5),  f_trendCol(trM5))
+    f_prow(29, "15M Trend", f_trendState(trM15), f_trendCol(trM15))
+    f_prow(30, "5M Trend",  f_trendState(trM5),  f_trendCol(trM5))
     // --- Phase 10: environment + scenario + evidence ------------------------
-    f_prow(39, "Trend Strength", trendStrTxt, isTrending ? (trendUp ? color.lime : color.red) : color.silver)
-    f_prow(40, "Momentum",   momTxt,   momCol)
-    f_prow(41, "Volume",     volTxt,   highLiq ? color.lime : lowLiq ? color.orange : color.silver)
-    f_prow(42, "Volatility", volatTxt, isExpand ? color.orange : isCompress ? color.aqua : color.silver)
-    f_prow(43, "Risk Level", riskLvl,  riskCol)
-    f_prow(44, "Support Conf",    distSupATR < 100 ? str.tostring(math.round(scoreSup)) : "—", scoreSup >= 80 ? color.lime : color.silver)
-    f_prow(45, "Resistance Conf", distResATR < 100 ? str.tostring(math.round(scoreRes)) : "—", scoreRes >= 80 ? color.red : color.silver)
-    f_prow(46, "Expected",    expTxt, stateCol)
-    f_prow(47, "Alternative", altTxt, color.silver)
+    f_prow(31, "Trend Strength", trendStrTxt, isTrending ? (trendUp ? color.lime : color.red) : color.silver)
+    f_prow(32, "Momentum",   momTxt,   momCol)
+    f_prow(33, "Volatility", volatTxt, isExpand ? color.orange : isCompress ? color.aqua : color.silver)
+    f_prow(34, "Risk Level", riskLvl,  riskCol)
+    f_prow(35, "Support Conf",    distSupATR < 100 ? str.tostring(math.round(scoreSup)) : "—", scoreSup >= 80 ? color.lime : color.silver)
+    f_prow(36, "Resistance Conf", distResATR < 100 ? str.tostring(math.round(scoreRes)) : "—", scoreRes >= 80 ? color.red : color.silver)
+    f_prow(37, "Expected",    expTxt, stateCol)
+    f_prow(38, "Alternative", altTxt, color.silver)
+    // --- Phase 9: self-review results (live accuracy of the engine) ---------
+    f_prow(39, "Hold Rate",   na(holdRate) ? "—" : str.tostring(math.round(holdRate)) + "%  (" + str.tostring(gHolds) + "/" + str.tostring(gHolds + gBreaks) + ")", na(holdRate) ? color.silver : holdRate >= 60 ? color.lime : color.orange)
+    f_prow(40, "False Breaks", na(falseRate) ? "—" : str.tostring(math.round(falseRate)) + "% of breaks", color.silver)
+    f_prow(41, "Pred Win",    na(winRate) ? "—" : str.tostring(math.round(winRate)) + "%  (" + str.tostring(predTotal) + " preds)", na(winRate) ? color.silver : winRate >= 55 ? color.lime : color.orange)
+    f_prow(42, "Calibration", na(calibGap) ? "—" : (calibGap > 0 ? "+" : "") + str.tostring(math.round(calibGap)) + "% overconf", na(calibGap) ? color.silver : math.abs(calibGap) <= 10 ? color.lime : color.orange)
     // Explainable evidence (built from the same signals that drive Bull Prob).
     evi = (f_trendSign(trW) > 0 ? "+18 Weekly bull\n" : f_trendSign(trW) < 0 ? "-18 Weekly bear\n" : "") + (f_trendSign(trD) > 0 ? "+15 Daily bull\n" : f_trendSign(trD) < 0 ? "-15 Daily bear\n" : "") + (f_trendSign(trH4) > 0 ? "+12 4H bull\n" : f_trendSign(trH4) < 0 ? "-12 4H bear\n" : "") + (nearSup ? "+ Support " + str.tostring(math.round(scoreSup)) + "\n" : "") + (nearRes ? "- Resistance " + str.tostring(math.round(scoreRes)) + "\n" : "") + (obBullNear ? "+10 Bull OB\n" : "") + (obBearNear ? "-10 Bear OB\n" : "") + (fvgBullNear ? "+9 Bull FVG\n" : "") + (fvgBearNear ? "-9 Bear FVG\n" : "") + (sweepSup ? "+12 Sweep down\n" : "") + (sweepRes ? "-12 Sweep up\n" : "") + (accumCond ? "+8 Accumulation\n" : "") + (distCond ? "-8 Distribution" : "")
-    table.cell(panel, 0, 48, "Evidence", text_color = color.new(color.gray, 0), text_size = size.small, text_halign = text.align_left)
-    table.cell(panel, 1, 48, evi == "" ? "—" : evi, text_color = color.silver, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(panel, 0, 43, "Evidence", text_color = color.new(color.gray, 0), text_size = size.small, text_halign = text.align_left)
+    table.cell(panel, 1, 43, evi == "" ? "—" : evi, text_color = color.silver, text_size = size.tiny, text_halign = text.align_left)
 
 // #############################################################################
 // # SECTION 14 — INSTITUTIONAL TRADE EXECUTION ENGINE
