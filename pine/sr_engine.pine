@@ -490,8 +490,11 @@ f_updateBreaks(Store s) =>
                 buf     = atrSafe * 0.25 * adAtrMult
                 crossed = math.abs(close - lvl) > buf and math.sign(close - lvl) != math.sign(close[1] - lvl)
                 if crossed
-                    if barstate.isconfirmed and not s.broken.get(i)
+                    // Debounced stats: one event per level per 3 bars, and a
+                    // break-bar can't also register as a hold (runs pre-touch).
+                    if barstate.isconfirmed and bar_index - s.lastTouch.get(i) >= 3
                         bc += 1
+                        s.lastTouch.set(i, bar_index)
                         fbPrice.push(lvl)
                         fbDir.push(close > lvl ? 1 : -1)
                         fbBar.push(bar_index)
@@ -1119,7 +1122,7 @@ if showPanel and barstate.islast
     f_prow(41, "Pred Win",    na(winRate) ? "—" : str.tostring(math.round(winRate)) + "%  (" + str.tostring(predTotal) + " preds)", na(winRate) ? color.silver : winRate >= 55 ? color.lime : color.orange)
     f_prow(42, "Calibration", na(calibGap) ? "—" : (calibGap > 0 ? "+" : "") + str.tostring(math.round(calibGap)) + "% overconf", na(calibGap) ? color.silver : math.abs(calibGap) <= 10 ? color.lime : color.orange)
     // Explainable evidence (built from the same signals that drive Bull Prob).
-    evi = (f_trendSign(trW) > 0 ? "+18 Weekly bull\n" : f_trendSign(trW) < 0 ? "-18 Weekly bear\n" : "") + (f_trendSign(trD) > 0 ? "+15 Daily bull\n" : f_trendSign(trD) < 0 ? "-15 Daily bear\n" : "") + (f_trendSign(trH4) > 0 ? "+12 4H bull\n" : f_trendSign(trH4) < 0 ? "-12 4H bear\n" : "") + (nearSup ? "+ Support " + str.tostring(math.round(scoreSup)) + "\n" : "") + (nearRes ? "- Resistance " + str.tostring(math.round(scoreRes)) + "\n" : "") + (obBullNear ? "+10 Bull OB\n" : "") + (obBearNear ? "-10 Bear OB\n" : "") + (fvgBullNear ? "+9 Bull FVG\n" : "") + (fvgBearNear ? "-9 Bear FVG\n" : "") + (sweepSup ? "+12 Sweep down\n" : "") + (sweepRes ? "-12 Sweep up\n" : "") + (accumCond ? "+8 Accumulation\n" : "") + (distCond ? "-8 Distribution" : "")
+    evi = (f_trendSign(trW) > 0 ? "+18 Weekly bull\n" : f_trendSign(trW) < 0 ? "-18 Weekly bear\n" : "") + (f_trendSign(trD) > 0 ? "+15 Daily bull\n" : f_trendSign(trD) < 0 ? "-15 Daily bear\n" : "") + (f_trendSign(trH4) > 0 ? "+12 4H bull\n" : f_trendSign(trH4) < 0 ? "-12 4H bear\n" : "") + (f_trendSign(trH1) > 0 ? "+6 1H bull\n" : f_trendSign(trH1) < 0 ? "-6 1H bear\n" : "") + (nearSup ? "+ Support " + str.tostring(math.round(scoreSup)) + "\n" : "") + (nearRes ? "- Resistance " + str.tostring(math.round(scoreRes)) + "\n" : "") + (obBullNear ? "+10 Bull OB\n" : "") + (obBearNear ? "-10 Bear OB\n" : "") + (fvgBullNear ? "+9 Bull FVG\n" : "") + (fvgBearNear ? "-9 Bear FVG\n" : "") + (sweepSup ? "+12 Sweep down\n" : "") + (sweepRes ? "-12 Sweep up\n" : "") + (mom > 0.3 ? "+" + str.tostring(math.round(10 * f_clamp(mom, -1, 1))) + " Momentum\n" : mom < -0.3 ? str.tostring(math.round(10 * f_clamp(mom, -1, 1))) + " Momentum\n" : "") + (accumCond ? "+8 Accumulation\n" : "") + (distCond ? "-8 Distribution" : "")
     table.cell(panel, 0, 43, "Evidence", text_color = color.new(color.gray, 0), text_size = size.small, text_halign = text.align_left)
     table.cell(panel, 1, 43, evi == "" ? "—" : evi, text_color = color.silver, text_size = size.tiny, text_halign = text.align_left)
 
