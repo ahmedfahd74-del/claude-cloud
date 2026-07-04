@@ -100,8 +100,8 @@ showPowerLine = input.bool(true, "Show Power Line", group = grpPower,
      tooltip = "A single line marking the nearest turning point where price is expected to flip back into the dominant HTF trend. Overall bear → nearest resistance above; overall bull → nearest support below. Does not touch the main S/R lines.")
 colPower      = input.color(color.new(#ffd600, 0), "Power Line Color", group = grpPower)
 powerWidth    = input.int(2, "Power Line Width", minval = 1, maxval = 6, group = grpPower)
-powerRadius   = input.float(8.0, "Search Radius (ATR)", minval = 1.0, maxval = 30.0, step = 0.5, group = grpPower,
-     tooltip = "How far from price the engine may look for its highest-confidence level.")
+powerRadius   = input.float(8.0, "Search Radius (Daily ATR)", minval = 1.0, maxval = 30.0, step = 0.5, group = grpPower,
+     tooltip = "How far from price the engine may look for its highest-confidence level. Measured in DAILY ATR so the Power Line is the same level on every chart timeframe.")
 powerMinSc    = input.int(60, "Min Level Score", minval = 0, maxval = 100, group = grpPower)
 powerShowStat = input.bool(true, "Show Status Intelligence", group = grpPower,
      tooltip = "Adds respect / break-likely / retest-likely and next-action readout to the Power label.")
@@ -1138,15 +1138,25 @@ stateCol = marketState == "Trend Expansion" or marketState == "Momentum Continua
      marketState == "Liquidity Hunt"       ? color.fuchsia :
      marketState == "Trend Exhaustion" or marketState == "Reversal Risk" ? color.orange : color.silver
 
-// --- POWER LINE v2: the single highest-confidence level in the whole book ---
-// Rank = confidence score × TF importance × proximity, searched within
-// powerRadius ATR of price. THE one line to keep if all others are hidden.
-// Falls back to the dominant HTF trend's held swing when nothing qualifies.
+// --- POWER LINE v2.1: the level the market is INTERACTING with -------------
+// THE one line to keep if all others are hidden. Distances are measured in
+// DAILY ATR (chart-TF independent), so the pick — and its status — is the
+// SAME line on every chart from 1m to 1M. Ranking puts interaction first:
+// proximity dominates, a level price is trading at right now qualifies even
+// before its score matures, and score × TF importance breaks the tie so a
+// Daily/Weekly line beats a 5m line at similar distance. Falls back to the
+// nearest live level, then to the dominant HTF trend swing (empty book).
+pATR = math.max(nz(atrD, atrFast), syminfo.mintick)
+
 f_powerPick() =>
     float bp = na
     float bs = na
     bool  br = false
-    best = -1.0
+    best  = -1.0
+    float fnP = na
+    float fnS = na
+    bool  fnR = false
+    nbest = 1.0e18
     for si = 0 to allSt.size() - 1
         st = allSt.get(si)
         if st.price.size() > 0
@@ -1154,14 +1164,26 @@ f_powerPick() =>
                 if not st.broken.get(i)
                     p  = st.price.get(i)
                     sc = st.score.get(i)
-                    d  = f_div(math.abs(close - p), atrFast)
-                    if sc >= powerMinSc and d <= powerRadius
-                        rank = sc * (0.6 + 0.4 * st.w) * (1.0 - 0.5 * d / powerRadius)
+                    d  = f_div(math.abs(close - p), pATR)
+                    if d < nbest
+                        nbest := d
+                        fnP := p
+                        fnS := sc
+                        fnR := st.isRes.get(i)
+                    if d <= powerRadius and (sc >= powerMinSc or d <= 0.8)
+                        prox  = f_clamp(1.0 - d / powerRadius, 0.0, 1.0)
+                        inter = d <= 0.3 ? 2.0 : d <= 0.8 ? 1.4 : 1.0
+                        rank  = math.max(sc, 25.0) * (0.6 + 0.4 * st.w) * (0.15 + 0.85 * prox) * inter
                         if rank > best
                             best := rank
                             bp := p
                             bs := sc
                             br := st.isRes.get(i)
+    // Nothing inside the radius → the market's nearest live level IS the line.
+    if na(bp)
+        bp := fnP
+        bs := fnS
+        br := fnR
     [bp, bs, br]
 [pwrP, pwrScore, pwrIsRes] = f_powerPick()
 
@@ -1187,7 +1209,7 @@ else if useH1 and f_trendSign(trH1) != 0
     domPl := lastPlH1
 powerPrice = not na(pwrP) ? pwrP : na(domTr) ? na : domTr < 0 ? domPh : domPl
 powerIsRes = not na(pwrP) ? pwrIsRes : not na(domTr) and domTr < 0
-pdist      = na(powerPrice) ? na : f_div(math.abs(close - powerPrice), atrFast)
+pdist      = na(powerPrice) ? na : f_div(math.abs(close - powerPrice), pATR)
 
 // Status intelligence — what the engine expects at this line (existing
 // globals only: htfAlign, momentum, side; no recomputation).
