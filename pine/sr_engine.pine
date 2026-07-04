@@ -24,14 +24,14 @@
 //    VISUAL    : Sections 13, 14 (render), 15 — Pine-only, never ported
 // =============================================================================
 
-indicator("Institutional Adaptive S/R Engine  [v2.0.6 · 2026-07-04]", "IA-SR v2.0.6", overlay = true,
+indicator("Institutional Adaptive S/R Engine  [v2.0.7 · 2026-07-04]", "IA-SR v2.0.7", overlay = true,
      max_lines_count = 200, max_labels_count = 200, max_boxes_count = 250)
 
 // BUILD TAG — bumped every release. Shows in the indicator title on the chart
 // (top-left) and on the dashboard's top row, so you can always confirm the
 // running version. If this differs from the tag I quote in chat, you're on an
 // old copy — re-paste the file I attached. Keep this in sync with the title.
-BUILD = "v2.0.6 · 2026-07-04"
+BUILD = "v2.0.7 · 2026-07-04"
 
 // #############################################################################
 // # SECTION 1 — INPUTS
@@ -76,8 +76,8 @@ useH4 = input.bool(true,  "4 Hour",  group = grpTF, inline = "tf")
 useH1 = input.bool(true,  "1 Hour",  group = grpTF, inline = "tf")
 useM15 = input.bool(true, "15 Min",  group = grpTF, inline = "tf2")
 useM5  = input.bool(true, "5 Min",   group = grpTF, inline = "tf2")
-htfOnly = input.bool(false, "HTF-Only (hide timeframes below the chart)", group = grpTF,
-     tooltip = "On: only show levels from the current chart TF and higher. E.g. on 1D you see 1D+1W+1M; on 1W you see 1W+1M.")
+htfOnly = input.bool(true, "HTF-Only (hide timeframes below the chart)", group = grpTF,
+     tooltip = "On (default): only levels from the current chart TF and higher. TradingView SAMPLES sub-chart timeframe data (e.g. 15m data requested on a 1h chart), which creates phantom low-quality levels — keep this on unless you know why you need it off.")
 
 grpLvl = "Levels"
 maxLvl       = input.int(8, "Max Levels per Timeframe", minval = 1, maxval = 20, group = grpLvl)
@@ -1054,6 +1054,9 @@ if allSt.size() == 0
     allSt.push(stM15)
     allSt.push(stM5)
 
+// Store timeframe minutes, parallel to allSt (index-matched).
+var array<float> allStMin = array.from(43200.0, 10080.0, 1440.0, 240.0, 60.0, 15.0, 5.0)
+
 // Nearest un-broken level above and below a price, with its confidence score.
 // Returns [distAbove, scoreAbove, distBelow, scoreBelow].
 f_nearest(float px) =>
@@ -1163,9 +1166,15 @@ f_powerPick() =>
     float fnS = na
     bool  fnR = false
     nbest = 1.0e18
+    // Candidates: INSTITUTIONAL timeframes only (4H and above, or the chart TF
+    // if higher). H4/D/W/MN data is identical on every chart via security(),
+    // so the pick CANNOT differ between a 5m and a 1h chart — the jumping
+    // came from chart-local low-TF levels that exist in one book but not the
+    // other (e.g. sampled sub-chart data creating a phantom S-30 level).
+    powerFloor = math.max(240.0, chartMin)
     for si = 0 to allSt.size() - 1
         st = allSt.get(si)
-        if st.price.size() > 0
+        if st.price.size() > 0 and allStMin.get(si) >= powerFloor
             for i = 0 to st.price.size() - 1
                 if not st.broken.get(i)
                     p  = st.price.get(i)
