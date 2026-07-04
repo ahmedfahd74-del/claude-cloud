@@ -1,0 +1,298 @@
+//@version=6
+// =============================================================================
+//  FVG PROJECTION — crypto-optimized build
+//  Upgrades over the original (behaviour preserved):
+//    · viTop/viBottom were `var` locals → persisted stale values across events;
+//      now plain locals (every hasVI branch assigns both).
+//    · ATR noise filter: skips micro-FVGs (< n × selected-TF ATR) that dominate
+//      24/7 crypto tape. 0 disables. ATR rides the existing security() tuple.
+//    · Max Active Projections cap: oldest matrices are deleted beyond the cap,
+//      preventing 500-object churn on 1m crypto charts.
+// =============================================================================
+indicator("FVG proj", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ─────────────────────────────
+// GENERAL SETTINGS
+// ─────────────────────────────
+tfChoice   = input.string("current", "Timeframe", options=["current","15s","30s","1m","2m","3m","5m","15m","30m","1h","4h","1d","1w"], group="General")
+extendBars = input.int(25, "Extend (bars)", minval=1, group="General")
+subLevelDiv       = input.string("1/2", "Sub-Levels", options=["-", "1/2", "1/4", "1/8"], group="General")
+showLevelLabels  = input.bool(false, "Show Level Labels", group="General")
+minGapAtr  = input.float(0.10, "Min FVG Size (× ATR, 0 = off)", minval=0.0, maxval=2.0, step=0.05, group="General",
+     tooltip="Crypto noise filter: ignore fair value gaps smaller than this fraction of the selected timeframe's ATR(14).")
+maxActive  = input.int(20, "Max Active Projections", minval=1, maxval=100, group="General",
+     tooltip="Oldest projections are removed beyond this cap — keeps 1m crypto charts fast.")
+
+// ─────────────────────────────
+// INVALIDATION
+// ─────────────────────────────
+invalidationMode = input.string("Lock After N Bars", "Mode", options=["Always Active", "Until Traded Through", "Lock After N Bars"], group="Invalidation")
+invalidationTrigger = input.string("Close Beyond", "Trigger", options=["Wick Beyond", "Close Beyond"], group="Invalidation")
+lockBars   = input.int(80, "Lock After (bars)", minval=1, group="Invalidation")
+
+// ─────────────────────────────
+// BULLISH PROJECTION STYLE
+// ─────────────────────────────
+bullZoneColor      = input.color(color.new(color.gray, 92), "Fill", group="Bullish Projection")
+bullLineColor       = input.color(color.new(color.gray, 30), "Border Color", group="Bullish Projection")
+bullLineStyleInput  = input.string("Dashed", "Border Style", options=["Solid","Dashed","Dotted"], group="Bullish Projection")
+bullSubColor        = input.color(color.new(color.gray, 60), "Sub-Line Color", group="Bullish Projection")
+bullSubStyleInput   = input.string("Dashed", "Sub-Line Style", options=["Solid","Dashed","Dotted"], group="Bullish Projection")
+
+// ─────────────────────────────
+// BEARISH PROJECTION STYLE
+// ─────────────────────────────
+bearZoneColor      = input.color(color.new(color.gray, 92), "Fill", group="Bearish Projection")
+bearLineColor       = input.color(color.new(color.gray, 30), "Border Color", group="Bearish Projection")
+bearLineStyleInput  = input.string("Dashed", "Border Style", options=["Solid","Dashed","Dotted"], group="Bearish Projection")
+bearSubColor        = input.color(color.new(color.gray, 60), "Sub-Line Color", group="Bearish Projection")
+bearSubStyleInput   = input.string("Dashed", "Sub-Line Style", options=["Solid","Dashed","Dotted"], group="Bearish Projection")
+
+labelTextColor = color.gray
+labelBgColor   = color.new(color.white, 100)
+
+// ─────────────────────────────
+// HELPERS
+// ─────────────────────────────
+f_resolveTF(tf) =>
+    result = switch tf
+        "current" => timeframe.period
+        "15s" => "15S"
+        "30s" => "30S"
+        "1m"  => "1"
+        "2m"  => "2"
+        "3m"  => "3"
+        "5m"  => "5"
+        "15m" => "15"
+        "30m" => "30"
+        "1h"  => "60"
+        "4h"  => "240"
+        "1d"  => "1D"
+        "1w"  => "1W"
+        =>       timeframe.period
+    result
+
+f_lineStyle(s) =>
+    style = s == "Solid" ? line.style_solid : s == "Dotted" ? line.style_dotted : line.style_dashed
+    style
+
+f_isBreached(isBull, level, hVal, lVal, cVal) =>
+    invalidationTrigger == "Wick Beyond" ? (isBull ? hVal > level : lVal < level) : (isBull ? cVal > level : cVal < level)
+
+f_shouldCheck(createdBar, currentCounter) =>
+    result = switch invalidationMode
+        "Always Active" => false
+        "Until Traded Through" => true
+        "Lock After N Bars" => (currentCounter - createdBar) < lockBars
+        => true
+    result
+
+selectedTF = f_resolveTF(tfChoice)
+tfMs       = timeframe.in_seconds(selectedTF) * 1000
+
+// ─────────────────────────────
+// PROJECTION MATRIX TYPE
+// ─────────────────────────────
+type ProjMatrix
+    box   zoneBox
+    array<line>  lines
+    array<label> labels
+    bool  isBull
+    float furthestLevel
+    int   createdBar
+
+var array<ProjMatrix> activeMatrices = array.new<ProjMatrix>()
+var int barCounter = 0
+
+deleteMatrix(ProjMatrix m) =>
+    box.delete(m.zoneBox)
+    for ln in m.lines
+        line.delete(ln)
+    for lb in m.labels
+        label.delete(lb)
+    true
+
+// ─────────────────────────────
+// BUILD A PROJECTION MATRIX (box + boundary lines + sub-levels + labels)
+// ─────────────────────────────
+buildMatrix(leftTime, rightTime, zoneTop, zoneBottom, topLabelTxt, bottomLabelTxt, fillColor, lineColor, lineStyleConst, subColor, subStyleConst) =>
+    zoneBoxId = box.new(xloc=xloc.bar_time, left=leftTime, top=zoneTop, bottom=zoneBottom, right=rightTime,
+         bgcolor=fillColor, border_color=na)
+
+    linesArr  = array.new<line>()
+    labelsArr = array.new<label>()
+
+    topLine = line.new(xloc=xloc.bar_time, x1=leftTime, y1=zoneTop, x2=rightTime, y2=zoneTop,
+         color=lineColor, style=lineStyleConst)
+    botLine = line.new(xloc=xloc.bar_time, x1=leftTime, y1=zoneBottom, x2=rightTime, y2=zoneBottom,
+         color=lineColor, style=lineStyleConst)
+    array.push(linesArr, topLine)
+    array.push(linesArr, botLine)
+
+    if showLevelLabels
+        array.push(labelsArr, label.new(xloc=xloc.bar_time, x=rightTime, y=zoneTop, text=topLabelTxt,
+             style=label.style_label_left, size=size.small, textcolor=labelTextColor, color=labelBgColor))
+        array.push(labelsArr, label.new(xloc=xloc.bar_time, x=rightTime, y=zoneBottom, text=bottomLabelTxt,
+             style=label.style_label_left, size=size.small, textcolor=labelTextColor, color=labelBgColor))
+
+    rangeSize = zoneTop - zoneBottom
+    fractions = switch subLevelDiv
+        "1/2" => array.from(0.5)
+        "1/4" => array.from(0.25, 0.5, 0.75)
+        "1/8" => array.from(0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875)
+        =>       array.new<float>()
+
+    for f in fractions
+        lvl = zoneBottom + rangeSize * f
+        subLine = line.new(xloc=xloc.bar_time, x1=leftTime, y1=lvl, x2=rightTime, y2=lvl,
+             color=subColor, style=subStyleConst)
+        array.push(linesArr, subLine)
+        if showLevelLabels
+            txt = str.tostring(f, "#.###")
+            array.push(labelsArr, label.new(xloc=xloc.bar_time, x=rightTime, y=lvl, text=txt,
+                 style=label.style_label_left, size=size.small, textcolor=labelTextColor, color=labelBgColor))
+
+    [zoneBoxId, linesArr, labelsArr]
+
+// ─────────────────────────────
+// FETCH SELECTED-TIMEFRAME DATA (+ ATR for the crypto noise filter)
+// Candle 1 = offset [3] (confirmed), Candle 2 = offset [2] (confirmed),
+// Candle 3 = offset [1] (confirmed), Live/forming bar = offset [0]
+// ─────────────────────────────
+[o0, h0, l0, c0,
+ o1, h1, l1, c1, t1,
+ o2, h2, l2, c2,
+ o3, h3, l3, c3, t3, atrTF] = request.security(syminfo.tickerid, selectedTF,
+     [open, high, low, close,
+      open[1], high[1], low[1], close[1], time[1],
+      open[2], high[2], low[2], close[2],
+      open[3], high[3], low[3], close[3], time[3], ta.atr(14)],
+     lookahead=barmerge.lookahead_off)
+
+// ─────────────────────────────
+// ONGOING INVALIDATION CHECK — runs every chart bar against the
+// live/forming bar of the selected timeframe, on all existing matrices.
+// ─────────────────────────────
+if array.size(activeMatrices) > 0
+    for i = array.size(activeMatrices) - 1 to 0
+        m = array.get(activeMatrices, i)
+        if f_shouldCheck(m.createdBar, barCounter) and f_isBreached(m.isBull, m.furthestLevel, h0, l0, c0)
+            deleteMatrix(m)
+            array.remove(activeMatrices, i)
+
+// ─────────────────────────────
+// NEW CONFIRMED BAR GATE — detection only runs once per closed
+// bar of the selected timeframe, using fully confirmed data.
+// ─────────────────────────────
+var float lastConfirmedTime = na
+isNewBar = not na(t1) and (na(lastConfirmedTime) or t1 != lastConfirmedTime)
+
+if isNewBar
+    lastConfirmedTime := t1
+    barCounter += 1
+
+    // Crypto noise filter: gap must clear the minimum ATR fraction (if set).
+    minGap  = na(atrTF) or minGapAtr == 0 ? 0.0 : atrTF * minGapAtr
+    bullFVG = l1 > h3 and (minGap == 0.0 or l1 - h3 >= minGap)
+    bearFVG = h1 < l3 and (minGap == 0.0 or l3 - h1 >= minGap)
+
+    leftTime  = t3
+    rightTime = t3 + extendBars * tfMs
+
+    // ─────────────────────────────
+    // BULLISH
+    // ─────────────────────────────
+    if bullFVG
+        gap12 = math.min(o2, c2) > math.max(o3, c3)
+        gap23 = math.min(o1, c1) > math.max(o2, c2)
+        hasVI = gap12 or gap23
+
+        if hasVI
+            float viTop = na
+            float viBottom = na
+            if gap12 and gap23
+                viTop    := o2
+                viBottom := o1
+            else if gap12
+                viTop    := o2
+                viBottom := l1
+            else if gap23
+                viTop    := h3
+                viBottom := o1
+
+            stdTop        = l1
+            stdBottom     = h3
+            stdProjection = stdTop + 1.5 * (stdTop - stdBottom)
+
+            viAbsTop     = math.max(viTop, viBottom)
+            viAbsBottom  = math.min(viTop, viBottom)
+            viProjection = viAbsTop + 1.5 * (viAbsTop - viAbsBottom)
+
+            zoneTop    = math.max(stdProjection, viProjection)
+            zoneBottom = math.min(stdProjection, viProjection)
+
+            topLabelTxt    = stdProjection > viProjection ? "FVG 1.5" : "VI 1.5"
+            bottomLabelTxt = stdProjection > viProjection ? "VI 1.5" : "FVG 1.5"
+
+            [zoneBoxId, linesArr, labelsArr] = buildMatrix(leftTime, rightTime, zoneTop, zoneBottom, topLabelTxt, bottomLabelTxt,
+                 bullZoneColor, bullLineColor, f_lineStyle(bullLineStyleInput), bullSubColor, f_lineStyle(bullSubStyleInput))
+
+            newMatrix = ProjMatrix.new(zoneBoxId, linesArr, labelsArr, true, zoneTop, barCounter)
+
+            if f_shouldCheck(barCounter, barCounter) and f_isBreached(true, zoneTop, h1, l1, c1)
+                deleteMatrix(newMatrix)
+            else
+                array.push(activeMatrices, newMatrix)
+
+    // ─────────────────────────────
+    // BEARISH
+    // ─────────────────────────────
+    if bearFVG
+        gap12 = math.max(o2, c2) < math.min(o3, c3)
+        gap23 = math.max(o1, c1) < math.min(o2, c2)
+        hasVI = gap12 or gap23
+
+        if hasVI
+            float viTop = na
+            float viBottom = na
+            if gap12 and gap23
+                viTop    := o2
+                viBottom := o1
+            else if gap12
+                viTop    := o2
+                viBottom := h1
+            else if gap23
+                viTop    := l3
+                viBottom := o1
+
+            stdTop        = l3
+            stdBottom     = h1
+            stdProjection = stdBottom - 1.5 * (stdTop - stdBottom)
+
+            viAbsTop     = math.max(viTop, viBottom)
+            viAbsBottom  = math.min(viTop, viBottom)
+            viProjection = viAbsBottom - 1.5 * (viAbsTop - viAbsBottom)
+
+            zoneTop    = math.max(stdProjection, viProjection)
+            zoneBottom = math.min(stdProjection, viProjection)
+
+            topLabelTxt    = stdProjection > viProjection ? "FVG 1.5" : "VI 1.5"
+            bottomLabelTxt = stdProjection > viProjection ? "VI 1.5" : "FVG 1.5"
+
+            [zoneBoxId, linesArr, labelsArr] = buildMatrix(leftTime, rightTime, zoneTop, zoneBottom, topLabelTxt, bottomLabelTxt,
+                 bearZoneColor, bearLineColor, f_lineStyle(bearLineStyleInput), bearSubColor, f_lineStyle(bearSubStyleInput))
+
+            newMatrix = ProjMatrix.new(zoneBoxId, linesArr, labelsArr, false, zoneBottom, barCounter)
+
+            if f_shouldCheck(barCounter, barCounter) and f_isBreached(false, zoneBottom, h1, l1, c1)
+                deleteMatrix(newMatrix)
+            else
+                array.push(activeMatrices, newMatrix)
+
+    // ─────────────────────────────
+    // PERFORMANCE CAP — drop the OLDEST projections beyond the limit.
+    // ─────────────────────────────
+    while array.size(activeMatrices) > maxActive
+        oldest = array.get(activeMatrices, 0)
+        deleteMatrix(oldest)
+        array.remove(activeMatrices, 0)

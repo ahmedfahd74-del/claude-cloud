@@ -31,16 +31,16 @@ indicator("Institutional Adaptive S/R Engine", "IA-SR", overlay = true,
 // # SECTION 1 — INPUTS
 // #############################################################################
 grpMode = "Engine Mode"
-engineMode = input.string("Balanced", "Market Sensitivity Mode", group = grpMode,
-     options = ["Conservative", "Balanced", "Aggressive", "Ultra Aggressive"],
-     tooltip = "One switch that retunes the whole engine: probability thresholds, S/R sensitivity, liquidity sensitivity and confirmation strictness. Conservative = fewer/higher-accuracy signals; Ultra Aggressive = scalping bias.")
+engineMode = input.string("Adaptive (Auto)", "Market Sensitivity Mode", group = grpMode,
+     options = ["Adaptive (Auto)", "Conservative", "Balanced", "Aggressive", "Ultra Aggressive"],
+     tooltip = "Adaptive (Auto) derives strictness live from volatility, regime, liquidity and market noise — recommended. The named presets are manual overrides. Affects ONLY trade filtering and probability thresholds; S/R levels are never changed by this setting.")
 
 grpAdapt = "Adaptive Engine (auto — leave default)"
 sensBias = input.float(1.0, "Sensitivity Bias", minval = 0.5, maxval = 2.0, step = 0.1,
      group = grpAdapt,
      tooltip = "Global nudge on adaptive sensitivity. 1.0 = fully automatic. Only touch if you want the engine broadly tighter/looser.")
 
-grpSR2 = "S/R Engine"
+grpSR2 = "S/R Engine (manual overrides — leave 1.0 for auto)"
 lvlSens    = input.float(1.0, "Level Sensitivity ×",              minval = 0.5,  maxval = 2.0, step = 0.1,  group = grpSR2, tooltip = "Higher = shorter adaptive pivot legs = more levels.")
 touchWMult = input.float(1.0, "Touch Weight ×",                   minval = 0.2,  maxval = 3.0, step = 0.1,  group = grpSR2)
 reactWMult = input.float(1.0, "Reaction Weight ×",                minval = 0.2,  maxval = 3.0, step = 0.1,  group = grpSR2)
@@ -50,21 +50,17 @@ decaySpd   = input.float(1.0, "Time Decay Speed ×",               minval = 0.25
 htfInfl    = input.float(1.0, "HTF Confluence Influence ×",       minval = 0.3,  maxval = 2.5, step = 0.1,  group = grpSR2)
 ltfNoise   = input.float(1.0, "LTF Noise Filter ×",               minval = 0.5,  maxval = 2.0, step = 0.1,  group = grpSR2, tooltip = "Higher = 15m/5m levels carry less weight in scoring and confluence.")
 
-grpProb2 = "Probability Engine"
+grpProb2 = "Probability Engine (manual overrides — leave 1.0 for auto)"
 wStruct = input.float(1.0, "Trend / Structure Weight ×",  minval = 0.0, maxval = 2.0, step = 0.1, group = grpProb2)
 wSRW    = input.float(1.0, "S/R Weight ×",                minval = 0.0, maxval = 2.0, step = 0.1, group = grpProb2)
 wLiq    = input.float(1.0, "Liquidity / SMC Weight ×",    minval = 0.0, maxval = 2.0, step = 0.1, group = grpProb2)
 wMom    = input.float(1.0, "Momentum Weight ×",           minval = 0.0, maxval = 2.0, step = 0.1, group = grpProb2)
 volAdjF = input.float(0.5, "Volatility Dampening",        minval = 0.0, maxval = 1.0, step = 0.1, group = grpProb2, tooltip = "Shrinks probability edge when volatility expands beyond normal (uncertainty discount).")
 
-// --- Mode-derived tuning (single source; every engine reads these) ----------
-modeIdx   = engineMode == "Conservative" ? 0 : engineMode == "Balanced" ? 1 : engineMode == "Aggressive" ? 2 : 3
-mProbAdj  = modeIdx == 0 ? 5.0  : modeIdx == 1 ? 0.0 : modeIdx == 2 ? -5.0  : -10.0
-mScoreAdj = modeIdx == 0 ? 10.0 : modeIdx == 1 ? 0.0 : modeIdx == 2 ? -10.0 : -20.0
-mQualAdj  = modeIdx == 0 ? 8.0  : modeIdx == 1 ? 0.0 : modeIdx == 2 ? -8.0  : -14.0
-mSens     = modeIdx == 0 ? 0.85 : modeIdx == 1 ? 1.0 : modeIdx == 2 ? 1.2   : 1.5
-mWick     = modeIdx == 0 ? 1.0  : modeIdx == 1 ? 0.8 : modeIdx == 2 ? 0.7   : 0.6
-effSens   = sensBias * mSens * lvlSens
+// Detection sensitivity: MANUAL overrides only (sensBias × lvlSens). The
+// Engine Mode deliberately has no path into swing detection or the level
+// book — levels are facts; mode only changes filtering and probability.
+detSens   = sensBias * lvlSens
 
 grpTF = "Higher-Timeframe Sources"
 useMN = input.bool(false, "Monthly", group = grpTF, inline = "tf")
@@ -104,6 +100,11 @@ showPowerLine = input.bool(true, "Show Power Line", group = grpPower,
      tooltip = "A single line marking the nearest turning point where price is expected to flip back into the dominant HTF trend. Overall bear → nearest resistance above; overall bull → nearest support below. Does not touch the main S/R lines.")
 colPower      = input.color(color.new(#ffd600, 0), "Power Line Color", group = grpPower)
 powerWidth    = input.int(2, "Power Line Width", minval = 1, maxval = 6, group = grpPower)
+powerRadius   = input.float(8.0, "Search Radius (ATR)", minval = 1.0, maxval = 30.0, step = 0.5, group = grpPower,
+     tooltip = "How far from price the engine may look for its highest-confidence level.")
+powerMinSc    = input.int(60, "Min Level Score", minval = 0, maxval = 100, group = grpPower)
+powerShowStat = input.bool(true, "Show Status Intelligence", group = grpPower,
+     tooltip = "Adds respect / break-likely / retest-likely and next-action readout to the Power label.")
 
 grpSMC = "Liquidity / SMC"
 showFVGZones = input.bool(false, "Draw FVG (imbalance) Zones", group = grpSMC,
@@ -219,6 +220,9 @@ volRatio   = f_div(volume, volAvg)
 highLiq    = volRatio > 1.3
 lowLiq     = volRatio < 0.6
 
+// --- 3.4b Market noise (Kaufman efficiency ratio: ~1 clean trend, ~0 chop) --
+effRatio   = f_clamp(f_div(math.abs(close - nz(close[20], close)), nz(math.sum(math.abs(close - nz(close[1], close)), 20), 1.0)), 0.0, 1.0)
+
 // --- 3.5 News / shock detection (ATR spike or gap) -------------------------
 atrSpike   = f_div(atrFast, atrFast[5]) > 1.6
 gapMove    = f_div(math.abs(open - close[1]), atrFast) > 0.8
@@ -240,10 +244,10 @@ regimeTxt  = newsDriven ? "NEWS / SHOCK"          :
 // cleaner swings). Calm/low-vol → shorter leg (more responsive). Custom swing
 // detector in Phase 2 will consume this as a *series* int (impossible with
 // ta.pivothigh — that's why we roll our own).
-adPivotLen = int(f_clamp(math.round(5 * volMult / effSens), 3, MAXLEG))
+adPivotLen = int(f_clamp(math.round(5 * volMult / detSens), 3, MAXLEG))
 
 // Zone half-width multiplier (× HTF ATR). Wider in expansion, tighter in squeeze.
-adZoneMult = f_clamp(volMult * (isExpand ? 1.4 : isCompress ? 0.7 : 1.0) * effSens, 0.4, 3.0)
+adZoneMult = f_clamp(volMult * (isExpand ? 1.4 : isCompress ? 0.7 : 1.0) * detSens, 0.4, 3.0)
 
 // ATR multiplier for break/rejection thresholds.
 adAtrMult  = f_clamp(1.0 * volMult, 0.6, 2.5)
@@ -262,6 +266,18 @@ adMergeMult = f_clamp(0.6 * volMult, 0.3, 1.5)
 
 // Chart timeframe in minutes — consumed by TF gating and level-store scaling.
 chartMin = timeframe.in_seconds() / 60.0
+
+// --- Mode tuning: ADAPTIVE FIRST. In Adaptive (Auto) the strictness shifts
+//     are derived live from regime, liquidity, volatility and market noise;
+//     the named presets are manual overrides. These values feed ONLY trade
+//     filtering, probability thresholds and sweep sensitivity — they have no
+//     path into swing detection or the level book (levels never change).
+autoStrict = f_clamp((newsDriven ? 6.0 : 0.0) + (lowLiq ? 3.0 : 0.0) + (isCompress ? 2.0 : 0.0) + (0.5 - effRatio) * 10.0 - (isTrending and highLiq ? 4.0 : 0.0), -10.0, 10.0)
+isAuto    = engineMode == "Adaptive (Auto)"
+mProbAdj  = isAuto ? autoStrict * 0.8 : engineMode == "Conservative" ? 5.0  : engineMode == "Balanced" ? 0.0 : engineMode == "Aggressive" ? -5.0  : -10.0
+mScoreAdj = isAuto ? autoStrict * 1.5 : engineMode == "Conservative" ? 10.0 : engineMode == "Balanced" ? 0.0 : engineMode == "Aggressive" ? -10.0 : -20.0
+mQualAdj  = isAuto ? autoStrict * 1.2 : engineMode == "Conservative" ? 8.0  : engineMode == "Balanced" ? 0.0 : engineMode == "Aggressive" ? -8.0  : -14.0
+mWick     = isAuto ? f_clamp(0.8 + autoStrict * 0.02, 0.6, 1.0) : engineMode == "Conservative" ? 1.0 : engineMode == "Balanced" ? 0.8 : engineMode == "Aggressive" ? 0.7 : 0.6
 
 // #############################################################################
 // # SECTION 5 — SWING ENGINE   (custom, series-length, non-repaint)
@@ -308,7 +324,7 @@ f_htfPack() =>
     aF   = ta.atr(14)
     aS   = ta.atr(50)
     vM   = f_clamp(f_div(aF, aS), 0.5, 2.5)
-    leg  = int(f_clamp(math.round(5 * vM / effSens), 3, MAXLEG))
+    leg  = int(f_clamp(math.round(5 * vM / detSens), 3, MAXLEG))
     [ph, pl] = f_swing(leg)
     // Hold last confirmed pivot + keep arrays of the last maxLvl pivots per side.
     // The arrays let the chart seed full HTF history on bar 1 regardless of how
@@ -854,16 +870,25 @@ stH1.atrTF  := nz(atrH1,  atrSafe)
 stM15.atrTF := nz(atrM15, atrSafe)
 stM5.atrTF  := nz(atrM5,  atrSafe)
 
-// Seed full HTF pivot history over the first few bars (arrays are na until the
-// HTF context resolves; merge-dedup keeps repeats harmless). Works on short LTF charts.
-if bar_index <= 3
-    f_seed(stMN,  hiMN,  loMN,  effUseMN,  colMN,  2, lsMN)
-    f_seed(stW,   hiW,   loW,   effUseW,   colW,   3, lsW)
-    f_seed(stD,   hiD,   loD,   effUseD,   colD,   2, lsD)
-    f_seed(stH4,  hiH4,  loH4,  effUseH4,  colH4,  1, lsH4)
-    f_seed(stH1,  hiH1,  loH1,  effUseH1,  colH1,  1, lsH1)
-    f_seed(stM15, hiM15, loM15, effUseM15, colM15, 1, lsM15)
-    f_seed(stM5,  hiM5,  loM5,  effUseM5,  colM5,  1, lsM5)
+// Seed full HTF pivot history. request.security data for high timeframes can
+// resolve LATE on very low chart TFs (the old bar<=3 window silently missed
+// Weekly/Daily levels on 1m charts). Each store now retries every bar until
+// it holds levels, through the first 50 bars; merge-dedup keeps it harmless.
+if bar_index <= 50
+    if stMN.price.size() == 0
+        f_seed(stMN,  hiMN,  loMN,  effUseMN,  colMN,  2, lsMN)
+    if stW.price.size() == 0
+        f_seed(stW,   hiW,   loW,   effUseW,   colW,   3, lsW)
+    if stD.price.size() == 0
+        f_seed(stD,   hiD,   loD,   effUseD,   colD,   2, lsD)
+    if stH4.price.size() == 0
+        f_seed(stH4,  hiH4,  loH4,  effUseH4,  colH4,  1, lsH4)
+    if stH1.price.size() == 0
+        f_seed(stH1,  hiH1,  loH1,  effUseH1,  colH1,  1, lsH1)
+    if stM15.price.size() == 0
+        f_seed(stM15, hiM15, loM15, effUseM15, colM15, 1, lsM15)
+    if stM5.price.size() == 0
+        f_seed(stM5,  hiM5,  loM5,  effUseM5,  colM5,  1, lsM5)
 
 // Line style per timeframe — user controlled (defaults all solid).
 if effUseMN and chgPhMN
@@ -1018,12 +1043,34 @@ stateCol = marketState == "Trend Expansion" or marketState == "Momentum Continua
      marketState == "Liquidity Hunt"       ? color.fuchsia :
      marketState == "Trend Exhaustion" or marketState == "Reversal Risk" ? color.orange : color.silver
 
-// --- POWER LINE: nearest turning point back into the dominant HTF trend ------
-// Overall bear → the resistance above that should flip price down.
-// Overall bull → the support below that should flip price up.
-// Dominant trending HTF (highest priority: W→D→4H→1H) defines the flip level.
-// Its swing high = ceiling in a downtrend, swing low = floor in an uptrend.
-// Sourced from held HTF swings → identical price on every chart timeframe.
+// --- POWER LINE v2: the single highest-confidence level in the whole book ---
+// Rank = confidence score × TF importance × proximity, searched within
+// powerRadius ATR of price. THE one line to keep if all others are hidden.
+// Falls back to the dominant HTF trend's held swing when nothing qualifies.
+f_powerPick() =>
+    float bp = na
+    float bs = na
+    bool  br = false
+    best = -1.0
+    for si = 0 to allSt.size() - 1
+        st = allSt.get(si)
+        if st.price.size() > 0
+            for i = 0 to st.price.size() - 1
+                if not st.broken.get(i)
+                    p  = st.price.get(i)
+                    sc = st.score.get(i)
+                    d  = f_div(math.abs(close - p), atrFast)
+                    if sc >= powerMinSc and d <= powerRadius
+                        rank = sc * (0.6 + 0.4 * st.w) * (1.0 - 0.5 * d / powerRadius)
+                        if rank > best
+                            best := rank
+                            bp := p
+                            bs := sc
+                            br := st.isRes.get(i)
+    [bp, bs, br]
+[pwrP, pwrScore, pwrIsRes] = f_powerPick()
+
+// Fallback: dominant trending HTF (W→D→4H→1H) held swing, as before.
 float domTr = na
 float domPh = na
 float domPl = na
@@ -1043,8 +1090,20 @@ else if useH1 and f_trendSign(trH1) != 0
     domTr := trH1
     domPh := lastPhH1
     domPl := lastPlH1
-powerPrice = na(domTr) ? na : domTr < 0 ? domPh : domPl
+powerPrice = not na(pwrP) ? pwrP : na(domTr) ? na : domTr < 0 ? domPh : domPl
+powerIsRes = not na(pwrP) ? pwrIsRes : not na(domTr) and domTr < 0
 pdist      = na(powerPrice) ? na : f_div(math.abs(close - powerPrice), atrFast)
+
+// Status intelligence — what the engine expects at this line (existing
+// globals only: htfAlign, momentum, side; no recomputation).
+pwrWrongSide = not na(powerPrice) and (powerIsRes ? close > powerPrice : close < powerPrice)
+pwrPressing  = not na(pdist) and pdist < 0.5
+pwrBreaking  = pwrPressing and (powerIsRes ? htfBull and mom > 0.2 : htfBear and mom < -0.2)
+pwrStatus    = na(powerPrice) ? "" :
+     pwrWrongSide and pdist < 1.5 ? "RETEST LIKELY" :
+     pwrWrongSide                 ? "BROKEN — new side" :
+     pwrBreaking                  ? "BREAK LIKELY" :
+     pwrPressing                  ? "RESPECT EXPECTED" : "HOLDING"
 
 var line  powerLn = na
 var label powerLb = na
@@ -1060,7 +1119,10 @@ if showPowerLine and not na(powerPrice)
         line.set_color(powerLn, colPower)
         line.set_width(powerLn, powerWidth)
         label.set_xy(powerLb, bar_index, powerPrice)
-    label.set_text(powerLb, "⚡ POWER  " + f_px(powerPrice) + "  |  " + str.tostring(pdist, "#.#") + " ATR" + (close > powerPrice ? "  ▲ above" : "  ▼ below"))
+    ptxt = "⚡ POWER  " + f_px(powerPrice) + " · " + (powerIsRes ? "R" : "S") + (na(pwrScore) ? "" : " " + str.tostring(math.round(pwrScore))) + " · " + str.tostring(pdist, "#.#") + " ATR · " + (htfBull ? "BULL" : htfBear ? "BEAR" : "NEUTRAL")
+    if powerShowStat
+        ptxt += " · " + pwrStatus + (htfBull ? "  → higher" : htfBear ? "  → lower" : "  → range")
+    label.set_text(powerLb, ptxt)
     label.set_color(powerLb, colPower)
 else
     if not na(powerLn)
