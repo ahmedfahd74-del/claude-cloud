@@ -24,8 +24,14 @@
 //    VISUAL    : Sections 13, 14 (render), 15 — Pine-only, never ported
 // =============================================================================
 
-indicator("Institutional Adaptive S/R Engine", "IA-SR", overlay = true,
+indicator("Institutional Adaptive S/R Engine  [v2.0.4 · 2026-07-04]", "IA-SR v2.0.4", overlay = true,
      max_lines_count = 200, max_labels_count = 200, max_boxes_count = 250)
+
+// BUILD TAG — bumped every release. Shows in the indicator title on the chart
+// (top-left) and on the dashboard's top row, so you can always confirm the
+// running version. If this differs from the tag I quote in chat, you're on an
+// old copy — re-paste the file I attached. Keep this in sync with the title.
+BUILD = "v2.0.4 · 2026-07-04"
 
 // #############################################################################
 // # SECTION 1 — INPUTS
@@ -1409,7 +1415,8 @@ f_prow(int r, string k, string v, color vc) =>
 if showPanel and barstate.islast
     table.cell(panel, 0, 0, "IA-SR  ·  MARKET STRUCTURE", text_color = color.white,
          text_size = size.small, text_halign = text.align_left)
-    table.cell(panel, 1, 0, "", text_color = color.white)
+    table.cell(panel, 1, 0, BUILD, text_color = color.new(color.gray, 0),
+         text_size = size.small, text_halign = text.align_right)
     f_prow(1,  "Regime",       regimeTxt,                                     regimeColor)
     f_prow(2,  "Vol Regime",   str.tostring(volRegime, "#.##") + "x",         volRegime > 1.15 ? color.orange : volRegime < 0.85 ? color.aqua : color.silver)
     f_prow(3,  "Trend Str",    str.tostring(trendStr, "#.##") + (trendUp ? " ▲" : " ▼"), isTrending ? (trendUp ? color.lime : color.red) : color.silver)
