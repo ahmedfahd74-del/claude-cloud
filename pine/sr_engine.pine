@@ -1171,9 +1171,18 @@ f_powerPick() =>
                         fnS := sc
                         fnR := st.isRes.get(i)
                     if d <= powerRadius and (sc >= powerMinSc or d <= 0.8)
-                        prox  = f_clamp(1.0 - d / powerRadius, 0.0, 1.0)
-                        inter = d <= 0.3 ? 2.0 : d <= 0.8 ? 1.4 : 1.0
-                        rank  = math.max(sc, 25.0) * (0.6 + 0.4 * st.w) * (0.15 + 0.85 * prox) * inter
+                        // Absolute inverse-distance: NEARNESS dominates. A level
+                        // 0.4 ATR away is genuinely ranked above one 0.5 ATR
+                        // away (the old radius-normalised term flattened both to
+                        // ~0.95, letting score drift the pick off the level price
+                        // is on). TF importance (0.55..1.0) still lifts a Daily/
+                        // Weekly line over 5m noise that's slightly closer;
+                        // score is only a gentle ±30% nudge, never overriding
+                        // which level the market is actually trading against.
+                        prox = 1.0 / (0.30 + d)
+                        tfw  = 0.55 + 0.45 * st.w
+                        scw  = 0.70 + 0.30 * f_clamp(sc / 100.0, 0.0, 1.0)
+                        rank = prox * tfw * scw
                         if rank > best
                             best := rank
                             bp := p
