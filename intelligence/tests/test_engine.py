@@ -210,6 +210,61 @@ class TestPortfolio(unittest.TestCase):
         self.assertIn("USD", why)
 
 
+class TestTiersAndReport(unittest.TestCase):
+    def _scan(self):
+        from ia_sr.portfolio import PortfolioController
+        feed = SyntheticFeed(total_bars=20000)
+        cfg = ScanConfig(symbols=["EURUSD", "BTCUSD", "XAUUSD"], history_bars=400)
+        pc = PortfolioController()
+        return scan(feed, cfg, portfolio=pc), pc, cfg
+
+    def test_three_tier_output(self):
+        result, _, cfg = self._scan()
+        for o in result.all_ranked:
+            self.assertIn(o.tier, ("A", "B", "C"))
+            self.assertTrue(0.0 <= o.gate_score <= 100.0)
+        self.assertEqual(result.watch,
+                         [o for o in result.all_ranked if o.tier == "B"][:cfg.top_n])
+        self.assertTrue(all(o.tier == "A" for o in result.approved))
+
+    def test_session_report_text_and_html(self):
+        from ia_sr import report as report_mod
+        from ia_sr.learning import LearningEngine
+        result, pc, _ = self._scan()
+        eng = LearningEngine(":memory:")
+        eng.record_pine_payload({"v": 1, "sym": "EURUSD", "tf": "60",
+                                 "bias": "SHORT", "bull": 34, "bear": 66,
+                                 "tier": "B", "gs": 74, "valid": False,
+                                 "power": 1.08})
+        rep = report_mod.build(result, pc, eng)
+        txt = report_mod.to_text(rep)
+        self.assertIn("SESSION REPORT", txt)
+        self.assertIn("TIER B — WATCH", txt)
+        self.assertIn("PINE PARITY", txt)
+        page = report_mod.to_html(rep, refresh_sec=60)
+        self.assertIn("<table>", page)
+        self.assertIn("refresh' content='60'", page)
+        self.assertIn("Pine Parity", page)
+
+    def test_pine_payload_parsed_for_parity(self):
+        from ia_sr.learning import LearningEngine
+        eng = LearningEngine(":memory:")
+        eng.record_pine_payload({"v": 1, "sym": "SOLUSD", "tf": "60",
+                                 "bias": "LONG", "bull": 71, "bear": 29,
+                                 "tier": "A", "gs": 88, "valid": True,
+                                 "entry": 80.2, "power": 79.97})
+        latest = eng.pine_latest()
+        self.assertIn("SOLUSD", latest)
+        self.assertEqual(latest["SOLUSD"]["bias"], "LONG")
+        self.assertTrue(latest["SOLUSD"]["valid"])
+
+    def test_feed_registry(self):
+        from ia_sr.datafeed import make_feed
+        self.assertTrue(make_feed("synthetic").bars("EURUSD", "1h", 10))
+        with self.assertRaises(ValueError):
+            make_feed("nonexistent")
+
+
 class TestEndToEnd(unittest.TestCase):
     def test_analyze_and_scan_synthetic(self):
         feed = SyntheticFeed(total_bars=20000)

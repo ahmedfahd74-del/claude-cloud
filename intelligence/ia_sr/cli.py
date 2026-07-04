@@ -1,26 +1,54 @@
 """Command-line interface.
 
-    python -m ia_sr scan [--feed synthetic|yfinance] [--symbols A,B] [--top N] [--json]
-    python -m ia_sr resolve [--db PATH]        # settle open signals, update calibration
+    python -m ia_sr scan      [--feed NAME] [--symbols A,B] [--top N] [--json]
+    python -m ia_sr report    [--feed NAME] [--out report.html]   # session report
+    python -m ia_sr dashboard [--feed NAME] [--port 8899] [--interval 300]
+    python -m ia_sr live      [--feed yfinance] [--interval 900]  # continuous loop
+    python -m ia_sr resolve   [--db PATH]      # settle open signals, update calibration
     python -m ia_sr calibration [--db PATH]    # expected vs realised win rate
-    python -m ia_sr webhook [--port 8787]      # receive Pine JSON exports
+    python -m ia_sr webhook   [--port 8787]    # receive Pine JSON exports
 """
 from __future__ import annotations
 
 import argparse
 import json
+import time
 
+from . import report as report_mod
 from .config import ScanConfig
-from .datafeed import SyntheticFeed
+from .datafeed import FEEDS, make_feed
 from .learning import LearningEngine
+from .portfolio import PortfolioController
 from .scanner import scan
 
 
 def _feed(name: str):
-    if name == "yfinance":
-        from .datafeed import YFinanceFeed
-        return YFinanceFeed()
-    return SyntheticFeed()
+    return make_feed(name)
+
+
+def _cfg_from(args) -> ScanConfig:
+    cfg = ScanConfig()
+    if getattr(args, "symbols", ""):
+        cfg.symbols = [s.strip().upper() for s in args.symbols.split(",")]
+    if getattr(args, "top", None):
+        cfg.top_n = args.top
+    return cfg
+
+
+def _run_session(args, feed=None):
+    """One full session pass: scan -> resolve -> report. Returns the report."""
+    cfg = _cfg_from(args)
+    learning = LearningEngine(args.db) if args.db else None
+    controller = PortfolioController()
+    result = scan(feed or _feed(args.feed), cfg, learning=learning,
+                  portfolio=controller)
+    if learning is not None:
+        try:
+            learning.resolve_open(feed or _feed(args.feed), cfg.base_tf,
+                                  cfg.tf_minutes(cfg.base_tf))
+        except Exception:
+            pass  # resolution must never kill a report
+    return report_mod.build(result, controller, learning)
 
 
 def _fmt(x, digits=5):
@@ -59,6 +87,80 @@ def cmd_scan(args) -> None:
         print(f"\nerrors: {result.errors}")
 
 
+def cmd_report(args) -> None:
+    rep = _run_session(args)
+    print(report_mod.to_text(rep))
+    if args.out:
+        with open(args.out, "w") as f:
+            f.write(report_mod.to_html(rep))
+        print(f"\nHTML report written to {args.out}")
+
+
+def cmd_dashboard(args) -> None:
+    """Watchlist dashboard: serves the session report, rescanning on a TTL."""
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    feed = _feed(args.feed)
+    cache = {"html": b"", "ts": 0.0}
+
+    def render() -> bytes:
+        rep = _run_session(args, feed=feed)
+        return report_mod.to_html(rep, refresh_sec=max(args.interval, 30)).encode()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 — stdlib API
+            if self.path not in ("/", "/index.html"):
+                self.send_response(404)
+                self.end_headers()
+                return
+            if time.time() - cache["ts"] > args.interval:
+                try:
+                    cache["html"] = render()
+                    cache["ts"] = time.time()
+                except Exception as exc:   # keep serving the last good page
+                    if not cache["html"]:
+                        cache["html"] = f"<pre>scan failed: {exc}</pre>".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(cache["html"])
+
+        def log_message(self, fmt, *a):  # quiet
+            pass
+
+    print(f"IA-SR dashboard on http://localhost:{args.port} "
+          f"(feed={args.feed}, rescan every {args.interval}s)")
+    HTTPServer(("0.0.0.0", args.port), Handler).serve_forever()
+
+
+def cmd_live(args) -> None:
+    """Continuous institutional loop: scan -> record -> resolve -> report."""
+    feed_name = args.feed
+    n = 0
+    while True:
+        n += 1
+        start = time.time()
+        try:
+            rep = _run_session(args, feed=_feed(feed_name))  # fresh feed = fresh data
+            if args.out:
+                with open(args.out, "w") as f:
+                    f.write(report_mod.to_html(rep, refresh_sec=args.interval))
+            s = rep.stats or {}
+            print(f"[{time.strftime('%H:%M:%S')}] pass {n}: "
+                  f"{len(rep.execute)} execute, {len(rep.watch)} watch, "
+                  f"{s.get('open', 0)} open, {s.get('resolved', 0)} resolved"
+                  f"{' -> ' + args.out if args.out else ''}")
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            print(f"[{time.strftime('%H:%M:%S')}] pass {n} FAILED: {exc}")
+        try:
+            time.sleep(max(30.0, args.interval - (time.time() - start)))
+        except KeyboardInterrupt:
+            print("\nlive loop stopped")
+            return
+
+
 def cmd_resolve(args) -> None:
     cfg = ScanConfig()
     eng = LearningEngine(args.db)
@@ -81,16 +183,44 @@ def main(argv=None) -> None:
     ap = argparse.ArgumentParser(prog="ia_sr", description="IA-SR intelligence layer")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
+    feeds = sorted(FEEDS)
+
     p = sub.add_parser("scan", help="market-wide scan + ranking")
-    p.add_argument("--feed", default="synthetic", choices=["synthetic", "yfinance"])
+    p.add_argument("--feed", default="synthetic", choices=feeds)
     p.add_argument("--symbols", default="")
     p.add_argument("--top", type=int, default=10)
     p.add_argument("--db", default="ia_sr.db")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_scan)
 
+    p = sub.add_parser("report", help="institutional session report (text + HTML)")
+    p.add_argument("--feed", default="synthetic", choices=feeds)
+    p.add_argument("--symbols", default="")
+    p.add_argument("--top", type=int, default=10)
+    p.add_argument("--db", default="ia_sr.db")
+    p.add_argument("--out", default="report.html")
+    p.set_defaults(fn=cmd_report)
+
+    p = sub.add_parser("dashboard", help="live watchlist dashboard (auto-rescan)")
+    p.add_argument("--feed", default="synthetic", choices=feeds)
+    p.add_argument("--symbols", default="")
+    p.add_argument("--top", type=int, default=10)
+    p.add_argument("--db", default="ia_sr.db")
+    p.add_argument("--port", type=int, default=8899)
+    p.add_argument("--interval", type=int, default=300)
+    p.set_defaults(fn=cmd_dashboard)
+
+    p = sub.add_parser("live", help="continuous scan/record/resolve loop")
+    p.add_argument("--feed", default="yfinance", choices=feeds)
+    p.add_argument("--symbols", default="")
+    p.add_argument("--top", type=int, default=10)
+    p.add_argument("--db", default="ia_sr.db")
+    p.add_argument("--interval", type=int, default=900)
+    p.add_argument("--out", default="report.html")
+    p.set_defaults(fn=cmd_live)
+
     p = sub.add_parser("resolve", help="settle open signals against fresh bars")
-    p.add_argument("--feed", default="synthetic", choices=["synthetic", "yfinance"])
+    p.add_argument("--feed", default="synthetic", choices=feeds)
     p.add_argument("--db", default="ia_sr.db")
     p.set_defaults(fn=cmd_resolve)
 

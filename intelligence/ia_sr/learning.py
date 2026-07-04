@@ -44,6 +44,19 @@ CREATE TABLE IF NOT EXISTS pine_payloads (
     received_ts INTEGER NOT NULL,
     payload TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS pine_plans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    received_ts INTEGER NOT NULL,
+    sym TEXT NOT NULL,
+    tf TEXT NOT NULL,
+    state TEXT, bias TEXT, quality TEXT, regime TEXT, tier TEXT,
+    bull REAL, bear REAL, gs REAL, htf_align REAL,
+    valid INTEGER,
+    entry REAL, stop REAL, tp1 REAL, tp2 REAL, tp3 REAL, rr REAL,
+    power REAL, atr REAL,
+    plan_n INTEGER, plan_win REAL
+);
+CREATE INDEX IF NOT EXISTS idx_pine_plans_sym ON pine_plans (sym, received_ts);
 """
 
 
@@ -86,9 +99,51 @@ class LearningEngine:
         return cur.lastrowid
 
     def record_pine_payload(self, payload: dict) -> None:
+        """Store the raw Section-16 export AND its parsed row (parity dataset)."""
+        now = int(time.time())
         self.db.execute("INSERT INTO pine_payloads (received_ts, payload) VALUES (?,?)",
-                        (int(time.time()), json.dumps(payload)))
+                        (now, json.dumps(payload)))
+        g = payload.get
+        if g("sym"):
+            self.db.execute(
+                "INSERT INTO pine_plans (received_ts, sym, tf, state, bias, quality,"
+                " regime, tier, bull, bear, gs, htf_align, valid, entry, stop,"
+                " tp1, tp2, tp3, rr, power, atr, plan_n, plan_win)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (now, g("sym"), g("tf", ""), g("state"), g("bias"), g("quality"),
+                 g("regime"), g("tier"), g("bull"), g("bear"), g("gs"), g("htfAlign"),
+                 1 if g("valid") else 0, g("entry"), g("stop"),
+                 g("tp1"), g("tp2"), g("tp3"), g("rr"), g("power"), g("atr"),
+                 g("planN"), g("planWin")))
         self.db.commit()
+
+    def pine_latest(self) -> dict[str, dict]:
+        """Most recent parsed Pine plan per symbol (parity comparison input)."""
+        rows = self.db.execute(
+            "SELECT p.sym, p.tf, p.bias, p.bull, p.bear, p.tier, p.valid,"
+            " p.entry, p.power, p.received_ts FROM pine_plans p"
+            " JOIN (SELECT sym, MAX(received_ts) mt FROM pine_plans GROUP BY sym) m"
+            " ON p.sym = m.sym AND p.received_ts = m.mt").fetchall()
+        return {r[0]: {"tf": r[1], "bias": r[2], "bull": r[3], "bear": r[4],
+                       "tier": r[5], "valid": bool(r[6]), "entry": r[7],
+                       "power": r[8], "ts": r[9]} for r in rows}
+
+    def stats(self) -> dict:
+        """Aggregate performance for the session report."""
+        row = self.db.execute(
+            "SELECT COUNT(*),"
+            " SUM(CASE WHEN status='win' THEN 1 ELSE 0 END),"
+            " SUM(CASE WHEN status='loss' THEN 1 ELSE 0 END),"
+            " SUM(CASE WHEN status IN ('pending','filled') THEN 1 ELSE 0 END),"
+            " AVG(CASE WHEN status IN ('win','loss') THEN outcome_r END)"
+            " FROM signals").fetchone()
+        total, wins, losses, open_n, avg_r = (row or (0, 0, 0, 0, None))
+        wins, losses, open_n = wins or 0, losses or 0, open_n or 0
+        resolved = wins + losses
+        return {"total": total or 0, "wins": wins, "losses": losses,
+                "open": open_n, "resolved": resolved,
+                "win_rate": 100.0 * wins / resolved if resolved else None,
+                "avg_r": avg_r}
 
     # -- resolution (Pine Section 14B lifecycle) ------------------------------
     def resolve_open(self, feed, base_tf: str, tf_minutes: float) -> int:

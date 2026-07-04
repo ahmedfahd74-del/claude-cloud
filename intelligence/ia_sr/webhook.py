@@ -18,6 +18,17 @@ def serve(port: int = 8787, db_path: str = "ia_sr.db") -> None:
     engine = LearningEngine(db_path)
 
     class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 — health check for webhook setup
+            if self.path.rstrip("/") == "/health":
+                body = b'{"ok":true,"service":"ia-sr-webhook"}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
         def do_POST(self):  # noqa: N802 — stdlib API
             if self.path.rstrip("/") != "/pine":
                 self.send_response(404)

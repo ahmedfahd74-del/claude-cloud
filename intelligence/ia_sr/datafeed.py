@@ -15,8 +15,14 @@ from .indicators import Bar
 
 
 class Feed(Protocol):
+    """THE data-source contract. Everything above this line of the stack —
+    analysis, scanner, learning, reports — talks only to this protocol, so
+    swapping yfinance for a professional real-time provider is: write one
+    class with this method, register it in FEEDS, done. Nothing else changes.
+    """
+
     def bars(self, symbol: str, tf: str, limit: int) -> list[Bar]:
-        """Return up to `limit` most-recent bars, oldest first."""
+        """Return up to `limit` most-recent CLOSED bars, oldest first."""
         ...
 
 
@@ -130,3 +136,19 @@ class YFinanceFeed:
                 bars = aggregate(bars, 240)
             self._cache[key] = bars
         return self._cache[key][-limit:]
+
+
+# --- Feed registry: the ONLY place a data source is named -------------------
+# Register a professional provider here (any class satisfying Feed) and every
+# command — scan, live, dashboard, report, resolve — can use it via --feed.
+FEEDS: dict[str, type] = {
+    "synthetic": SyntheticFeed,
+    "yfinance": YFinanceFeed,
+}
+
+
+def make_feed(name: str) -> Feed:
+    try:
+        return FEEDS[name]()
+    except KeyError:
+        raise ValueError(f"unknown feed '{name}' — registered: {sorted(FEEDS)}") from None

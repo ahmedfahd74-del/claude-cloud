@@ -36,18 +36,25 @@ class Opportunity:
     power_price: float | None = None      # Power Line v2.1 (the ONE level)
     power_status: str = ""
     power_is_res: bool = False
+    price: float = 0.0
+    tier: str = "C"                       # A EXECUTE / B WATCH / C IGNORE
+    gate_score: float = 0.0
+    tp2: float | None = None
+    tp3: float | None = None
 
     @property
     def sort_key(self):
-        return (self.valid, self.calibrated_prob, _QUALITY_RANK.get(self.quality, 0), self.rr)
+        return (self.valid, self.tier == "B", self.gate_score,
+                self.calibrated_prob, _QUALITY_RANK.get(self.quality, 0), self.rr)
 
 
 @dataclass
 class ScanResult:
-    approved: list[Opportunity]
+    approved: list[Opportunity]                 # Tier A after portfolio control
     rejected: list[tuple[Opportunity, str]]     # portfolio rejections
     all_ranked: list[Opportunity]
     errors: dict[str, str]
+    watch: list[Opportunity] = field(default_factory=list)   # Tier B
 
 
 def scan(feed: Feed, cfg: ScanConfig | None = None,
@@ -71,15 +78,13 @@ def scan(feed: Feed, cfg: ScanConfig | None = None,
             errors[symbol] = str(exc)
     ranked.sort(key=lambda o: o.sort_key, reverse=True)
 
-    # Signal filter: directional, tradeable-quality setups only.
-    candidates = [o for o in ranked
-                  if o.direction != "NEUTRAL"
-                  and _QUALITY_RANK.get(o.quality, 0) >= 4
-                  and o.calibrated_prob >= cfg.min_prob][:cfg.top_n]
+    # Tier A (EXECUTE) goes to portfolio control; Tier B is the WATCH list.
+    candidates = [o for o in ranked if o.tier == "A"][:cfg.top_n]
+    watch = [o for o in ranked if o.tier == "B"][:cfg.top_n]
     controller = portfolio or PortfolioController()
     approved, rejected = controller.select(candidates)
     return ScanResult(approved=approved, rejected=rejected,
-                      all_ranked=ranked, errors=errors)
+                      all_ranked=ranked, errors=errors, watch=watch)
 
 
 def _to_opportunity(a: Analysis, learning: LearningEngine | None) -> Opportunity:
@@ -96,4 +101,6 @@ def _to_opportunity(a: Analysis, learning: LearningEngine | None) -> Opportunity
         power_price=a.power.price if a.power else None,
         power_status=a.power.status if a.power else "",
         power_is_res=a.power.is_res if a.power else False,
+        price=a.price, tier=a.plan.tier, gate_score=a.plan.gate_score,
+        tp2=a.plan.tp2, tp3=a.plan.tp3,
     )

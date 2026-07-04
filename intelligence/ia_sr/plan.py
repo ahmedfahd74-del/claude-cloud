@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .decision import DecisionState
-from .indicators import clamp
+from .indicators import clamp, safe_div
 from .levels import LevelBook, gather
 from .probability import ProbabilityState
 from .regime import RegimeState
@@ -39,6 +39,8 @@ class TradePlan:
     position_pct: float | None = None  # % notional for account_risk_pct
     gates: dict[str, bool] = field(default_factory=dict)
     fail_reasons: list[str] = field(default_factory=list)
+    tier: str = "C"                    # Pine 3-tier: A EXECUTE / B WATCH / C IGNORE
+    gate_score: float = 0.0            # Pine gs — weighted partial credit 0-100
 
 
 def build(price: float, st: RegimeState, dc: DecisionState, pb: ProbabilityState,
@@ -98,9 +100,28 @@ def build(price: float, st: RegimeState, dc: DecisionState, pb: ProbabilityState
         "rr": rr >= cfg.min_rr,
     }
     fails = [name for name, ok in gates.items() if not ok]
+    valid = not fails
+
+    # Pine 3-TIER OUTPUT: gate score = weighted PARTIAL credit (a 64% prob
+    # against a 65% bar scores ~0.98, not 0), so borderline setups surface
+    # as Tier B WATCH instead of a blanket "no trade".
+    _qual = {"Excellent": 1.0, "High Quality": 0.85, "Good": 0.6,
+             "Average": 0.4, "Poor": 0.15, "No Trade": 0.0}
+    gs = (10.0 * (1.0 if (long or short) else 0.0)
+          + 12.0 * _qual.get(pb.quality, 0.0)
+          + 18.0 * clamp(safe_div(pb.dir_prob, max(eff_min_prob, 1.0)), 0.0, 1.0)
+          + 12.0 * (1.0 if gates["htf_align"] else 0.0)
+          + 14.0 * clamp(safe_div(sr_conf, max(eff_min_score, 1.0)), 0.0, 1.0)
+          + 10.0 * (1.0 if gates["structure"] else 0.0)
+          + 12.0 * (1.0 if gates["levels"] else 0.0)
+          + 12.0 * clamp(safe_div(rr, max(cfg.min_rr, 0.1)), 0.0, 1.0))
+    tier = "A" if valid else \
+        "B" if gs >= 55.0 and (long or short) and gates["levels"] else "C"
+
     return TradePlan(
-        valid=not fails,
+        valid=valid,
         direction=pb.bias,
         entry=entry, stop=stop, tp1=tps[0], tp2=tps[1], tp3=tps[2],
         rr=rr, position_pct=pos_pct, gates=gates, fail_reasons=fails,
+        tier=tier, gate_score=gs,
     )
