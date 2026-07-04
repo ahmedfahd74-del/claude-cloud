@@ -2,6 +2,16 @@
 
 Pine = execution terminal. Python = master intelligence. One logic model, two runtimes.
 
+> **STATUS: PINE v2.0 FROZEN — 2026-07-04.**
+> Frozen build: `sr_engine.pine` **v2.0.9** (user-tested live and approved) +
+> `fvg_proj.pine` crypto build. From this point Pine receives **bug fixes only**
+> (compile errors, level-accuracy defects). All new capability lands in the
+> Python engine (`intelligence/ia_sr/`), which must also absorb the post-port
+> Pine changes for parity: prev-period extreme levels (PDH/PDL/PWH/PWL/PMH/PML),
+> extreme-snap merge-refine, structural-extreme eviction guard, HTF-only store
+> gating, Power Line v2.1 (daily-ATR distances, trend-side launch-level
+> preference, 4H+ candidate floor), and liquidity sweep lines.
+
 ---
 
 ## 0. Honest comms reality (drives the whole design)
