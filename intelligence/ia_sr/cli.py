@@ -40,12 +40,14 @@ def cmd_scan(args) -> None:
         return
 
     print(f"{'SYMBOL':<8} {'DIR':<7} {'PROB':>5} {'CAL':>5} {'QUALITY':<13} "
-          f"{'STATE':<22} {'R:R':>5}  PLAN")
+          f"{'STATE':<22} {'R:R':>5} {'POWER':<22}  PLAN")
     for o in result.all_ranked:
         plan = (f"entry {_fmt(o.entry)} sl {_fmt(o.stop)} tp {_fmt(o.tp1)}"
                 if o.valid else "no trade (" + ", ".join(o.fail_reasons[:3]) + ")")
+        power = ("—" if o.power_price is None else
+                 f"{_fmt(o.power_price)} {'R' if o.power_is_res else 'S'} {o.power_status}")
         print(f"{o.symbol:<8} {o.direction:<7} {o.prob:>4.0f}% {o.calibrated_prob:>4.0f}% "
-              f"{o.quality:<13} {o.state:<22} {o.rr:>5.1f}  {plan}")
+              f"{o.quality:<13} {o.state:<22} {o.rr:>5.1f} {power:<22.22}  {plan}")
     print(f"\nTOP SETUPS (after signal filter + portfolio control): {len(result.approved)}")
     for o in result.approved:
         print(f"  {o.symbol} {o.direction} {o.calibrated_prob:.0f}% {o.quality}"

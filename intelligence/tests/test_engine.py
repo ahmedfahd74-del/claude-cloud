@@ -11,10 +11,10 @@ from ia_sr.analysis import analyze
 from ia_sr.config import ScanConfig
 from ia_sr.datafeed import SyntheticFeed, aggregate
 from ia_sr.indicators import Bar, atr, clamp, ema, safe_div, sma
-from ia_sr.levels import Level, LevelBook
+from ia_sr.levels import Level, LevelBook, power_pick
 from ia_sr.portfolio import PortfolioController, factors
 from ia_sr.probability import evaluate as prob_eval
-from ia_sr.regime import compute_regime, trend_sign
+from ia_sr.regime import compute_regime, mode_adjust, trend_sign
 from ia_sr.scanner import scan
 from ia_sr.swings import detect_swings
 
@@ -93,6 +93,94 @@ class TestLevelBook(unittest.TestCase):
         bar = Bar(0, 99.5, 99.6, 95.0, 95.0, 0)             # close well below
         b.update_breaks(bar, prev_close=101.0, bar_index=10, st=st)
         self.assertTrue(b.levels[0].is_res, "broken support must flip to resistance")
+
+    def test_merge_refine_snaps_to_extreme(self):
+        # v2.0.9 parity: a same-side swing inside the merge radius must snap
+        # the level to the cluster's TRUE extreme, not be discarded.
+        b = self._book()
+        b.add(100.0, True, 0, 1.0, 0.6)
+        b.add(100.3, True, 5, 1.0, 0.6)     # higher high, same cluster
+        self.assertEqual(len(b.levels), 1)
+        self.assertEqual(b.levels[0].price, 100.3, "resistance must snap UP to the extreme")
+        self.assertGreater(b.levels[0].touches, 0.0, "repeat swing counts as evidence")
+        s = self._book()
+        s.add(50.0, False, 0, 1.0, 0.6)
+        s.add(49.8, False, 5, 1.0, 0.6)     # lower low, same cluster
+        self.assertEqual(s.levels[0].price, 49.8, "support must snap DOWN to the extreme")
+
+    def test_eviction_protects_range_boundaries(self):
+        # v2.0.9 parity: the highest/lowest unbroken levels (structural
+        # extremes) survive eviction even with the weakest scores.
+        b = self._book()                     # cap = 3
+        b.add(100.0, False, 0, 1.0, 0.6)     # range low
+        b.add(110.0, True, 1, 1.0, 0.6)
+        b.add(120.0, True, 2, 1.0, 0.6)
+        b.add(130.0, True, 3, 1.0, 0.6)      # range high → over cap
+        prices = [lv.price for lv in b.levels]
+        self.assertEqual(len(b.levels), 3)
+        self.assertIn(100.0, prices, "range low must survive")
+        self.assertIn(130.0, prices, "range high must survive")
+
+
+class TestPowerLine(unittest.TestCase):
+    def _books(self):
+        h4 = LevelBook(tf="4h", weight=0.60, tf_minutes=240, base_minutes=60, atr_tf=1.0)
+        w = LevelBook(tf="1w", weight=1.00, tf_minutes=10080, base_minutes=60, atr_tf=4.0)
+        m5 = LevelBook(tf="5m", weight=0.30, tf_minutes=5, base_minutes=60, atr_tf=0.2)
+        return h4, w, m5
+
+    def test_trend_side_prefers_launch_level(self):
+        h4, w, m5 = self._books()
+        h4.add(101.0, True, 0, 1.0, 0.6)    # ceiling just above
+        h4.add(98.0, False, 0, 1.0, 0.6)    # launch shelf below (farther)
+        pw = power_pick([h4, w], close=100.0, p_atr=1.0, htf_bull=True,
+                        htf_bear=False, mom=0.5, base_minutes=60)
+        self.assertIsNotNone(pw)
+        self.assertEqual(pw.price, 98.0, "BULL bias must pick the launch level below")
+        self.assertFalse(pw.is_res)
+
+    def test_sub_institutional_tfs_excluded(self):
+        h4, w, m5 = self._books()
+        m5.add(100.1, False, 0, 1.0, 0.6)   # nearest, but 5m = not a candidate
+        h4.add(99.0, False, 0, 1.0, 0.6)
+        pw = power_pick([h4, m5], close=100.0, p_atr=1.0, htf_bull=True,
+                        htf_bear=False, mom=0.0, base_minutes=60)
+        self.assertEqual(pw.price, 99.0, "5m level must never be the Power Line")
+
+    def test_status_retest_after_flip(self):
+        h4, w, m5 = self._books()
+        h4.add(100.5, True, 0, 1.0, 0.6)    # resistance, price above → broken side
+        pw = power_pick([h4], close=101.0, p_atr=1.0, htf_bull=True,
+                        htf_bear=False, mom=0.0, base_minutes=60)
+        self.assertEqual(pw.status, "RETEST LIKELY")
+
+
+class TestAdaptiveMode(unittest.TestCase):
+    def test_auto_strict_bounds_and_presets(self):
+        regs = compute_regime(mk_bars([100 + (i % 3) * 0.1 for i in range(120)]))
+        st = regs[-1]
+        self.assertTrue(-10.0 <= st.auto_strict <= 10.0)
+        self.assertTrue(0.0 <= st.eff_ratio <= 1.0)
+        pa, sa, qa, wick = mode_adjust("Adaptive (Auto)", st)
+        self.assertAlmostEqual(pa, st.auto_strict * 0.8)
+        self.assertTrue(0.6 <= wick <= 1.0)
+        self.assertEqual(mode_adjust("Conservative", st), (5.0, 10.0, 8.0, 1.0))
+        self.assertEqual(mode_adjust("Ultra Aggressive", st), (-10.0, -20.0, -14.0, 0.6))
+
+
+class TestPeriodExtremes(unittest.TestCase):
+    def test_daily_levels_exist_without_swing_confirmation(self):
+        # Monotonic daily data has no confirmable swings — the daily book must
+        # still hold levels via prev-period extremes (Pine v2.0.6 parity).
+        base = mk_bars([100 + 0.05 * i for i in range(240)], spread=0.2,
+                       t0=1_700_000_000, step=3600)
+        daily = mk_bars([100 + 1.2 * k for k in range(45)], spread=0.5,
+                        t0=1_700_000_000 - 44 * 86400 + 240 * 3600, step=86400)
+        cfg = ScanConfig(symbols=["X"], history_bars=240)
+        a = analyze("X", {"1h": base, "1d": daily, "4h": aggregate(base, 240)}, cfg)
+        dbook = next(b for b in a.books if b.tf == "1d")
+        self.assertTrue(dbook.levels, "period extremes must seed the daily book")
+        self.assertIsInstance(a.sweep_pools, list)
 
 
 class TestProbability(unittest.TestCase):

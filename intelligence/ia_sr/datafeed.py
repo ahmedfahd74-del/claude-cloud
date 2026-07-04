@@ -58,7 +58,8 @@ class SyntheticFeed:
             return self._cache[symbol]
         rng = random.Random(symbol)
         price = 100.0 * (1 + rng.random())
-        drift = 0.0
+        anchor = price          # long-run anchor: reversion stops the walk from
+        drift = 0.0             # collapsing to ~0 (volatility drag) or exploding
         vol = 0.002
         bars: list[Bar] = []
         step = int(self.base_minutes * 60)
@@ -67,7 +68,8 @@ class SyntheticFeed:
                 drift = rng.choice([-1, 0, 0, 1]) * vol * 0.35
                 vol = 0.002 * (0.5 + rng.random() * 2.0)
             o = price
-            moves = [rng.gauss(drift, vol) for _ in range(4)]
+            rev = 0.002 * math.log(anchor / price) if price > 0 else 0.0
+            moves = [rng.gauss(drift + rev, vol) for _ in range(4)]
             path = [o]
             for m in moves:
                 path.append(path[-1] * (1 + m))

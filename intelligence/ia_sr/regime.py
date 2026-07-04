@@ -36,6 +36,8 @@ class RegimeState:
     ad_react: float
     ad_min_score: int
     ad_merge: float
+    eff_ratio: float = 0.5    # Kaufman efficiency: ~1 clean trend, ~0 chop
+    auto_strict: float = 0.0  # live strictness shift (Pine autoStrict, ±10)
 
 
 def trend_sign(tr: float) -> int:
@@ -97,6 +99,18 @@ def compute_regime(bars: list[Bar], sens_bias: float = 1.0) -> list[RegimeState]
                       ("TREND " + ("UP" if trend_up else "DOWN")) if is_trending else
                       "NEUTRAL")
 
+        # Market noise (Kaufman efficiency ratio over 20 bars) + the live
+        # ADAPTIVE-FIRST strictness shift (Pine Section 4 autoStrict parity):
+        # shock/chop/low liquidity tighten; clean high-participation trends loosen.
+        if i >= 20:
+            path = sum(abs(closes[k] - closes[k - 1]) for k in range(i - 19, i + 1))
+            eff_ratio = clamp(safe_div(abs(closes[i] - closes[i - 20]), path), 0.0, 1.0)
+        else:
+            eff_ratio = 0.5
+        auto_strict = clamp((6.0 if news else 0.0) + (3.0 if low_liq else 0.0)
+                            + (2.0 if is_compress else 0.0) + (0.5 - eff_ratio) * 10.0
+                            - (4.0 if is_trending and high_liq else 0.0), -10.0, 10.0)
+
         leg = int(clamp(round(5 * vol_mult / sens_bias), 3, MAXLEG))
         out.append(RegimeState(
             atr_fast=af,
@@ -120,5 +134,26 @@ def compute_regime(bars: list[Bar], sens_bias: float = 1.0) -> list[RegimeState]
             ad_react=clamp(0.8 * vol_mult, 0.4, 2.0),
             ad_min_score=int(clamp(45 + (20 if news else 0) + (10 if low_liq else 0), 40, 80)),
             ad_merge=clamp(0.6 * vol_mult, 0.3, 1.5),
+            eff_ratio=eff_ratio,
+            auto_strict=auto_strict,
         ))
     return out
+
+
+def mode_adjust(mode: str, st: RegimeState) -> tuple[float, float, float, float]:
+    """Pine mode tuning (ADAPTIVE FIRST) → (prob_adj, score_adj, qual_adj, wick).
+
+    "Adaptive (Auto)" derives the shifts live from the regime; the named
+    presets are manual overrides. These feed ONLY gates, probability
+    thresholds and sweep sensitivity — never detection or the level book.
+    """
+    if mode == "Conservative":
+        return 5.0, 10.0, 8.0, 1.0
+    if mode == "Balanced":
+        return 0.0, 0.0, 0.0, 0.8
+    if mode == "Aggressive":
+        return -5.0, -10.0, -8.0, 0.7
+    if mode == "Ultra Aggressive":
+        return -10.0, -20.0, -14.0, 0.6
+    a = st.auto_strict
+    return a * 0.8, a * 1.5, a * 1.2, clamp(0.8 + a * 0.02, 0.6, 1.0)

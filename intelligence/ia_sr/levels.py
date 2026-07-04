@@ -27,12 +27,13 @@ W_SMC = 0.10
 class Level:
     price: float
     is_res: bool
-    touches: int = 0
+    touches: float = 0.0      # GRAVITY-WEIGHTED touch mass (prox × rejection × momentum)
     react_sum: float = 0.0
     vol_sum: float = 0.0
     last_touch: int = 0       # base-bar index of last activity (also birth)
     score: float = 50.0
     sweeps: int = 0
+    breaks: int = 0           # break-quality mass: clean close-through=2, wick=1
     broken: bool = False
 
 
@@ -42,7 +43,7 @@ class LevelBook:
     weight: float             # Pine Store.w
     tf_minutes: float
     base_minutes: float
-    max_levels: int = 6
+    max_levels: int = 8
     atr_tf: float = 0.0       # this TF's own ATR (kept current by caller)
     levels: list[Level] = field(default_factory=list)
 
@@ -52,23 +53,49 @@ class LevelBook:
         return clamp(500.0 * self.tf_minutes / max(self.base_minutes, 1.0), 500.0, 5000.0)
 
     def _merge_dist(self, atr_safe: float, ad_merge: float) -> float:
-        return max(atr_safe, self.atr_tf * 0.5) * ad_merge
+        return max(atr_safe, self.atr_tf * 0.35) * ad_merge
 
     def add(self, price: float, is_res: bool, bar_index: int,
             atr_safe: float, ad_merge: float) -> None:
-        """Pine f_addLevel: merge-dedupe, seed stats, quality eviction."""
+        """Pine f_addLevel: merge-REFINE, seed stats, guarded quality eviction.
+
+        A same-side swing inside the merge radius snaps the level to the
+        cluster's TRUE extreme (the wick traders see) and counts as touch
+        evidence — it is never silently discarded (v2.0.9 parity).
+        """
         md = self._merge_dist(atr_safe, ad_merge)
         for lv in self.levels:
             if abs(lv.price - price) <= md:
+                if lv.is_res == is_res and not lv.broken:
+                    lv.price = max(lv.price, price) if is_res else min(lv.price, price)
+                    lv.touches += 0.5
+                    lv.last_touch = bar_index
                 return
         self.levels.insert(0, Level(price=price, is_res=is_res, last_touch=bar_index))
         while len(self.levels) > self.max_levels:
-            worst, ws = 1, 1.0e9
+            # Never evict the just-added level (index 0) nor the store's
+            # STRUCTURAL EXTREMES (highest/lowest unbroken = range boundaries).
+            hi_idx = lo_idx = -1
+            hi_p, lo_p = -1.0e18, 1.0e18
+            for j, lv in enumerate(self.levels):
+                if not lv.broken:
+                    if lv.price > hi_p:
+                        hi_p, hi_idx = lv.price, j
+                    if lv.price < lo_p:
+                        lo_p, lo_idx = lv.price, j
+            worst, ws = -1, 1.0e9
             for j in range(1, len(self.levels)):
+                if j in (hi_idx, lo_idx):
+                    continue
                 cs = self.levels[j].score - (100.0 if self.levels[j].broken else 0.0)
                 if cs <= ws:
-                    ws = cs
-                    worst = j
+                    ws, worst = cs, j
+            if worst < 0:   # everything except index 0 protected → weakest overall
+                worst, ws = 1, 1.0e9
+                for j in range(1, len(self.levels)):
+                    cs = self.levels[j].score - (100.0 if self.levels[j].broken else 0.0)
+                    if cs <= ws:
+                        ws, worst = cs, j
             self.levels.pop(worst)
 
     def update_breaks(self, bar: Bar, prev_close: float, bar_index: int,
@@ -90,6 +117,8 @@ class LevelBook:
             if bar_index - lv.last_touch >= 3:
                 bc += 1
                 lv.last_touch = bar_index
+                # Break quality: decisive close-through (2) vs marginal/wick (1).
+                lv.breaks += 2 if safe_div(abs(bar.close - lv.price), st.atr_fast) > 0.6 else 1
             if mode == "Remove":
                 self.levels.pop(i)
             elif mode == "Keep":
@@ -98,25 +127,35 @@ class LevelBook:
                 lv.broken = True
         return bc
 
-    def update_touches(self, bar: Bar, bar_index: int, st: RegimeState) -> int:
-        """Pine f_touchUpdate: debounced touch/reaction/volume/sweep stats."""
+    def update_touches(self, bar: Bar, bar_index: int, st: RegimeState,
+                       mom_x: float = 1.0) -> int:
+        """Pine f_touchUpdate (v2 TOUCH GRAVITY): every interaction adds
+        weighted touch mass — proximity (near-misses are partial touches) ×
+        rejection strength × momentum at interaction. Debounced by 3 bars.
+        """
         hc = 0
         for lv in self.levels:
             if lv.broken:
                 continue
             buf = st.atr_safe * st.ad_react
-            if (bar.high >= lv.price - buf and bar.low <= lv.price + buf
-                    and bar_index - lv.last_touch >= 3):
+            hit = bar.high >= lv.price - buf and bar.low <= lv.price + buf
+            dist = min(abs(bar.high - lv.price), abs(bar.low - lv.price))
+            near = not hit and dist <= buf * 2.0
+            if (hit or near) and bar_index - lv.last_touch >= 3:
                 rej = bar.high - bar.close if lv.is_res else bar.close - bar.low
-                lv.touches += 1
-                lv.react_sum += clamp(safe_div(rej, st.atr_fast), 0.0, 3.0)
-                lv.vol_sum += st.vol_ratio
+                react = clamp(safe_div(rej, st.atr_fast), 0.0, 3.0)
+                prox = 1.0 if hit else clamp(1.0 - (dist - buf) / buf, 0.2, 0.6)
+                tw = prox * (1.0 + 0.5 * clamp(react, 0.0, 1.0)) * (0.75 + 0.25 * mom_x)
+                lv.touches += tw
+                lv.react_sum += react * (1.0 if hit else 0.4)
+                lv.vol_sum += st.vol_ratio * prox
                 lv.last_touch = bar_index
-                hc += 1
-                pierced = (bar.high > lv.price + buf and bar.close < lv.price) if lv.is_res \
-                    else (bar.low < lv.price - buf and bar.close > lv.price)
-                if pierced:
-                    lv.sweeps += 1
+                if hit:
+                    hc += 1
+                    pierced = (bar.high > lv.price + buf and bar.close < lv.price) if lv.is_res \
+                        else (bar.low < lv.price - buf and bar.close > lv.price)
+                    if pierced:
+                        lv.sweeps += 1
         return hc
 
     def near_count(self, price: float, band: float) -> int:
@@ -148,7 +187,9 @@ class LevelBook:
                    + W_FRESH * clamp(1.0 - recency / self.fhor, 0.0, 1.0)
                    + W_SWEEP * norm01(lv.sweeps, 2)
                    + W_SMC * clamp(smc_bonus(lv.price) + norm01(eq_count, 1) * 0.5, 0.0, 1.0))
-            lv.score = clamp(100.0 * raw * (0.6 + 0.4 * self.weight), 0.0, 100.0)
+            sc = clamp(100.0 * raw * (0.6 + 0.4 * self.weight), 0.0, 100.0)
+            # Lifecycle break penalty — clean breaks hurt most (Pine parity).
+            lv.score = sc * clamp(1.0 - 0.12 * min(lv.breaks, 3), 0.5, 1.0)
 
 
 def nearest(books: list[LevelBook], px: float) -> tuple[float, float, float, float]:
@@ -173,3 +214,70 @@ def gather(books: list[LevelBook], px: float, direction: int) -> list[float]:
            if not lv.broken and (lv.price > px if direction == 1 else lv.price < px)]
     arr.sort(reverse=(direction == -1))
     return arr
+
+
+@dataclass
+class PowerLine:
+    """Pine POWER LINE v2.1: the single institutional level that matters."""
+    price: float
+    score: float
+    is_res: bool
+    dist_atr: float           # distance in DAILY ATR (chart-TF independent)
+    status: str               # RETEST LIKELY / BROKEN / BREAK LIKELY / RESPECT EXPECTED / HOLDING
+
+
+def power_pick(books: list[LevelBook], close: float, p_atr: float,
+               htf_bull: bool, htf_bear: bool, mom: float,
+               base_minutes: float, radius: float = 8.0, min_sc: float = 60.0,
+               trend_side: bool = True, side_bias: float = 1.6) -> PowerLine | None:
+    """Pine f_powerPick v2.1 parity.
+
+    Candidates: institutional TFs only (4H+ or the base TF if higher) — the
+    same data on every chart, so the pick cannot jump between timeframes.
+    Rank: absolute inverse-distance × squared TF importance × soft score
+    nudge × trend-side preference (BULL favors the launch level BELOW price).
+    Falls back to the nearest live candidate when nothing sits in the radius.
+    """
+    floor = max(240.0, base_minutes)
+    best_rank = -1.0
+    best: Level | None = None
+    fn: Level | None = None
+    fn_d = 1.0e18
+    for book in books:
+        if book.tf_minutes < floor:
+            continue
+        for lv in book.levels:
+            if lv.broken:
+                continue
+            d = safe_div(abs(close - lv.price), p_atr)
+            if d < fn_d:
+                fn_d, fn = d, lv
+            if d > radius:
+                continue
+            prox = 1.0 / (0.30 + d)
+            tfw = (0.55 + 0.45 * book.weight) ** 2
+            scw = (0.85 + 0.15 * clamp(lv.score / 100.0, 0.0, 1.0)) * (1.0 if lv.score >= min_sc else 0.85)
+            below = lv.price < close
+            side_w = 1.0
+            if trend_side:
+                if htf_bull:
+                    side_w = side_bias if below else 1.0 / side_bias
+                elif htf_bear:
+                    side_w = 1.0 / side_bias if below else side_bias
+            rank = prox * tfw * scw * side_w
+            if rank > best_rank:
+                best_rank, best = rank, lv
+    pick = best if best is not None else fn
+    if pick is None:
+        return None
+    pdist = safe_div(abs(close - pick.price), p_atr)
+    wrong = close > pick.price if pick.is_res else close < pick.price
+    pressing = pdist < 0.5
+    breaking = pressing and ((htf_bull and mom > 0.2) if pick.is_res
+                             else (htf_bear and mom < -0.2))
+    status = ("RETEST LIKELY" if wrong and pdist < 1.5 else
+              "BROKEN — new side" if wrong else
+              "BREAK LIKELY" if breaking else
+              "RESPECT EXPECTED" if pressing else "HOLDING")
+    return PowerLine(price=pick.price, score=pick.score, is_res=pick.is_res,
+                     dist_atr=pdist, status=status)

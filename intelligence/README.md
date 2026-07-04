@@ -1,11 +1,18 @@
 # IA-SR Intelligence Layer (Python)
 
 The brain of the two-layer institutional platform. Pine (`pine/sr_engine.pine`,
-v1.0, feature-complete) is the execution + visualization terminal for the open
+**v2.0.9, FROZEN**) is the execution + visualization terminal for the open
 chart; this package is everything Pine cannot do: market-wide scanning,
 1m→Weekly multi-timeframe analysis, opportunity ranking, portfolio exposure
 control and performance-based calibration. Pure stdlib — no required
 dependencies; `yfinance` is optional for live data.
+
+Parity status: level engine matches frozen Pine v2.0.9 — touch gravity,
+extreme-snap merge-refine, structural-extreme eviction guard, break-quality
+mass, prev-period extreme levels (PDH/PDL/PWH/PWL/PMH/PML), HTF-only store
+gating, adaptive-first mode system (Kaufman-ER `autoStrict`), Power Line v2.1
+(daily-ATR distances, 4H+ candidate floor, trend-side launch preference,
+status intelligence) and unmitigated liquidity sweep pools.
 
 ## Quick start
 

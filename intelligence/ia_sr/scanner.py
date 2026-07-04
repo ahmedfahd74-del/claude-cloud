@@ -33,6 +33,9 @@ class Opportunity:
     tp1: float | None
     evidence: str
     fail_reasons: list[str] = field(default_factory=list)
+    power_price: float | None = None      # Power Line v2.1 (the ONE level)
+    power_status: str = ""
+    power_is_res: bool = False
 
     @property
     def sort_key(self):
@@ -90,4 +93,7 @@ def _to_opportunity(a: Analysis, learning: LearningEngine | None) -> Opportunity
         entry=a.plan.entry, stop=a.plan.stop, tp1=a.plan.tp1,
         evidence=a.probability.evidence_text(),
         fail_reasons=a.plan.fail_reasons,
+        power_price=a.power.price if a.power else None,
+        power_status=a.power.status if a.power else "",
+        power_is_res=a.power.is_res if a.power else False,
     )

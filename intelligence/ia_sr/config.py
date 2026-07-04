@@ -42,8 +42,14 @@ class ScanConfig:
     min_sr_conf: float = 60.0
     account_risk_pct: float = 1.0
     top_n: int = 10
-    max_levels_per_tf: int = 6
+    max_levels_per_tf: int = 8
     sens_bias: float = 1.0
+    engine_mode: str = "Adaptive (Auto)"     # or Conservative/Balanced/Aggressive/Ultra Aggressive
+    htf_only: bool = True                    # drop level TFs below the base TF (Pine v2.0.7 default)
+    power_radius: float = 8.0                # Power Line search radius (daily ATR)
+    power_min_score: float = 60.0
+    power_trend_side: bool = True
+    power_side_bias: float = 1.6
 
     def tf_minutes(self, tf: str) -> float:
         return TIMEFRAMES[tf][0]

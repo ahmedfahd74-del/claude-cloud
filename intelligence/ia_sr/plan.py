@@ -22,6 +22,8 @@ class GateConfig:
     min_rr: float = 2.0
     min_sr_conf: float = 60.0
     account_risk_pct: float = 1.0
+    prob_adj: float = 0.0      # adaptive/mode shift (Pine mProbAdj)
+    score_adj: float = 0.0     # adaptive/mode shift (Pine mScoreAdj)
 
 
 @dataclass
@@ -82,12 +84,15 @@ def build(price: float, st: RegimeState, dc: DecisionState, pb: ProbabilityState
 
     rev_favors = (dc.near_sup and dc.htf_bull) if long else \
                  (dc.near_res and dc.htf_bear) if short else False
+    # Adaptive/mode-shifted effective thresholds (Pine effMinProb/effMinScore).
+    eff_min_prob = clamp(cfg.min_prob + cfg.prob_adj, 50.0, 98.0)
+    eff_min_score = clamp(cfg.min_sr_conf + cfg.score_adj, 0.0, 100.0)
     gates = {
         "bias": long or short,
         "quality": pb.quality in ("Excellent", "High Quality"),
-        "probability": pb.dir_prob >= cfg.min_prob,
+        "probability": pb.dir_prob >= eff_min_prob,
         "htf_align": dc.htf_align > 0 if long else dc.htf_align < 0 if short else False,
-        "sr_confidence": sr_conf >= cfg.min_sr_conf,
+        "sr_confidence": sr_conf >= eff_min_score,
         "structure": dc.market_state != "Reversal Risk" or rev_favors,
         "levels": entry is not None and stop is not None and tps[0] is not None,
         "rr": rr >= cfg.min_rr,
