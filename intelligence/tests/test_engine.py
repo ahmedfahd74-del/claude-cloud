@@ -176,7 +176,8 @@ class TestPeriodExtremes(unittest.TestCase):
                        t0=1_700_000_000, step=3600)
         daily = mk_bars([100 + 1.2 * k for k in range(45)], spread=0.5,
                         t0=1_700_000_000 - 44 * 86400 + 240 * 3600, step=86400)
-        cfg = ScanConfig(symbols=["X"], history_bars=240)
+        cfg = ScanConfig(symbols=["X"], history_bars=240, base_tf="1h", exec_tf="1h",
+                         level_tfs=["1d", "4h", "1h"])
         a = analyze("X", {"1h": base, "1d": daily, "4h": aggregate(base, 240)}, cfg)
         dbook = next(b for b in a.books if b.tf == "1d")
         self.assertTrue(dbook.levels, "period extremes must seed the daily book")
@@ -263,6 +264,70 @@ class TestTiersAndReport(unittest.TestCase):
         self.assertTrue(make_feed("synthetic").bars("EURUSD", "1h", 10))
         with self.assertRaises(ValueError):
             make_feed("nonexistent")
+
+
+class TestStructure(unittest.TestCase):
+    def test_uptrend_bos_and_labels(self):
+        from ia_sr.structure import analyze_structure
+        # rising zigzag: each peak higher than the last (HH), each trough higher
+        # (HL) → confirmed BOS up, trend +1.
+        closes = []
+        for k in range(8):
+            closes += [100 + 5 * k, 104 + 5 * k, 101 + 5 * k]   # up, peak, pull back
+        bars = mk_bars(closes, spread=0.3)
+        st = analyze_structure(bars, swing_len=1)
+        self.assertEqual(st.trend, 1, "rising zigzag must read as uptrend")
+        self.assertTrue(any(e.kind == "BOS" and e.direction == 1 for e in st.events))
+        self.assertTrue(any(s.label == "HH" for s in st.swings))
+
+    def test_choch_on_reversal(self):
+        from ia_sr.structure import analyze_structure
+        up = []
+        for k in range(6):
+            up += [100 + 5 * k, 104 + 5 * k, 101 + 5 * k]
+        down = []
+        top = up[-1]
+        for k in range(6):
+            down += [top - 5 * k, top - 4 - 5 * k, top - 1 - 5 * k]
+        bars = mk_bars(up + down, spread=0.3)
+        st = analyze_structure(bars, swing_len=1)
+        self.assertTrue(any(e.kind == "CHoCH" for e in st.events),
+                        "a trend reversal must produce a CHoCH")
+
+
+class TestMethodology(unittest.TestCase):
+    def test_gates_in_order_and_shapes(self):
+        from ia_sr.methodology import evaluate_methodology
+        feed = SyntheticFeed(total_bars=30000)
+        cfg = ScanConfig(symbols=["EURUSD"])
+        bt = {tf: feed.bars("EURUSD", tf, cfg.history_bars if tf == cfg.base_tf else 400)
+              for tf in {cfg.base_tf, *cfg.level_tfs}}
+        from ia_sr.analysis import analyze
+        a = analyze("EURUSD", bt, cfg)
+        mr = a.methodology
+        self.assertIn(mr.tier, ("A", "B", "C"))
+        self.assertEqual([s.n for s in mr.steps], list(range(1, len(mr.steps) + 1)),
+                         "steps must be gated in order 1..n")
+        # Step 1 is always evaluated; a later step only exists if earlier passed
+        if len(mr.steps) >= 2:
+            self.assertTrue(mr.steps[0].passed, "Step 2 present ⇒ Step 1 passed")
+        # A tradeable tier must carry a full structural plan with monotonic TPs
+        if mr.tier in ("A", "B") and mr.entry is not None:
+            d = 1 if mr.bias == "LONG" else -1
+            self.assertTrue((mr.tp1 - mr.entry) * d > 0 < (mr.tp3 - mr.tp1) * d)
+            self.assertGreater(mr.rr, 0.0)
+
+    def test_no_daily_interaction_rejects_at_step1(self):
+        from ia_sr.methodology import evaluate_methodology
+        from ia_sr.levels import LevelBook
+        # a Daily book whose only level is far from price → outside any IIZ
+        book = LevelBook(tf="1d", weight=0.8, tf_minutes=1440, base_minutes=15, atr_tf=1.0)
+        book.add(1000.0, True, 0, 1.0, 0.6)
+        bars = mk_bars([100 + 0.1 * i for i in range(300)])
+        mr = evaluate_methodology({"15m": bars, "1d": mk_bars([100] * 60)}, book, ScanConfig())
+        self.assertFalse(mr.active)
+        self.assertEqual(mr.tier, "C")
+        self.assertIn("Daily", mr.reject_reason)
 
 
 class TestEndToEnd(unittest.TestCase):

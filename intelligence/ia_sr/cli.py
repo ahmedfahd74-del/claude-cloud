@@ -70,8 +70,9 @@ def cmd_scan(args) -> None:
     print(f"{'SYMBOL':<8} {'DIR':<7} {'PROB':>5} {'CAL':>5} {'QUALITY':<13} "
           f"{'STATE':<22} {'R:R':>5} {'POWER':<22}  PLAN")
     for o in result.all_ranked:
-        plan = (f"entry {_fmt(o.entry)} sl {_fmt(o.stop)} tp {_fmt(o.tp1)}"
-                if o.valid else "no trade (" + ", ".join(o.fail_reasons[:3]) + ")")
+        plan = (f"entry {_fmt(o.entry)} sl {_fmt(o.stop)} tp {_fmt(o.tp1)}" if o.valid
+                else f"WATCH · entry {_fmt(o.entry)} sl {_fmt(o.stop)}" if o.tier == "B"
+                else "no trade (" + ", ".join(o.fail_reasons[:3] or [o.state]) + ")")
         power = ("—" if o.power_price is None else
                  f"{_fmt(o.power_price)} {'R' if o.power_is_res else 'S'} {o.power_status}")
         print(f"{o.symbol:<8} {o.direction:<7} {o.prob:>4.0f}% {o.calibrated_prob:>4.0f}% "
@@ -161,6 +162,43 @@ def cmd_live(args) -> None:
             return
 
 
+def cmd_backtest(args) -> None:
+    from . import backtest as bt_mod
+    cfg = _cfg_from(args)
+    result = bt_mod.run(_feed(args.feed), cfg, history=args.history,
+                        stride=args.stride, warmup=args.warmup)
+    s = result.summary()
+    print("═" * 64)
+    print("IA-SR METHODOLOGY VALIDATION  (no optimisation — robustness only)")
+    print("═" * 64)
+    print(f"symbols           {len(cfg.symbols)}  ({', '.join(cfg.symbols[:8])}{'…' if len(cfg.symbols) > 8 else ''})")
+    print(f"evaluated points  {s['evaluated_points']}")
+    print(f"opportunities     {s['opportunities']}   (filled {s['filled']}, closed {s['closed']})")
+    print(f"trade frequency   {s['opportunities'] / max(len(cfg.symbols), 1):.1f} per symbol")
+    wr = s['win_rate']
+    print(f"win rate          {wr:.1f}%" if wr is not None else "win rate          —")
+    arr = s['avg_planned_rr']
+    print(f"avg planned R:R   {arr:.2f}" if arr is not None else "avg planned R:R   —")
+    ar = s['avg_realised_r']
+    print(f"avg realised R    {ar:+.2f}R" if ar is not None else "avg realised R    —")
+    print(f"expectancy        {s['expectancy_r']:+.3f}R / trade" if s['expectancy_r'] is not None else "expectancy        —")
+    print(f"max drawdown      {s['max_drawdown_r']:.2f}R")
+    ah = s['avg_hold_bars']
+    print(f"avg hold          {ah:.0f} {cfg.exec_tf} bars" if ah is not None else "avg hold          —")
+    ta, tb = s['tierA_pct'], s['tierB_pct']
+    print(f"tier mix          A {ta:.0f}%   B {tb:.0f}%" if ta is not None else "tier mix          —")
+    print("─" * 64)
+    print("rejection reasons (why setups were filtered):")
+    for reason, cnt in s['reject_reasons'].items():
+        print(f"  {cnt:>6}  {reason}")
+    if not s['reject_reasons']:
+        print("  (none recorded)")
+    print("═" * 64)
+    if args.json:
+        import json
+        print(json.dumps(s, indent=2, default=str))
+
+
 def cmd_resolve(args) -> None:
     cfg = ScanConfig()
     eng = LearningEngine(args.db)
@@ -218,6 +256,15 @@ def main(argv=None) -> None:
     p.add_argument("--interval", type=int, default=900)
     p.add_argument("--out", default="report.html")
     p.set_defaults(fn=cmd_live)
+
+    p = sub.add_parser("backtest", help="validate the methodology on history")
+    p.add_argument("--feed", default="synthetic", choices=feeds)
+    p.add_argument("--symbols", default="")
+    p.add_argument("--history", type=int, default=4000)
+    p.add_argument("--stride", type=int, default=4)
+    p.add_argument("--warmup", type=int, default=400)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_backtest)
 
     p = sub.add_parser("resolve", help="settle open signals against fresh bars")
     p.add_argument("--feed", default="synthetic", choices=feeds)

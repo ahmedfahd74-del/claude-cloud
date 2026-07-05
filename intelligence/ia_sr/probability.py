@@ -28,7 +28,8 @@ class ProbabilityState:
                 else self.bear_prob if self.bias == "SHORT" else 0.0)
 
     def evidence_text(self, sep: str = ", ") -> str:
-        return sep.join(f"{'+' if p > 0 else ''}{p:.0f} {label}"
+        # p == 0 → a plain reason string (methodology evidence carries no weight).
+        return sep.join(label if p == 0 else f"{'+' if p > 0 else ''}{p:.0f} {label}"
                         for p, label in self.evidence)
 
 

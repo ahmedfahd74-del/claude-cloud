@@ -12,11 +12,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .config import ScanConfig
-from .decision import DecisionState, evaluate as evaluate_decision
+from .decision import DecisionState
 from .indicators import Bar, NAN, clamp, safe_div
 from .levels import LevelBook, PowerLine, power_pick
-from .plan import GateConfig, TradePlan, build as build_plan
-from .probability import ProbabilityState, evaluate as evaluate_probability
+from .methodology import MethodologyResult, evaluate_methodology
+from .plan import TradePlan
+from .probability import ProbabilityState
 from .regime import RegimeState, compute_regime, mode_adjust
 from .smc import SMCState
 from .swings import Swing, detect_swings
@@ -35,6 +36,11 @@ class Analysis:
     trends: dict[str, float]     # tf -> normalised EMA slope
     power: PowerLine | None = None
     sweep_pools: list[tuple[float, bool]] = None  # (price, swept_high) unmitigated
+    methodology: MethodologyResult | None = None
+
+    @property
+    def why(self) -> str:
+        return " · ".join(self.methodology.evidence) if self.methodology else ""
 
 
 def _last_trend(regimes: list[RegimeState]) -> float:
@@ -133,30 +139,51 @@ def analyze(symbol: str, bars_by_tf: dict[str, list[Bar]],
                 others = [o for o in books if o is not book]
                 book.score_levels(others, i, st, smc.bonus)
 
-    # Final-bar decision stack (Pine Sections 10/11/14).
+    # ── SINGLE DECISION CORE: the institutional 5-step methodology ──────────
+    # Replaces the old evidence/probability/gate stack. Its result is adapted
+    # onto the existing ProbabilityState / DecisionState / TradePlan carriers
+    # so scanner, dashboard, report and learning are unchanged.
     last_i = len(base) - 1
     st = base_regimes[last_i]
+    price = base[last_i].close
     trends = {tf: _last_trend(regs) for tf, regs in tf_regimes.items()}
-    tr_w = trends.get("1w", NAN)
-    tr_d = trends.get("1d", NAN)
-    tr_h4 = trends.get("4h", NAN)
-    tr_h1 = trends.get("1h", st.trend if cfg.base_tf == "1h" else NAN)
 
-    dc = evaluate_decision(base, last_i, st, books, tr_w, tr_d, tr_h4)
-    obu, obd, fbu, fbd = smc.near_flags(base[last_i])
-    pb = evaluate_probability(st, dc, tr_w, tr_d, tr_h4, tr_h1, obu, obd, fbu, fbd)
-    prob_adj, score_adj, _, _ = mode_adjust(cfg.engine_mode, st)
-    plan = build_plan(base[last_i].close, st, dc, pb, books,
-                      GateConfig(cfg.min_prob, cfg.min_rr, cfg.min_sr_conf,
-                                 cfg.account_risk_pct, prob_adj, score_adj))
+    daily_book = next((b for b in books if b.tf_minutes == 1440), None)
+    mr = evaluate_methodology(bars_by_tf, daily_book, cfg)
 
-    # Power Line v2.1: distances in DAILY ATR (chart-TF independent).
-    daily = next((b for b in books if b.tf_minutes == 1440), None)
-    p_atr = daily.atr_tf if daily is not None and daily.atr_tf > 0 else \
+    want = 1 if mr.bias == "LONG" else -1 if mr.bias == "SHORT" else 0
+    mom = safe_div(price - base[last_i - 10].close, st.atr_fast) if last_i >= 10 else 0.0
+    dc = DecisionState(
+        dist_res_atr=0.0, score_res=0.0, dist_sup_atr=0.0, score_sup=0.0,
+        near_res=False, near_sup=False,
+        htf_align=mr.htf_agree * want, htf_bull=mr.bias == "LONG", htf_bear=mr.bias == "SHORT",
+        mom=clamp(mom, -10.0, 10.0), accum=False, dist=False,
+        sweep_res=False, sweep_sup=False, market_state=mr.phase)
+
+    conf = mr.confidence
+    bull = clamp(conf, 2.0, 98.0) if mr.bias == "LONG" else clamp(100.0 - conf, 2.0, 98.0)
+    quality = ("Excellent" if mr.tier == "A" and conf >= 80 else
+               "High Quality" if mr.tier == "A" else
+               "Good" if mr.tier == "B" and conf >= 55 else
+               "Average" if mr.tier == "B" else "No Trade")
+    pb = ProbabilityState(bull_prob=bull, bear_prob=100.0 - bull, bias=mr.direction,
+                          quality=quality, q_points=mr.gate_score,
+                          evidence=[(0.0, s) for s in mr.evidence])
+
+    plan = TradePlan(
+        valid=mr.tier == "A", direction=mr.direction,
+        entry=mr.entry, stop=mr.stop, tp1=mr.tp1, tp2=mr.tp2, tp3=mr.tp3, rr=mr.rr,
+        gates={f"step{s.n}": s.passed for s in mr.steps},
+        fail_reasons=[mr.reject_reason] if mr.reject_reason else [],
+        tier=mr.tier, gate_score=mr.gate_score)
+
+    # Power Line v2.1 retained as a visualization aid (distances in DAILY ATR).
+    p_atr = daily_book.atr_tf if daily_book is not None and daily_book.atr_tf > 0 else \
         (st.atr_fast if st.atr_fast == st.atr_fast else st.atr_safe)
-    power = power_pick(books, base[last_i].close, p_atr, dc.htf_bull, dc.htf_bear,
+    power = power_pick(books, price, p_atr, dc.htf_bull, dc.htf_bear,
                        dc.mom, base_min, cfg.power_radius, cfg.power_min_score,
                        cfg.power_trend_side, cfg.power_side_bias)
-    return Analysis(symbol=symbol, price=base[last_i].close, ts=base[last_i].ts,
+    return Analysis(symbol=symbol, price=price, ts=base[last_i].ts,
                     regime=st, decision=dc, probability=pb, plan=plan,
-                    books=books, trends=trends, power=power, sweep_pools=pools)
+                    books=books, trends=trends, power=power, sweep_pools=pools,
+                    methodology=mr)

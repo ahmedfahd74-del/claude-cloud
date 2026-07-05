@@ -34,9 +34,11 @@ DEFAULT_SYMBOLS = [
 @dataclass
 class ScanConfig:
     symbols: list[str] = field(default_factory=lambda: list(DEFAULT_SYMBOLS))
-    base_tf: str = "1h"                      # the "chart" the engine replays
-    level_tfs: list[str] = field(default_factory=lambda: ["1w", "1d", "4h", "1h", "15m", "5m"])
-    history_bars: int = 600                  # base bars replayed per symbol
+    # The methodology replays the execution TF and reads structure on all HTFs.
+    base_tf: str = "15m"                     # = execution TF replay clock
+    exec_tf: str = "15m"                     # Step 4 execution timeframe
+    level_tfs: list[str] = field(default_factory=lambda: ["1w", "1d", "4h", "1h", "30m", "15m"])
+    history_bars: int = 800                  # execution bars replayed per symbol
     min_prob: float = 65.0
     min_rr: float = 2.0
     min_sr_conf: float = 60.0
@@ -50,6 +52,14 @@ class ScanConfig:
     power_min_score: float = 60.0
     power_trend_side: bool = True
     power_side_bias: float = 1.6
+    # ── Institutional methodology (single source of truth) ──────────────────
+    iiz_atr: float = 0.5                     # Step 1: IIZ half-width = k × Daily ATR
+    major_min_score: float = 55.0            # Step 1: a "major" Daily level's min score
+    swing_len_htf: int = 3                   # Steps 2-3: fractal leg on W/D/4H/1H
+    swing_len_exec: int = 2                  # Steps 3-4: fractal leg on 30M/exec
+    align_lookback: int = 20                 # Step 3: bars for a fresh 1H BOS/CHoCH
+    exec_lookback: int = 15                  # Step 4: bars for sweep + break window
+    retest_atr: float = 0.5                  # Step 4: retest proximity = k × exec ATR
 
     def tf_minutes(self, tf: str) -> float:
         return TIMEFRAMES[tf][0]
