@@ -199,6 +199,61 @@ def cmd_backtest(args) -> None:
         print(json.dumps(s, indent=2, default=str))
 
 
+def cmd_ablation(args) -> None:
+    import json as _json
+    from . import ablation as ab
+    cfg = _cfg_from(args)
+    study = ab.run_study(_feed(args.feed), cfg, history=args.history,
+                         stride=args.stride, warmup=args.warmup)
+    rep = ab.full_report(study, cfg)
+
+    def _f(x, fmt="{:.1f}", dash="—"):
+        return dash if x is None else fmt.format(x)
+
+    print("═" * 78)
+    print("IA-SR METHODOLOGY ABLATION STUDY (one pass, rule-level instrumentation)")
+    print("═" * 78)
+    print(f"evaluated points {rep['evaluated_points']} · directional candidates "
+          f"{rep['candidates']} · resolved {rep['resolved']}")
+    print("\nQ1 · FUNNEL — first failing rule (methodology order):")
+    print(f"  {'passed ALL rules':<26}{rep['passed_all']:>7}")
+    for k in ab.RULE_ORDER:
+        print(f"  step {ab.STEP_OF[k]} · {k:<18}{rep['funnel_first_fail'][k]:>7}"
+              f"   (would-have-won: {rep['lost_winners_by_step'][k]})")
+    print("\nQ3-5 · ABLATIONS — remove one rule at a time:")
+    print(f"  {'variant':<30}{'trades':>7}{'/1k bars':>9}{'win%':>7}{'expect R':>10}{'maxDD':>8}")
+    base = rep['variants']['FULL (all rules)']
+    for name, v in rep['variants'].items():
+        print(f"  {name:<30}{v['trades']:>7}{v['per_1k_bars']:>9.2f}"
+              f"{_f(v['win_rate']):>7}{_f(v['expectancy_r'], '{:+.3f}'):>10}"
+              f"{v['max_dd_r']:>8.1f}")
+    print("\nQ6 · CONFUSION MATRIX (vs FULL chain):")
+    cm = rep['confusion_matrix']
+    print(f"                 WIN      LOSS")
+    print(f"  accepted   {cm['accepted_win']:>7}  {cm['accepted_loss']:>8}")
+    print(f"  rejected   {cm['rejected_win']:>7}  {cm['rejected_loss']:>8}   "
+          f"(rejected winners = missed profit; accepted losers = filter misses)")
+    print("\nQ7 · PER MARKET (SIMPLE chain: iiz+htf2+sweep+bos):")
+    for mkt, v in rep['per_market_simple'].items():
+        print(f"  {mkt:<8} trades {v['trades']:>5}  win% {_f(v['win_rate'])}"
+              f"  expect {_f(v['expectancy_r'], '{:+.3f}')}R  maxDD {v['max_dd_r']:.1f}R")
+    print("\nQ8 · HTF VOTE COMBINATIONS (which timeframes agreed, SIMPLE chain):")
+    for k, v in sorted(rep['htf_combo'].items(), key=lambda kv: -kv[1]['n']):
+        print(f"  {k:<12} n {v['n']:>5}  win% {_f(v['win_rate'])}"
+              f"  expect {_f(v['expectancy'], '{:+.3f}')}R")
+    print("\nQ9 · LOSER ATTRIBUTION (SIMPLE-chain losers, n="
+          f"{rep['losers_analyzed']}):")
+    for k, v in rep['loser_attribution'].items():
+        print(f"  {k:<18}{v:>6}")
+    print("═" * 78)
+    if args.json:
+        print(_json.dumps(rep, indent=2, default=str))
+    if args.out:
+        with open(args.out, "w") as f:
+            _json.dump(rep, f, indent=2, default=str)
+        print(f"raw JSON → {args.out}")
+
+
 def cmd_resolve(args) -> None:
     cfg = ScanConfig()
     eng = LearningEngine(args.db)
@@ -265,6 +320,16 @@ def main(argv=None) -> None:
     p.add_argument("--warmup", type=int, default=400)
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_backtest)
+
+    p = sub.add_parser("ablation", help="rule-level ablation study of the methodology")
+    p.add_argument("--feed", default="synthetic", choices=feeds)
+    p.add_argument("--symbols", default="")
+    p.add_argument("--history", type=int, default=3500)
+    p.add_argument("--stride", type=int, default=4)
+    p.add_argument("--warmup", type=int, default=400)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--out", default="")
+    p.set_defaults(fn=cmd_ablation)
 
     p = sub.add_parser("resolve", help="settle open signals against fresh bars")
     p.add_argument("--feed", default="synthetic", choices=feeds)
