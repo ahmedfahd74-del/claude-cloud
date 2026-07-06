@@ -25,16 +25,32 @@ W_SMC = 0.10
 
 @dataclass
 class Level:
-    price: float
+    price: float              # IDENTITY = wick extreme, FROZEN at birth — never
+                              # reassigned. This is what makes a level the same
+                              # institutional object on every timeframe.
     is_res: bool
+    body: float = 0.0         # origin-candle body edge (display anchor ONLY)
     touches: float = 0.0      # GRAVITY-WEIGHTED touch mass (prox × rejection × momentum)
     react_sum: float = 0.0
     vol_sum: float = 0.0
-    last_touch: int = 0       # base-bar index of last activity (also birth)
+    birth: int = 0            # bar index the level was confirmed (immutable)
+    last_touch: int = 0       # base-bar index of last activity
     score: float = 50.0
     sweeps: int = 0
     breaks: int = 0           # break-quality mass: clean close-through=2, wick=1
     broken: bool = False
+
+    def display_price(self, anchor: float = 0.0) -> float:
+        """Where the line is DRAWN: wick (0) → mid (0.5) → body (1). Purely
+        visual — identity `price` is unchanged, so anchor cannot alter which
+        levels exist, their scores, ranking or confluence."""
+        return self.price * (1.0 - anchor) + self.body * anchor
+
+    @property
+    def proven(self) -> bool:
+        """A confirmed institutional level that must not be evicted by the cap
+        (only intentional invalidation removes it)."""
+        return self.touches >= 1.0 or self.score >= 60.0
 
 
 @dataclass
@@ -64,51 +80,74 @@ class LevelBook:
         """TF-scaled freshness horizon in base bars (Pine Store.fhor)."""
         return clamp(500.0 * self.tf_minutes / max(self.base_minutes, 1.0), 500.0, 5000.0)
 
+    MERGE_FRAC = 0.5             # merge radius as a fraction of the level's TF ATR
+
     def _merge_dist(self, atr_safe: float, ad_merge: float) -> float:
-        return max(atr_safe, self.atr_tf * 0.35) * ad_merge * self._adapt
+        """TF-STABLE merge radius. Depends ONLY on this level's own timeframe
+        ATR — never the varying base-bar ATR or per-bar regime multiplier — so
+        whether two swings are the same institutional object is deterministic
+        and identical on every timeframe that reads the book. (atr_safe is the
+        fallback before the TF ATR is known.)"""
+        base = self.atr_tf if self.atr_tf > 0 else atr_safe
+        return base * self.MERGE_FRAC
 
     def add(self, price: float, is_res: bool, bar_index: int,
-            atr_safe: float, ad_merge: float) -> None:
-        """Pine f_addLevel: merge-REFINE, seed stats, guarded quality eviction.
+            atr_safe: float, ad_merge: float, body: float | None = None) -> None:
+        """Add a confirmed level: merge-dedupe (evidence only — NEVER moves an
+        existing level's price), else create it with a FROZEN identity price,
+        then enforce the cap deterministically.
 
-        A same-side swing inside the merge radius snaps the level to the
-        cluster's TRUE extreme (the wick traders see) and counts as touch
-        evidence — it is never silently discarded (v2.0.9 parity).
+        A same-side swing inside the merge radius of an existing level is the
+        SAME institutional object: it adds touch evidence, it does not create,
+        move, or duplicate a level. This is the core of cross-timeframe parity.
         """
+        body = price if body is None else body
         md = self._merge_dist(atr_safe, ad_merge)
         for lv in self.levels:
             if abs(lv.price - price) <= md:
                 if lv.is_res == is_res and not lv.broken:
-                    lv.price = max(lv.price, price) if is_res else min(lv.price, price)
-                    lv.touches += 0.5
+                    lv.touches += 0.5             # evidence only — price FROZEN
                     lv.last_touch = bar_index
                 return
-        self.levels.insert(0, Level(price=price, is_res=is_res, last_touch=bar_index))
+        self.levels.insert(0, Level(price=price, is_res=is_res, body=body,
+                                    birth=bar_index, last_touch=bar_index))
+        self._enforce_cap()
+
+    def _enforce_cap(self) -> None:
+        """Deterministic, protective eviction. Confirmed 'proven' levels and the
+        structural extremes are never removed under the normal cap — only a
+        broken or unproven level goes, chosen by an EXPLICIT total order
+        (broken-first, then lowest score, then lowest price) so the same inputs
+        always evict the same level. A hard ceiling (3× cap) is the only thing
+        that can retire a proven level, keeping memory bounded without letting
+        levels vanish non-deterministically."""
         while len(self.levels) > self.max_levels:
-            # Never evict the just-added level (index 0) nor the store's
-            # STRUCTURAL EXTREMES (highest/lowest unbroken = range boundaries).
-            hi_idx = lo_idx = -1
-            hi_p, lo_p = -1.0e18, 1.0e18
-            for j, lv in enumerate(self.levels):
-                if not lv.broken:
-                    if lv.price > hi_p:
-                        hi_p, hi_idx = lv.price, j
-                    if lv.price < lo_p:
-                        lo_p, lo_idx = lv.price, j
-            worst, ws = -1, 1.0e9
-            for j in range(1, len(self.levels)):
-                if j in (hi_idx, lo_idx):
-                    continue
-                cs = self.levels[j].score - (100.0 if self.levels[j].broken else 0.0)
-                if cs <= ws:
-                    ws, worst = cs, j
-            if worst < 0:   # everything except index 0 protected → weakest overall
-                worst, ws = 1, 1.0e9
-                for j in range(1, len(self.levels)):
-                    cs = self.levels[j].score - (100.0 if self.levels[j].broken else 0.0)
-                    if cs <= ws:
-                        ws, worst = cs, j
-            self.levels.pop(worst)
+            idx = self._evict_index()
+            if idx is None:
+                break
+            self.levels.pop(idx)
+
+    def _evict_index(self) -> int | None:
+        n = len(self.levels)
+        if n <= 1:
+            return None
+        hi_idx = lo_idx = -1
+        hi_p, lo_p = -1.0e18, 1.0e18
+        for j, lv in enumerate(self.levels):
+            if not lv.broken:
+                if lv.price > hi_p:
+                    hi_p, hi_idx = lv.price, j
+                if lv.price < lo_p:
+                    lo_p, lo_idx = lv.price, j
+        protected = {0, hi_idx, lo_idx}
+        over_hard = n > self.max_levels * 3
+        cands = [j for j in range(1, n)
+                 if j not in protected
+                 and (over_hard or self.levels[j].broken or not self.levels[j].proven)]
+        if not cands:
+            return None
+        return min(cands, key=lambda j: (0 if self.levels[j].broken else 1,
+                                         self.levels[j].score, self.levels[j].price))
 
     def update_breaks(self, bar: Bar, prev_close: float, bar_index: int,
                       st: RegimeState, mode: str = "Keep") -> int:

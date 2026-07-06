@@ -2,8 +2,13 @@
 
 Adaptive-leg pivot detector: the bar `leg` bars back is a swing if it is the
 extreme of the [i-2*leg .. i] window. A swing is confirmed `leg` bars after it
-prints — no future data, no repaint. The returned level is anchored between
-wick and body per `anchor` (0=wick, 0.5=wick/body mid, 1=body edge).
+prints — no future data, no repaint.
+
+STABILITY CONTRACT (V3 hardening): a swing's IDENTITY is always the wick
+extreme — the exact price institutions defend. The candle's body edge is
+carried alongside as `body` purely so the display layer can anchor the drawn
+line to wick / mid / body WITHOUT changing the level's identity, score, merge
+behaviour or ranking. Detection never blends the anchor into the price.
 """
 from __future__ import annotations
 
@@ -15,15 +20,18 @@ from .regime import RegimeState
 
 @dataclass(frozen=True)
 class Swing:
-    price: float
+    price: float         # IDENTITY = wick extreme (frozen, anchor-independent)
     is_high: bool
     pivot_index: int     # bar index of the swing itself
     confirm_index: int   # bar index where it became known
     confirm_ts: int      # epoch seconds when it became known (bar CLOSE time)
+    body: float = 0.0    # body edge of the pivot candle (display anchor only)
 
 
-def detect_swings(bars: list[Bar], regimes: list[RegimeState], tf_seconds: int,
-                  anchor: float = 0.0) -> list[Swing]:
+def detect_swings(bars: list[Bar], regimes: list[RegimeState],
+                  tf_seconds: int) -> list[Swing]:
+    """Confirmed swings. `price` is always the wick extreme; `body` is the
+    same-side body edge (open/close) for optional display anchoring."""
     out: list[Swing] = []
     for i in range(len(bars)):
         leg = regimes[i].leg
@@ -48,7 +56,7 @@ def detect_swings(bars: list[Bar], regimes: list[RegimeState], tf_seconds: int,
         body_lo = min(bars[p].open, bars[p].close)
         confirm_ts = bars[i].ts + tf_seconds
         if is_high:
-            out.append(Swing(hv * (1 - anchor) + body_hi * anchor, True, p, i, confirm_ts))
+            out.append(Swing(hv, True, p, i, confirm_ts, body_hi))
         if is_low:
-            out.append(Swing(lv * (1 - anchor) + body_lo * anchor, False, p, i, confirm_ts))
+            out.append(Swing(lv, False, p, i, confirm_ts, body_lo))
     return out

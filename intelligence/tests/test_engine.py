@@ -94,19 +94,20 @@ class TestLevelBook(unittest.TestCase):
         b.update_breaks(bar, prev_close=101.0, bar_index=10, st=st)
         self.assertTrue(b.levels[0].is_res, "broken support must flip to resistance")
 
-    def test_merge_refine_snaps_to_extreme(self):
-        # v2.0.9 parity: a same-side swing inside the merge radius must snap
-        # the level to the cluster's TRUE extreme, not be discarded.
+    def test_merge_keeps_frozen_identity(self):
+        # V3 stability: a same-side swing inside the merge radius is the SAME
+        # institutional object — it adds evidence but must NOT move the level's
+        # frozen identity price (the old v2.0.9 snap-to-extreme was the drift bug).
         b = self._book()
         b.add(100.0, True, 0, 1.0, 0.6)
         b.add(100.3, True, 5, 1.0, 0.6)     # higher high, same cluster
         self.assertEqual(len(b.levels), 1)
-        self.assertEqual(b.levels[0].price, 100.3, "resistance must snap UP to the extreme")
+        self.assertEqual(b.levels[0].price, 100.0, "identity price must stay FROZEN")
         self.assertGreater(b.levels[0].touches, 0.0, "repeat swing counts as evidence")
         s = self._book()
         s.add(50.0, False, 0, 1.0, 0.6)
         s.add(49.8, False, 5, 1.0, 0.6)     # lower low, same cluster
-        self.assertEqual(s.levels[0].price, 49.8, "support must snap DOWN to the extreme")
+        self.assertEqual(s.levels[0].price, 50.0, "support identity must stay FROZEN")
 
     def test_eviction_protects_range_boundaries(self):
         # v2.0.9 parity: the highest/lowest unbroken levels (structural

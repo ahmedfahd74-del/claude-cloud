@@ -100,7 +100,7 @@ def analyze(symbol: str, bars_by_tf: dict[str, list[Bar]],
             c = cursors[p]
             while c < len(swings) and swings[c].confirm_ts <= bar_end:
                 s = swings[c]
-                book.add(s.price, s.is_high, i, st.atr_safe, st.ad_merge)
+                book.add(s.price, s.is_high, i, st.atr_safe, st.ad_merge, s.body)
                 c += 1
             cursors[p] = c
         for p, (book, ev) in enumerate(periods):

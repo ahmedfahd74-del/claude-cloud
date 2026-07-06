@@ -101,7 +101,7 @@ def _build_daily_book(daily_bars: list, cfg: ScanConfig) -> LevelBook:
         st = regs[i]
         for s in swings:
             if s.confirm_index == i:
-                book.add(s.price, s.is_high, i, st.atr_safe, st.ad_merge)
+                book.add(s.price, s.is_high, i, st.atr_safe, st.ad_merge, s.body)
         book.update_breaks(b, daily_bars[i - 1].close if i else b.close, i, st)
         book.update_touches(b, i, st)
     others: list[LevelBook] = []
