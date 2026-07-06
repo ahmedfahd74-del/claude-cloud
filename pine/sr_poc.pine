@@ -171,6 +171,23 @@ pPrice = pI >= 0 ? Dp.get(pI) : na
 pRes   = pI >= 0 ? Ds.get(pI) == 1 : false
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 4b · DATABASE HASH — objective determinism proof (order-independent).
+//      A pure function of the frozen database contents (tick-rounded price +
+//      side + timeframe per level, summed mod a prime — commutative, so it is
+//      independent of insertion order). If this value is IDENTICAL on every
+//      chart timeframe, the database is provably identical. No eyeballing.
+// ═══════════════════════════════════════════════════════════════════════════
+f_hash() =>
+    h = 0
+    if Dp.size() > 0
+        for i = 0 to Dp.size() - 1
+            tickP = int(math.round(Dp.get(i) / syminfo.mintick))
+            lh = tickP * 131 + Ds.get(i) * 17 + Dtf.get(i) * 7
+            h := int(math.abs((h + lh) % 99999989))
+    h
+dbHash = f_hash()
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 5 · RENDERER — READ-ONLY. Every setting here changes drawing only.
 // ═══════════════════════════════════════════════════════════════════════════
 anchorA = anchorS == "Body" ? 1.0 : anchorS == "Mid" ? 0.5 : 0.0
@@ -215,3 +232,16 @@ if barstate.islast
     if showPwr and not na(pPrice)
         pLine := line.new(x1, pPrice, x2, pPrice, xloc = xloc.bar_index, extend = extend.both, color = colPwr, width = 3, style = line.style_solid)
         pLbl  := label.new(x2, pPrice, "⚡ POWER " + str.tostring(pPrice, format.mintick) + " · " + (pRes ? "R" : "S"), xloc = xloc.bar_index, style = label.style_label_left, color = colPwr, textcolor = color.black, size = size.normal)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 6 · HASH READOUT — the validation instrument. Compare this value across
+//     1M / 5M / 15M / 1H / 4H / 1D: identical hash ⇒ identical database.
+// ═══════════════════════════════════════════════════════════════════════════
+var table hud = table.new(position.top_right, 2, 3, bgcolor = color.new(#0a1a3a, 10), border_width = 1, border_color = color.new(color.gray, 60))
+if barstate.islast
+    table.cell(hud, 0, 0, "DB HASH", text_color = color.white, text_size = size.normal)
+    table.cell(hud, 1, 0, str.tostring(dbHash), text_color = #00e676, text_size = size.normal)
+    table.cell(hud, 0, 1, "Levels", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 1, str.tostring(Dp.size()), text_color = color.silver, text_size = size.small)
+    table.cell(hud, 0, 2, "Power", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 2, na(pPrice) ? "—" : str.tostring(pPrice, format.mintick), text_color = color.white, text_size = size.small)
