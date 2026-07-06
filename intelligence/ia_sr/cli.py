@@ -221,12 +221,11 @@ def cmd_ablation(args) -> None:
         print(f"  step {ab.STEP_OF[k]} · {k:<18}{rep['funnel_first_fail'][k]:>7}"
               f"   (would-have-won: {rep['lost_winners_by_step'][k]})")
     print("\nQ3-5 · ABLATIONS — remove one rule at a time:")
-    print(f"  {'variant':<30}{'trades':>7}{'/1k bars':>9}{'win%':>7}{'expect R':>10}{'maxDD':>8}")
-    base = rep['variants']['FULL (all rules)']
+    print(f"  {'variant':<36}{'trades':>7}{'/1k':>6}{'win%':>7}{'expect R':>10}{'maxDD':>8}{'premat%':>9}")
     for name, v in rep['variants'].items():
-        print(f"  {name:<30}{v['trades']:>7}{v['per_1k_bars']:>9.2f}"
+        print(f"  {name:<36}{v['trades']:>7}{v['per_1k_bars']:>6.1f}"
               f"{_f(v['win_rate']):>7}{_f(v['expectancy_r'], '{:+.3f}'):>10}"
-              f"{v['max_dd_r']:>8.1f}")
+              f"{v['max_dd_r']:>8.1f}{_f(v.get('premature_stop_pct')):>9}")
     print("\nQ6 · CONFUSION MATRIX (vs FULL chain):")
     cm = rep['confusion_matrix']
     print(f"                 WIN      LOSS")

@@ -45,7 +45,19 @@ class LevelBook:
     base_minutes: float
     max_levels: int = 8
     atr_tf: float = 0.0       # this TF's own ATR (kept current by caller)
+    noise: float = 0.5        # measured tape wickiness 0..1 (V3 self-adaptive:
+                              # hot/wicky tape widens merge, break and reaction
+                              # geometry automatically — crypto vs FX vs indices
+                              # differ with NO settings change)
     levels: list[Level] = field(default_factory=list)
+
+    @property
+    def _adapt(self) -> float:
+        """Noise-driven geometry multiplier. REVERTED to 1.0 (neutral): the
+        self-adaptive-geometry experiment regressed the ablation vs V2's fixed
+        geometry, so it is disabled pending a formulation that measures better.
+        The `noise` field is still populated for the Power Line / diagnostics."""
+        return 1.0
 
     @property
     def fhor(self) -> float:
@@ -53,7 +65,7 @@ class LevelBook:
         return clamp(500.0 * self.tf_minutes / max(self.base_minutes, 1.0), 500.0, 5000.0)
 
     def _merge_dist(self, atr_safe: float, ad_merge: float) -> float:
-        return max(atr_safe, self.atr_tf * 0.35) * ad_merge
+        return max(atr_safe, self.atr_tf * 0.35) * ad_merge * self._adapt
 
     def add(self, price: float, is_res: bool, bar_index: int,
             atr_safe: float, ad_merge: float) -> None:
@@ -109,7 +121,7 @@ class LevelBook:
             lv = self.levels[i]
             if lv.broken:
                 continue
-            buf = max(st.atr_safe * 0.25, self.atr_tf * 0.15) * st.ad_atr
+            buf = max(st.atr_safe * 0.25, self.atr_tf * 0.15) * st.ad_atr * self._adapt
             crossed = (abs(bar.close - lv.price) > buf
                        and (bar.close - lv.price) * (prev_close - lv.price) < 0)
             if not crossed:
@@ -137,7 +149,7 @@ class LevelBook:
         for lv in self.levels:
             if lv.broken:
                 continue
-            buf = st.atr_safe * st.ad_react
+            buf = st.atr_safe * st.ad_react * self._adapt
             hit = bar.high >= lv.price - buf and bar.low <= lv.price + buf
             dist = min(abs(bar.high - lv.price), abs(bar.low - lv.price))
             near = not hit and dist <= buf * 2.0
@@ -226,16 +238,34 @@ class PowerLine:
     status: str               # RETEST LIKELY / BROKEN / BREAK LIKELY / RESPECT EXPECTED / HOLDING
 
 
+def _cluster_mass(books: list[LevelBook], price: float, band: float) -> float:
+    """Confluence mass at a price: TF-weighted scores of every unbroken level
+    within `band`. THE institutional signal — many timeframes defending one
+    price = the level that controls the market."""
+    m = 0.0
+    for book in books:
+        for lv in book.levels:
+            if not lv.broken and abs(lv.price - price) <= band:
+                m += lv.score * (0.6 + 0.4 * book.weight)
+    return m
+
+
 def power_pick(books: list[LevelBook], close: float, p_atr: float,
                htf_bull: bool, htf_bear: bool, mom: float,
                base_minutes: float, radius: float = 8.0, min_sc: float = 60.0,
-               trend_side: bool = True, side_bias: float = 1.6) -> PowerLine | None:
-    """Pine f_powerPick v2.1 parity.
+               trend_side: bool = True, side_bias: float = 1.6,
+               pools: list[tuple[float, bool]] | None = None,
+               bar_index: int = 0) -> PowerLine | None:
+    """V3 INSTITUTIONAL POWER LINE — the market's line of truth.
 
-    Candidates: institutional TFs only (4H+ or the base TF if higher) — the
-    same data on every chart, so the pick cannot jump between timeframes.
-    Rank: absolute inverse-distance × squared TF importance × soft score
-    nudge × trend-side preference (BULL favors the launch level BELOW price).
+    Candidates: institutional TFs only (4H+ or the base TF if higher), so the
+    pick is identical on every chart. Rank blends:
+      · proximity (inverse-distance — where price is doing business)
+      · squared TF importance (Weekly outranks 4H)
+      · CLUSTER MASS (confluence: all books' levels stacked at that price)
+      · liquidity-pool confluence (an unmitigated sweep pool at the level)
+      · reaction recency (recently defended > stale)
+      · trend-side preference (bull → the launch level below price)
     Falls back to the nearest live candidate when nothing sits in the radius.
     """
     floor = max(240.0, base_minutes)
@@ -243,6 +273,7 @@ def power_pick(books: list[LevelBook], close: float, p_atr: float,
     best: Level | None = None
     fn: Level | None = None
     fn_d = 1.0e18
+    band = 0.25 * p_atr
     for book in books:
         if book.tf_minutes < floor:
             continue
@@ -257,6 +288,14 @@ def power_pick(books: list[LevelBook], close: float, p_atr: float,
             prox = 1.0 / (0.30 + d)
             tfw = (0.55 + 0.45 * book.weight) ** 2
             scw = (0.85 + 0.15 * clamp(lv.score / 100.0, 0.0, 1.0)) * (1.0 if lv.score >= min_sc else 0.85)
+            mass = _cluster_mass(books, lv.price, band)
+            cw = 0.7 + 0.3 * clamp(mass / 150.0, 0.0, 1.0)
+            pw = 1.0
+            if pools and any(abs(px - lv.price) <= band for px, _ in pools):
+                pw = 1.2                     # unmitigated liquidity AT the level
+            rw = 1.0
+            if bar_index and lv.last_touch:
+                rw = 1.15 if bar_index - lv.last_touch <= 30 else 1.0
             below = lv.price < close
             side_w = 1.0
             if trend_side:
@@ -264,7 +303,7 @@ def power_pick(books: list[LevelBook], close: float, p_atr: float,
                     side_w = side_bias if below else 1.0 / side_bias
                 elif htf_bear:
                     side_w = 1.0 / side_bias if below else side_bias
-            rank = prox * tfw * scw * side_w
+            rank = prox * tfw * scw * cw * pw * rw * side_w
             if rank > best_rank:
                 best_rank, best = rank, lv
     pick = best if best is not None else fn

@@ -78,6 +78,88 @@ def _major_daily_levels(book: LevelBook | None, min_score: float) -> list:
     return strong or [lv for lv in book.levels if not lv.broken]
 
 
+def hunt_depth(bars: list[Bar], swing_lows: list[float], swing_highs: list[float],
+               want: int, e_atr: float, lookback: int = 80) -> float:
+    """ADAPTIVE STOP BUFFER (V3): measure this market's actual stop-hunt depth —
+    how far wicks typically overshoot swing levels before closing back — and
+    place stops beyond it. Returns the ~75th percentile overshoot, floored at
+    0.15 ATR. This is what stops 'right idea, stopped anyway' losses."""
+    depths: list[float] = []
+    levels = swing_lows if want > 0 else swing_highs
+    if not levels:
+        return 0.25 * e_atr
+    for b in bars[-lookback:]:
+        if want > 0:
+            lvl = min(levels, key=lambda x: abs(x - b.low))
+            if b.low < lvl and b.close > lvl:
+                depths.append(lvl - b.low)
+        else:
+            lvl = min(levels, key=lambda x: abs(x - b.high))
+            if b.high > lvl and b.close < lvl:
+                depths.append(b.high - lvl)
+    if not depths:
+        return 0.25 * e_atr
+    depths.sort()
+    q75 = depths[min(len(depths) - 1, int(0.75 * len(depths)))]
+    return max(0.15 * e_atr, min(q75 * 1.1, 1.2 * e_atr))
+
+
+def wickiness(bars: list[Bar], lookback: int = 100) -> float:
+    """Tape noise 0..1: how much of each bar is wick vs body. Crypto tape runs
+    hot (~0.6+), calm FX ~0.35. Drives adaptive geometry with NO symbol map."""
+    w = bars[-lookback:]
+    tot = n = 0.0
+    for b in w:
+        rng = b.high - b.low
+        if rng > 0:
+            tot += (rng - abs(b.close - b.open)) / rng
+            n += 1
+    return tot / n if n else 0.5
+
+
+def build_plan_v3(want: int, price: float, e_atr: float,
+                  sweep_price: float | None, broken_level: float | None,
+                  swing_highs: list[float], swing_lows: list[float],
+                  daily_level: float, exec_bars: list[Bar],
+                  cfg: ScanConfig) -> tuple[float, float, float, float, float, float]:
+    """V3 execution engine — SHARED by methodology, ablation and backtest.
+
+    Entry: the 50% discount of the sweep→shift impulse (institutions fill the
+    retrace, they don't chase the break). Falls back to the broken structure
+    level, then to price.
+    Stop: beyond BOTH the sweep extreme and the nearest liquidity cluster,
+    plus the market's measured stop-hunt depth (adaptive buffer). The
+    objective is fewer premature stop-outs, not tighter risk.
+    Targets: structural ladder (monotonic), TP3 anchored toward the Daily level.
+    Returns (entry, stop, tp1, tp2, tp3, rr)."""
+    # MEASURED, NOT ASSUMED: every V3 execution experiment (50%-retrace limit
+    # entry, pool-extended stop, adaptive stop-hunt buffer) REGRESSED vs V2 on
+    # the ablation (expectancy and drawdown both worse; premature-stop% did not
+    # fall). Per the keep-only-improvements rule, entry/stop/targets are exact
+    # V2. The SOLE surviving V3 change is upstream: retest + 30M are confidence
+    # bonuses, not hard gates — which the V2 ablation proved lifts expectancy.
+    buf = 0.10 * e_atr
+    entry = (broken_level if broken_level is not None
+             and abs(price - broken_level) <= cfg.retest_atr * e_atr else price)
+    if want > 0:
+        sl_base = sweep_price if sweep_price is not None else \
+            (min(swing_lows[-3:]) if swing_lows else entry - e_atr)
+        stop = min(sl_base, entry - 0.5 * e_atr) - buf
+        risk = entry - stop
+        struct = sorted(x for x in (swing_highs + [daily_level]) if x >= entry + 0.5 * risk)
+        tp1, tp2, tp3 = _stack_targets(struct, entry, risk, +1)
+    else:
+        sl_base = sweep_price if sweep_price is not None else \
+            (max(swing_highs[-3:]) if swing_highs else entry + e_atr)
+        stop = max(sl_base, entry + 0.5 * e_atr) + buf
+        risk = stop - entry
+        struct = sorted((x for x in (swing_lows + [daily_level]) if x <= entry - 0.5 * risk),
+                        reverse=True)
+        tp1, tp2, tp3 = _stack_targets(struct, entry, risk, -1)
+    rr = abs(tp3 - entry) / risk if risk > 0 else 0.0
+    return entry, stop, tp1, tp2, tp3, rr
+
+
 def _stack_targets(struct: list[float], entry: float, risk: float,
                    sign: int) -> tuple[float, float, float]:
     """Three strictly-progressing targets: prefer structural levels, fill gaps
@@ -199,57 +281,45 @@ def evaluate_methodology(bars_by_tf: dict[str, list[Bar]],
                 break
     broken_level = ex_st.protected_high if want > 0 else ex_st.protected_low
     retest = (broken_level is not None and abs(price - broken_level) <= cfg.retest_atr * e_atr)
-    exec_full = ex_break and sweep and retest
-    exec_partial = ex_break and (sweep or retest)
-    steps.append(Step(4, "Execution trigger", exec_full,
-                      f"sweep={'Y' if sweep else 'N'} break={'Y' if ex_break else 'N'} "
-                      f"retest={'Y' if retest else 'N'}"))
+    # ── V3 chain (ablation-driven): sweep + structure shift are the trigger.
+    # Retest and 30M are CONFIDENCE BONUSES, never hard gates — the study
+    # showed mandatory retest cut expectancy and mandatory 30M added nothing.
+    exec_full = ex_break and sweep
+    exec_partial = ex_break or sweep
+    steps.append(Step(4, "Execution trigger (sweep + MSS)", exec_full,
+                      f"sweep={'Y' if sweep else 'N'} shift={'Y' if ex_break else 'N'} "
+                      f"retest-bonus={'Y' if retest else 'N'} 30m-bonus={'Y' if m30_ok else 'N'}"))
 
-    # ── STEP 5 · Trade plan (from structure) ────────────────────────────────
+    # ── STEP 5 · Trade plan — V3 execution engine (shared) ──────────────────
     entry = stop = tp1 = tp2 = tp3 = None
     rr = 0.0
     if exec_partial or exec_full:
-        entry = (broken_level if broken_level is not None
-                 and abs(price - broken_level) <= cfg.retest_atr * e_atr else price)
-        if want > 0:
-            sl_base = sweep_price if sweep_price is not None else (ex_st.protected_low or (entry - e_atr))
-            stop = min(sl_base, entry - 0.5 * e_atr) - buf
-            risk = entry - stop
-            # structural targets beyond entry, at least 0.5R out, monotonic;
-            # fill any gaps with R-multiples so TP1<TP2<TP3 always holds.
-            struct = sorted(x for x in (highs + [nearest.price]) if x >= entry + 0.5 * risk)
-            tp1, tp2, tp3 = _stack_targets(struct, entry, risk, +1)
-        else:
-            sl_base = sweep_price if sweep_price is not None else (ex_st.protected_high or (entry + e_atr))
-            stop = max(sl_base, entry + 0.5 * e_atr) + buf
-            risk = stop - entry
-            struct = sorted((x for x in (lows + [nearest.price]) if x <= entry - 0.5 * risk), reverse=True)
-            tp1, tp2, tp3 = _stack_targets(struct, entry, risk, -1)
-        rr = abs(tp3 - entry) / risk if risk > 0 else 0.0
+        entry, stop, tp1, tp2, tp3, rr = build_plan_v3(
+            want, price, e_atr, sweep_price, broken_level,
+            highs, lows, nearest.price, exec_bars, cfg)
 
-    # ── Tiering + confidence ────────────────────────────────────────────────
-    aligned_full = h1_aligned and m30_ok
-    tierA = (iiz and interaction in ("reacting", "break-retest") and agree >= 2
-             and aligned_full and exec_full and rr >= cfg.min_rr)
-    tierB = (agree >= 2 and (h1_aligned or exec_partial)
-             and (exec_partial or exec_full) and entry is not None)
+    # ── Tiering + confidence (V3) ───────────────────────────────────────────
+    tierA = (iiz and agree >= 2 and h1_aligned and exec_full
+             and entry is not None and rr >= cfg.min_rr)
+    tierB = (agree >= 2 and h1_aligned and exec_partial and entry is not None)
     tier = "A" if tierA else "B" if tierB else "C"
 
-    # confidence: HTF agreement + alignment + execution completeness + zone quality
     conf = (18.0 * agree
-            + (14.0 if h1_aligned else 0.0) + (6.0 if m30_ok else 0.0)
-            + (12.0 if sweep else 0.0) + (12.0 if ex_break else 0.0) + (10.0 if retest else 0.0)
+            + (16.0 if h1_aligned else 0.0)
+            + (14.0 if sweep else 0.0) + (14.0 if ex_break else 0.0)
+            + (8.0 if retest else 0.0) + (6.0 if m30_ok else 0.0)      # bonuses
             + (8.0 if interaction in ("reacting", "break-retest") else 4.0))
     conf = clamp(conf, 0.0, 100.0)
-    gs = clamp(20.0 * agree + (15.0 if h1_aligned else 0.0)
-               + (15.0 if sweep else 0.0) + (15.0 if ex_break else 0.0)
-               + (15.0 if retest else 0.0) + clamp(rr / max(cfg.min_rr, 0.1) * 10.0, 0.0, 10.0),
+    gs = clamp(20.0 * agree + (18.0 if h1_aligned else 0.0)
+               + (16.0 if sweep else 0.0) + (16.0 if ex_break else 0.0)
+               + (6.0 if retest else 0.0) + (4.0 if m30_ok else 0.0)
+               + clamp(rr / max(cfg.min_rr, 0.1) * 10.0, 0.0, 10.0),
                0.0, 100.0)
 
     reject = ""
     if tier == "C":
-        reject = ("Step 3: 1H not aligned" if not h1_aligned and not exec_partial
-                  else "Step 4: no execution trigger" if not exec_partial
+        reject = ("Step 3: 1H not aligned" if not h1_aligned
+                  else "Step 4: no sweep + structure shift" if not exec_partial
                   else "Step 5: R:R below minimum" if entry is not None and rr < cfg.min_rr
                   else "incomplete setup")
 

@@ -15,7 +15,7 @@ from .config import ScanConfig
 from .decision import DecisionState
 from .indicators import Bar, NAN, clamp, safe_div
 from .levels import LevelBook, PowerLine, power_pick
-from .methodology import MethodologyResult, evaluate_methodology
+from .methodology import MethodologyResult, evaluate_methodology, wickiness
 from .plan import TradePlan
 from .probability import ProbabilityState
 from .regime import RegimeState, compute_regime, mode_adjust
@@ -78,6 +78,7 @@ def analyze(symbol: str, bars_by_tf: dict[str, list[Bar]],
                          base_minutes=base_min, max_levels=cfg.max_levels_per_tf)
         last = regs[-1]
         book.atr_tf = last.atr_fast if last.atr_fast == last.atr_fast else last.atr_safe
+        book.noise = wickiness(bars)     # V3: measured tape noise → geometry
         books.append(book)
         pending.append((book, sorted(swings, key=lambda s: s.confirm_ts)))
         # Prev-period extremes (PDH/PDL, PWH/PWL, …): exact candle prices that
@@ -182,7 +183,8 @@ def analyze(symbol: str, bars_by_tf: dict[str, list[Bar]],
         (st.atr_fast if st.atr_fast == st.atr_fast else st.atr_safe)
     power = power_pick(books, price, p_atr, dc.htf_bull, dc.htf_bear,
                        dc.mom, base_min, cfg.power_radius, cfg.power_min_score,
-                       cfg.power_trend_side, cfg.power_side_bias)
+                       cfg.power_trend_side, cfg.power_side_bias,
+                       pools=pools, bar_index=last_i)
     return Analysis(symbol=symbol, price=price, ts=base[last_i].ts,
                     regime=st, decision=dc, probability=pb, plan=plan,
                     books=books, trends=trends, power=power, sweep_pools=pools,

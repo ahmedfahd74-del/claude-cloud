@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 
 from .config import ScanConfig
 from .datafeed import Feed
-from .methodology import _last_atr, _major_daily_levels, _stack_targets
+from .methodology import _last_atr, _major_daily_levels, build_plan_v3
 from .structure import StructureState, analyze_structure, swept
 
 FILL_WIN = 40
@@ -89,6 +89,8 @@ class Study:
                                         else c.i + FILL_WIN)
         closed = [c for c in kept if c.outcome in ("win", "loss", "timeout")]
         wins = [c for c in closed if c.realised_r > 0]
+        losers = [c for c in closed if c.realised_r < 0]
+        premature = sum(1 for c in losers if c.tp1_after_stop)
         n = len(closed)
         eq = peak = mdd = 0.0
         for c in closed:
@@ -106,6 +108,9 @@ class Study:
             "max_dd_r": mdd,
             "avg_hold": (sum(c.hold for c in closed if c.hold is not None)
                          / max(1, sum(1 for c in closed if c.hold is not None))),
+            # EXECUTION QUALITY: share of losers that were premature stop-outs
+            # (stopped, then TP1 printed anyway) — the metric V3 targets.
+            "premature_stop_pct": (100.0 * premature / len(losers)) if losers else None,
         }
 
 
@@ -241,24 +246,12 @@ def _evaluate_point(symbol, ex, i, sliced, cfg, struct_cache, book_cache):
     r_retest = (broken_level is not None
                 and abs(price - broken_level) <= cfg.retest_atr * e_atr)
 
-    # candidate plan — same construction as methodology Step 5
-    entry = (broken_level if broken_level is not None
-             and abs(price - broken_level) <= cfg.retest_atr * e_atr else price)
-    if want > 0:
-        sl_base = sweep_price if sweep_price is not None else (ex_st.protected_low or (entry - e_atr))
-        stop = min(sl_base, entry - 0.5 * e_atr) - buf
-        risk = entry - stop
-        struct = sorted(x for x in (highs + [nearest.price]) if x >= entry + 0.5 * risk)
-        tp1, tp2, tp3 = _stack_targets(struct, entry, risk, +1)
-    else:
-        sl_base = sweep_price if sweep_price is not None else (ex_st.protected_high or (entry + e_atr))
-        stop = max(sl_base, entry + 0.5 * e_atr) + buf
-        risk = stop - entry
-        struct = sorted((x for x in (lows + [nearest.price]) if x <= entry - 0.5 * risk), reverse=True)
-        tp1, tp2, tp3 = _stack_targets(struct, entry, risk, -1)
-    if risk <= 0:
+    # candidate plan — the SHARED V3 execution engine (same as methodology)
+    entry, stop, tp1, tp2, tp3, rr = build_plan_v3(
+        want, price, e_atr, sweep_price, broken_level,
+        highs, lows, nearest.price, ex_bars[-420:], cfg)
+    if abs(entry - stop) <= 0:
         return None
-    rr = abs(tp3 - entry) / risk
     r_rr = rr >= cfg.min_rr
 
     return Candidate(
@@ -334,6 +327,8 @@ def full_report(study: Study, cfg: ScanConfig) -> dict:
     for k in RULE_ORDER:
         keys = [r for r in RULE_ORDER if r != k]
         variants[f"minus {k}"] = study.variant(keys)
+    variants["V3 (iiz+htf2+align1h+sweep+bos+rr)"] = study.variant(
+        ["iiz", "htf2", "align1h", "sweep", "bos", "rr"])
     variants["SIMPLE (iiz+htf2+sweep+bos)"] = study.variant(["iiz", "htf2", "sweep", "bos"])
     variants["UNIVERSE (no rules)"] = study.variant([])
 
