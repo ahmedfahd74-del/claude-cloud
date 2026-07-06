@@ -24,14 +24,14 @@
 //    VISUAL    : Sections 13, 14 (render), 15 — Pine-only, never ported
 // =============================================================================
 
-indicator("Institutional Adaptive S/R Engine  [v2.0.9 · 2026-07-04]", "IA-SR v2.0.9", overlay = true,
+indicator("Institutional Adaptive S/R Engine  [v2.1.0 · 2026-07-06]", "IA-SR v2.1.0", overlay = true,
      max_lines_count = 200, max_labels_count = 200, max_boxes_count = 250)
 
 // BUILD TAG — bumped every release. Shows in the indicator title on the chart
 // (top-left) and on the dashboard's top row, so you can always confirm the
 // running version. If this differs from the tag I quote in chat, you're on an
 // old copy — re-paste the file I attached. Keep this in sync with the title.
-BUILD = "v2.0.9 · 2026-07-04"
+BUILD = "v2.1.0 · 2026-07-06"
 
 // #############################################################################
 // # SECTION 1 — INPUTS
@@ -83,8 +83,8 @@ grpLvl = "Levels"
 maxLvl       = input.int(8, "Max Levels per Timeframe", minval = 1, maxval = 20, group = grpLvl)
 minTouches   = input.int(0, "Min Touches to Show Level", minval = 0, maxval = 20, group = grpLvl,
      tooltip = "0 = show all. Higher = only show levels price has reacted to at least this many times (proven S/R).")
-anchorMode   = input.string("Wick", "Level Anchor", options = ["Wick", "Wick/Body Mid", "Body"], group = grpLvl,
-     tooltip = "Where the level sits on the swing candle. Wick = exact extreme. Wick/Body Mid = between wick and body (institutional). Body = candle body edge.")
+anchorMode   = input.string("Wick", "Level Anchor (visual only)", options = ["Wick", "Wick/Body Mid", "Body"], group = grpLvl,
+     tooltip = "COSMETIC ONLY. The institutional level is always the wick extreme — its identity, score, ranking, confluence and the Power Line never change. This just shifts where the line is DRAWN toward the candle interior (Mid / Body). It can no longer create, move, or rebuild levels.")
 showZones    = input.bool(false, "Show Zones (bands around levels)", group = grpLvl,
      tooltip = "Draws a faint supply/demand band around each level. Width scales with HTF ATR and the adaptive zone multiplier.")
 zoneWidthK   = input.float(0.15, "Zone Width × HTF-ATR", minval = 0.02, maxval = 1.0, step = 0.01, group = grpLvl)
@@ -215,6 +215,14 @@ volMult    = f_clamp(volRegime, 0.5, 2.5)
 // Single safe-ATR used by every module (fallback before ta.atr(14) resolves).
 atrSafe    = na(atrFast) ? close * 0.001 : atrFast
 
+// VISUAL ANCHOR ONLY. Identity is always the wick; this shifts the DRAWN line
+// toward the candle interior for the Body / Mid options (resistance draws
+// downward from its high, support upward from its low). Bounded by the level's
+// own-TF ATR so it stays cosmetic and can never approach another level.
+f_anchorY(float price, bool isRes, float atrTF) =>
+    off = anchorA * math.max(atrTF, atrSafe) * 0.12
+    price + (isRes ? -off : off)
+
 // --- 3.2 Trend strength (normalized EMA slope in ATR units) ----------------
 emaTrend   = ta.ema(close, 34)
 slopeRaw   = f_div(emaTrend - emaTrend[10], atrFast)
@@ -304,8 +312,10 @@ mWick     = isAuto ? f_clamp(0.8 + autoStrict * 0.02, 0.6, 1.0) : engineMode == 
 // #############################################################################
 
 // Returns [swingHighPrice, swingLowPrice] — non-na only on the confirmation bar.
-// Detection uses the wick extreme; the RETURNED level is anchored between wick
-// and body per anchorA (still an exact HTF price → projects unchanged to LTF).
+// IDENTITY IS THE WICK EXTREME, always. The anchor NEVER enters detection, so
+// the level book (identities, merges, scores, ranking, confluence, Power Line)
+// is 100% independent of the Wick/Body toggle. The toggle only shifts where
+// the line is drawn (see f_anchorY), it can no longer create or move a level.
 f_swing(int leg) =>
     win     = 2 * leg
     hi      = high[leg]
@@ -319,9 +329,7 @@ f_swing(int leg) =>
             isHigh := false
         if low[i] < lo
             isLow := false
-    phVal = hi * (1.0 - anchorA) + math.max(open[leg], close[leg]) * anchorA
-    plVal = lo * (1.0 - anchorA) + math.min(open[leg], close[leg]) * anchorA
-    [isHigh ? phVal : na, isLow ? plVal : na]
+    [isHigh ? hi : na, isLow ? lo : na]
 
 // True when v just became a fresh non-na value (edge detect for new swings).
 f_changed(float v) => not na(v) and (na(v[1]) or v != v[1])
@@ -539,32 +547,32 @@ f_removeAt(Store s, int i) =>
 // identically on every chart timeframe.
 f_addLevel(Store s, float p, bool isRes, color col, int wdt, string lstyle) =>
     if not na(p)
-        md  = math.max(atrSafe, s.atrTF * 0.35) * adMergeMult
+        // TF-NATIVE MERGE (deterministic): the merge radius depends ONLY on
+        // this store's own timeframe ATR — never the chart/base-bar ATR or the
+        // per-bar regime multiplier — so whether two swings are the same
+        // institutional object is identical on every chart timeframe.
+        md  = (s.atrTF > 0 ? s.atrTF : atrSafe) * 0.5
         dup = false
         if s.price.size() > 0
             for i = 0 to s.price.size() - 1
                 if math.abs(s.price.get(i) - p) <= md
                     dup := true
-                    // Refine, never discard: a same-side swing inside the merge
-                    // radius snaps the level to the cluster's TRUE extreme, so
-                    // the line sits exactly on the wick traders see — and the
-                    // repeat swing itself is evidence (touch mass + freshness).
+                    // FROZEN IDENTITY: a same-side swing inside the merge radius
+                    // is the SAME level — it adds touch evidence only. The
+                    // price is NEVER moved (no snap-to-extreme, no drift), so a
+                    // confirmed W/D/4H level is permanent across all timeframes.
                     if s.isRes.get(i) == isRes and not s.broken.get(i)
-                        old = s.price.get(i)
-                        np  = isRes ? math.max(old, p) : math.min(old, p)
-                        if np != old
-                            s.price.set(i, np)
-                            line.set_y1(s.ln.get(i), np)
-                            line.set_y2(s.ln.get(i), np)
                         s.touches.set(i, s.touches.get(i) + 0.5 * touchWMult)
                         s.lastTouch.set(i, bar_index)
                     break
         if not dup
-            ln = line.new(bar_index - 1, p, bar_index, p, xloc = xloc.bar_index,
+            // Identity is the WICK price p; the drawn Y is anchor-adjusted only.
+            dy = f_anchorY(p, isRes, s.atrTF)
+            ln = line.new(bar_index - 1, dy, bar_index, dy, xloc = xloc.bar_index,
                  extend = extend.both, color = col, width = wdt, style = lstyle)
             bx = showZones ? box.new(bar_index - 1, p, bar_index, p, xloc = xloc.bar_index,
                  extend = extend.both, border_width = 0, border_color = color.new(col, 100), bgcolor = color.new(col, 80)) : na
-            lb = showLabel ? label.new(bar_index, p, "", xloc = xloc.bar_index,
+            lb = showLabel ? label.new(bar_index, dy, "", xloc = xloc.bar_index,
                  style = label.style_label_left,
                  color = color.new(col, 30), textcolor = color.white, size = size.small) : na
             s.price.unshift(p)
@@ -904,7 +912,8 @@ f_scoreAndRender(Store s, color baseCol, Store o1, Store o2, Store o3, Store o4,
             if not na(lb)
                 if showLabel and not weak and show
                     grade = sc >= 90 ? "A+" : sc >= 80 ? "A" : sc >= 70 ? "B" : sc >= 55 ? "C" : "D"
-                    label.set_xy(lb, bar_index, lvl)
+                    // Label rides the anchored line; TEXT shows the frozen identity price.
+                    label.set_xy(lb, bar_index, f_anchorY(lvl, res, s.atrTF))
                     label.set_text(lb, grade + "  " + (res ? "R" : "S") + "  " + f_px(lvl) + "  " + str.tostring(math.round(sc)) + "%")
                     label.set_color(lb, color.new(baseCol, 25))
                     label.set_textcolor(lb, sc >= 80 ? color.white : color.new(color.white, 25))
@@ -1265,28 +1274,13 @@ f_powerPick() =>
     [bp, bs, br]
 [pwrP, pwrScore, pwrIsRes] = f_powerPick()
 
-// Fallback: dominant trending HTF (W→D→4H→1H) held swing, as before.
-float domTr = na
-float domPh = na
-float domPl = na
-if useW and f_trendSign(trW) != 0
-    domTr := trW
-    domPh := lastPhW
-    domPl := lastPlW
-else if useD and f_trendSign(trD) != 0
-    domTr := trD
-    domPh := lastPhD
-    domPl := lastPlD
-else if useH4 and f_trendSign(trH4) != 0
-    domTr := trH4
-    domPh := lastPhH4
-    domPl := lastPlH4
-else if useH1 and f_trendSign(trH1) != 0
-    domTr := trH1
-    domPh := lastPhH1
-    domPl := lastPlH1
-powerPrice = not na(pwrP) ? pwrP : na(domTr) ? na : domTr < 0 ? domPh : domPl
-powerIsRes = not na(pwrP) ? pwrIsRes : not na(domTr) and domTr < 0
+// SINGLE SOURCE OF TRUTH: the Power Line is ALWAYS an existing frozen level
+// selected from the one level book (f_powerPick returns a store price, and its
+// own nearest-live-level fallback covers the out-of-radius case). It never
+// recalculates a fresh price — if the book is empty there is simply no Power
+// Line. This is what makes it the identical line on every timeframe.
+powerPrice = pwrP
+powerIsRes = pwrIsRes
 pdist      = na(powerPrice) ? na : f_div(math.abs(close - powerPrice), pATR)
 
 // Status intelligence — what the engine expects at this line (existing
