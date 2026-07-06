@@ -24,14 +24,14 @@
 //    VISUAL    : Sections 13, 14 (render), 15 — Pine-only, never ported
 // =============================================================================
 
-indicator("Institutional Adaptive S/R Engine  [v2.1.0 · 2026-07-06]", "IA-SR v2.1.0", overlay = true,
+indicator("Institutional Adaptive S/R Engine  [v2.1.1 · 2026-07-06]", "IA-SR v2.1.1", overlay = true,
      max_lines_count = 200, max_labels_count = 200, max_boxes_count = 250)
 
 // BUILD TAG — bumped every release. Shows in the indicator title on the chart
 // (top-left) and on the dashboard's top row, so you can always confirm the
 // running version. If this differs from the tag I quote in chat, you're on an
 // old copy — re-paste the file I attached. Keep this in sync with the title.
-BUILD = "v2.1.0 · 2026-07-06"
+BUILD = "v2.1.1 · 2026-07-06"
 
 // #############################################################################
 // # SECTION 1 — INPUTS
@@ -101,6 +101,13 @@ styleH1 = input.string("Solid", "1 Hour",  options = ["Solid", "Dashed", "Dotted
 styleM15 = input.string("Solid", "15 Min", options = ["Solid", "Dashed", "Dotted"], group = grpStyle, inline = "s4")
 styleM5  = input.string("Solid", "5 Min",  options = ["Solid", "Dashed", "Dotted"], group = grpStyle, inline = "s4")
 
+// Global appearance — DISPLAY ONLY (never affects the level book or scoring).
+grpViz = "Line Appearance (visual only)"
+lineWidth   = input.int(2, "Line width", minval = 1, maxval = 6, group = grpViz)
+lineOpacity = input.int(0, "Line transparency (0 = solid, 90 = faint)", minval = 0, maxval = 95, group = grpViz)
+zoneOpacity = input.int(80, "Zone fill transparency", minval = 40, maxval = 98, group = grpViz,
+     tooltip = "Only applies when Show Zones is on. Higher = fainter fill.")
+
 grpPower = "Power Line"
 showPowerLine = input.bool(true, "Show Power Line", group = grpPower,
      tooltip = "A single line marking the nearest turning point where price is expected to flip back into the dominant HTF trend. Overall bear → nearest resistance above; overall bull → nearest support below. Does not touch the main S/R lines.")
@@ -163,6 +170,12 @@ showRiskBx  = input.bool(true, "Risk / Reward Boxes", group = grpVizT)
 // Hard ceiling on adaptive pivot leg. Also the fixed swing-scan loop bound —
 // keeps the detector's cost constant regardless of the live (series) leg.
 MAXLEG = 14
+
+// Fixed INTERNAL book capacity per store. The level book always holds up to
+// this many confirmed levels — independent of the user's "Max Levels" display
+// setting — so changing Max Levels can never move or delete a stored level; it
+// only changes how many of the top-ranked ones are DRAWN (see f_scoreAndRender).
+MAXBOOK = 20
 
 // Level anchor blend: 0 = wick extreme, 0.5 = wick/body midpoint, 1 = body edge.
 anchorA = anchorMode == "Body" ? 1.0 : anchorMode == "Wick/Body Mid" ? 0.5 : 0.0
@@ -347,7 +360,11 @@ f_htfPack() =>
     aF   = ta.atr(14)
     aS   = ta.atr(50)
     vM   = f_clamp(f_div(aF, aS), 0.5, 2.5)
-    leg  = int(f_clamp(math.round(5 * vM / detSens), 3, MAXLEG))
+    // FIXED INSTITUTIONAL LEG — the book's swing detection depends ONLY on the
+    // timeframe's own volatility (vM), never on the Sensitivity input. Moving
+    // Sensitivity therefore cannot re-detect or move a confirmed level; it now
+    // affects trade filtering only (see effMinScore/effMinProb).
+    leg  = int(f_clamp(math.round(5 * vM), 3, MAXLEG))
     [ph, pl] = f_swing(leg)
     // Hold last confirmed pivot + keep arrays of the last maxLvl pivots per side.
     // The arrays let the chart seed full HTF history on bar 1 regardless of how
@@ -588,7 +605,7 @@ f_addLevel(Store s, float p, bool isRes, color col, int wdt, string lstyle) =>
             s.sweeps.unshift(0)
             s.breaks.unshift(0)
             s.broken.unshift(false)
-            while s.price.size() > maxLvl
+            while s.price.size() > MAXBOOK
                 // Evict weakest, never the just-added level (index 0) and never
                 // the store's STRUCTURAL EXTREMES (highest / lowest unbroken
                 // level = the range boundaries) — a fresh major top/bottom has
@@ -645,9 +662,11 @@ f_updateBreaks(Store s) =>
         while i >= 0
             if not s.broken.get(i)
                 lvl     = s.price.get(i)
-                // Break buffer honours the level's OWN timeframe scale — a 5m
-                // close cannot "break" a Weekly level on Weekly terms.
-                buf     = math.max(atrSafe * 0.25, s.atrTF * 0.15) * adAtrMult * brkConf
+                // Break buffer is PURELY the level's own timeframe scale — no
+                // chart ATR, no chart-regime multiplier — so a level's broken
+                // state is identical on every chart (it can no longer be broken
+                // on a 5m chart yet alive on 1h). This is core to cross-TF parity.
+                buf     = s.atrTF * 0.30 * brkConf
                 crossed = math.abs(close - lvl) > buf and math.sign(close - lvl) != math.sign(close[1] - lvl)
                 if crossed
                     // Debounced stats: one event per level per 3 bars, and a
@@ -851,75 +870,90 @@ W_FRESH = 0.10
 W_SWEEP = 0.10
 W_SMC   = 0.10
 
-f_scoreAndRender(Store s, color baseCol, Store o1, Store o2, Store o3, Store o4, Store o5, Store o6) =>
+// Score threshold for the top-n levels by score (display filter). Returns -1
+// when the store holds <= n live levels (draw all). Pure read — never mutates.
+f_rankThresh(Store s, int n) =>
+    tmp = array.new<float>()
     if s.price.size() > 0
-        // Confluence + zone geometry on the store's own TF scale, so a Weekly
-        // level keeps Weekly-sized confluence bands and zones on any chart.
+        for i = 0 to s.price.size() - 1
+            if not s.broken.get(i)
+                tmp.push(s.score.get(i))
+    thr = -1.0
+    if tmp.size() > n and n > 0
+        tmp.sort(order.descending)
+        thr := tmp.get(n - 1)
+    thr
+
+// Two passes: (1) compute every live level's score, (2) render. Scoring NEVER
+// touches price/identity. Max Levels + strength + timeframe visibility are all
+// applied in pass 2 as pure display filters — a hidden level keeps its exact
+// frozen position and reappears unchanged when shown again.
+f_scoreAndRender(Store s, color baseCol, Store o1, Store o2, Store o3, Store o4, Store o5, Store o6, bool drawOK) =>
+    if s.price.size() > 0
         atrRef = math.max(atrSafe, s.atrTF * 0.5)
         band   = atrRef * adMergeMult * 1.5
+        // --- PASS 1: score every live level (no rendering, no mutation of price)
         for i = 0 to s.price.size() - 1
-            if s.broken.get(i)
-                continue
-            lvl      = s.price.get(i)
-            res      = s.isRes.get(i)
-            t        = s.touches.get(i)
-            avgReact = t > 0 ? s.reactSum.get(i) / t : 0.0
-            avgVol   = t > 0 ? s.volSum.get(i) / t : 0.0
-            recency  = bar_index - s.lastTouch.get(i)
-            // Confluence: weighted count of agreeing levels on the other TFs.
-            conf     = o1.w * f_nearCount(o1, lvl, band) + o2.w * f_nearCount(o2, lvl, band) + o3.w * f_nearCount(o3, lvl, band) + o4.w * f_nearCount(o4, lvl, band) + o5.w * f_nearCount(o5, lvl, band) + o6.w * f_nearCount(o6, lvl, band)
-            // Trend alignment: support favours uptrend, resistance favours down.
-            aligned  = res ? not trendUp : trendUp
-            // Liquidity-pool (equal highs/lows) + SMC footprint (FVG / order block).
-            eqCount  = f_sameSideNear(s, lvl, res, atrRef * 0.2, i)
-            fTouch   = f_norm01(t, 3)
-            fReact   = f_norm01(avgReact, 1.0)
-            fConf    = f_norm01(conf * htfInfl, 2.0)
-            fTrend   = isTrending ? (aligned ? 1.0 : 0.35) : 0.6
-            fVol     = f_norm01(avgVol, 1.0)
-            fFresh   = f_clamp(1.0 - recency * decaySpd / s.fhor, 0.0, 1.0)
-            fSweep   = f_norm01(s.sweeps.get(i), 2)
-            fSMC     = f_clamp(f_smcBonus(lvl) + f_norm01(eqCount, 1) * 0.5, 0.0, 1.0)
-            raw      = W_TOUCH * fTouch + W_REACT * fReact + W_CONF * fConf + W_TREND * fTrend + W_VOL * fVol + W_FRESH * fFresh + W_SWEEP * fSweep + W_SMC * fSMC
-            // Scale by timeframe importance (0.6..1.0 band) → final 0-100,
-            // then apply the lifecycle break penalty (clean breaks hurt most).
-            sc       = f_clamp(100.0 * raw * (0.6 + 0.4 * s.w), 0.0, 100.0)
-            sc      *= f_clamp(1.0 - 0.12 * math.min(s.breaks.get(i), 3), 0.5, 1.0)
-            s.score.set(i, sc)
-            weak     = sc < adMinScore
-            // Strength class drives VISIBILITY only — never recalculation.
-            clsStrong = sc >= 70
-            clsMed    = sc >= 50 and sc < 70
-            vizOK    = clsStrong ? showStrongLvl : clsMed ? showMedLvl : showWeakLvl
-            // Touch-mass filter: hide levels with insufficient weighted touches.
-            show     = t >= minTouches and vizOK
-            // Lines keep their Phase-3 look; filter hides them via transparency.
-            line.set_color(s.ln.get(i), show ? baseCol : color.new(baseCol, 100))
-            // --- Zone band: width ∝ chart ATR × adaptive mult; visible fill ---
-            bxo = s.bx.get(i)
-            if not na(bxo)
-                if show
-                    // Chart-ATR based → zone stays in proportion on EVERY timeframe.
-                    half = atrRef * zoneWidthK * adZoneMult * zoneScale
-                    box.set_top(bxo, lvl + half)
-                    box.set_bottom(bxo, lvl - half)
-                    ztr = int(f_clamp(84.0 - sc * 0.14, 70.0, 86.0))
-                    box.set_bgcolor(bxo, color.new(baseCol, ztr))
-                else
-                    box.set_bgcolor(bxo, color.new(baseCol, 100))
-            // --- Label: grade · side · price · score% (right edge) -----------
-            lb = s.lb.get(i)
-            if not na(lb)
-                if showLabel and not weak and show
-                    grade = sc >= 90 ? "A+" : sc >= 80 ? "A" : sc >= 70 ? "B" : sc >= 55 ? "C" : "D"
-                    // Label rides the anchored line; TEXT shows the frozen identity price.
-                    label.set_xy(lb, bar_index, f_anchorY(lvl, res, s.atrTF))
-                    label.set_text(lb, grade + "  " + (res ? "R" : "S") + "  " + f_px(lvl) + "  " + str.tostring(math.round(sc)) + "%")
-                    label.set_color(lb, color.new(baseCol, 25))
-                    label.set_textcolor(lb, sc >= 80 ? color.white : color.new(color.white, 25))
-                else
-                    label.set_text(lb, "")
-                    label.set_color(lb, color.new(color.white, 100))
+            if not s.broken.get(i)
+                lvl      = s.price.get(i)
+                res      = s.isRes.get(i)
+                t        = s.touches.get(i)
+                avgReact = t > 0 ? s.reactSum.get(i) / t : 0.0
+                avgVol   = t > 0 ? s.volSum.get(i) / t : 0.0
+                recency  = bar_index - s.lastTouch.get(i)
+                conf     = o1.w * f_nearCount(o1, lvl, band) + o2.w * f_nearCount(o2, lvl, band) + o3.w * f_nearCount(o3, lvl, band) + o4.w * f_nearCount(o4, lvl, band) + o5.w * f_nearCount(o5, lvl, band) + o6.w * f_nearCount(o6, lvl, band)
+                aligned  = res ? not trendUp : trendUp
+                eqCount  = f_sameSideNear(s, lvl, res, atrRef * 0.2, i)
+                fTouch   = f_norm01(t, 3)
+                fReact   = f_norm01(avgReact, 1.0)
+                fConf    = f_norm01(conf * htfInfl, 2.0)
+                fTrend   = isTrending ? (aligned ? 1.0 : 0.35) : 0.6
+                fVol     = f_norm01(avgVol, 1.0)
+                fFresh   = f_clamp(1.0 - recency * decaySpd / s.fhor, 0.0, 1.0)
+                fSweep   = f_norm01(s.sweeps.get(i), 2)
+                fSMC     = f_clamp(f_smcBonus(lvl) + f_norm01(eqCount, 1) * 0.5, 0.0, 1.0)
+                raw      = W_TOUCH * fTouch + W_REACT * fReact + W_CONF * fConf + W_TREND * fTrend + W_VOL * fVol + W_FRESH * fFresh + W_SWEEP * fSweep + W_SMC * fSMC
+                sc       = f_clamp(100.0 * raw * (0.6 + 0.4 * s.w), 0.0, 100.0)
+                sc      *= f_clamp(1.0 - 0.12 * math.min(s.breaks.get(i), 3), 0.5, 1.0)
+                s.score.set(i, sc)
+        // Max Levels is a DISPLAY filter: only the top-maxLvl by score are drawn.
+        thr = f_rankThresh(s, maxLvl)
+        // --- PASS 2: render (all gating here is visual; positions never move)
+        for i = 0 to s.price.size() - 1
+            if not s.broken.get(i)
+                lvl   = s.price.get(i)
+                res   = s.isRes.get(i)
+                t     = s.touches.get(i)
+                sc    = s.score.get(i)
+                weak  = sc < adMinScore
+                clsStrong = sc >= 70
+                clsMed    = sc >= 50 and sc < 70
+                vizOK  = clsStrong ? showStrongLvl : clsMed ? showMedLvl : showWeakLvl
+                rankOK = thr < 0 or sc >= thr
+                show   = drawOK and t >= minTouches and vizOK and rankOK
+                lnCol  = color.new(baseCol, show ? lineOpacity : 100)
+                line.set_color(s.ln.get(i), lnCol)
+                line.set_width(s.ln.get(i), lineWidth)
+                bxo = s.bx.get(i)
+                if not na(bxo)
+                    if show and showZones
+                        half = math.max(atrSafe, s.atrTF * 0.5) * zoneWidthK * zoneScale
+                        box.set_top(bxo, lvl + half)
+                        box.set_bottom(bxo, lvl - half)
+                        box.set_bgcolor(bxo, color.new(baseCol, zoneOpacity))
+                    else
+                        box.set_bgcolor(bxo, color.new(baseCol, 100))
+                lb = s.lb.get(i)
+                if not na(lb)
+                    if showLabel and not weak and show
+                        grade = sc >= 90 ? "A+" : sc >= 80 ? "A" : sc >= 70 ? "B" : sc >= 55 ? "C" : "D"
+                        label.set_xy(lb, bar_index, f_anchorY(lvl, res, s.atrTF))
+                        label.set_text(lb, grade + "  " + (res ? "R" : "S") + "  " + f_px(lvl) + "  " + str.tostring(math.round(sc)) + "%")
+                        label.set_color(lb, color.new(baseCol, 25))
+                        label.set_textcolor(lb, sc >= 80 ? color.white : color.new(color.white, 25))
+                    else
+                        label.set_text(lb, "")
+                        label.set_color(lb, color.new(color.white, 100))
 
 // --- Per-timeframe stores (w = importance, tfMin = TF minutes) + new swings -
 var Store stMN = f_newStore(1.00, 43200)
@@ -930,15 +964,30 @@ var Store stH1 = f_newStore(0.45, 60)
 var Store stM15 = f_newStore(0.35 * f_clamp(1.0 / ltfNoise, 0.5, 2.0), 15)
 var Store stM5  = f_newStore(0.30 * f_clamp(1.0 / ltfNoise, 0.5, 2.0), 5)
 
-// HTF-Only gating: a TF is shown only if it's >= the chart TF (when htfOnly on).
+// POPULATION vs DISPLAY (the core cross-TF-parity fix).
+// A store is POPULATED whenever its timeframe is at or above the chart — i.e.
+// whenever request.security can read it RELIABLY (a sub-chart request returns
+// sampled/phantom data and is correctly skipped). This makes the book depend
+// only on the level's own timeframe data, never on the user's source toggles
+// or Max Levels — so Weekly / Daily / 4H are IDENTICAL on every execution
+// chart at or below their TF. The source toggles + htfOnly are DISPLAY-only
+// (draw*), passed to the renderer: hiding a timeframe hides its lines without
+// touching the book or the Power Line.
+effUseMN  = 43200 >= chartMin
+effUseW   = 10080 >= chartMin
+effUseD   = 1440  >= chartMin
+effUseH4  = 240   >= chartMin
+effUseH1  = 60    >= chartMin
+effUseM15 = 15    >= chartMin
+effUseM5  = 5     >= chartMin
 f_eff(bool use, float tfMin) => use and (not htfOnly or tfMin >= chartMin)
-effUseMN  = f_eff(useMN,  43200)
-effUseW   = f_eff(useW,   10080)
-effUseD   = f_eff(useD,   1440)
-effUseH4  = f_eff(useH4,  240)
-effUseH1  = f_eff(useH1,  60)
-effUseM15 = f_eff(useM15, 15)
-effUseM5  = f_eff(useM5,  5)
+drawMN  = effUseMN  and f_eff(useMN,  43200)
+drawW   = effUseW   and f_eff(useW,   10080)
+drawD   = effUseD   and f_eff(useD,   1440)
+drawH4  = effUseH4  and f_eff(useH4,  240)
+drawH1  = effUseH1  and f_eff(useH1,  60)
+drawM15 = effUseM15 and f_eff(useM15, 15)
+drawM5  = effUseM5  and f_eff(useM5,  5)
 
 // Keep each store's own-TF ATR current (drives merge/zone/break/confluence).
 stMN.atrTF  := nz(atrMN,  atrSafe)
@@ -1046,13 +1095,13 @@ touchEvents = f_touchUpdate(stMN) + f_touchUpdate(stW) + f_touchUpdate(stD) + f_
 gBreaks += brkEvents
 gHolds  += touchEvents
 
-f_scoreAndRender(stMN,  colMN,  stW,  stD,  stH4, stH1, stM15, stM5)
-f_scoreAndRender(stW,   colW,   stMN, stD,  stH4, stH1, stM15, stM5)
-f_scoreAndRender(stD,   colD,   stMN, stW,  stH4, stH1, stM15, stM5)
-f_scoreAndRender(stH4,  colH4,  stMN, stW,  stD,  stH1, stM15, stM5)
-f_scoreAndRender(stH1,  colH1,  stMN, stW,  stD,  stH4, stM15, stM5)
-f_scoreAndRender(stM15, colM15, stMN, stW,  stD,  stH4, stH1,  stM5)
-f_scoreAndRender(stM5,  colM5,  stMN, stW,  stD,  stH4, stH1,  stM15)
+f_scoreAndRender(stMN,  colMN,  stW,  stD,  stH4, stH1, stM15, stM5,  drawMN)
+f_scoreAndRender(stW,   colW,   stMN, stD,  stH4, stH1, stM15, stM5,  drawW)
+f_scoreAndRender(stD,   colD,   stMN, stW,  stH4, stH1, stM15, stM5,  drawD)
+f_scoreAndRender(stH4,  colH4,  stMN, stW,  stD,  stH1, stM15, stM5,  drawH4)
+f_scoreAndRender(stH1,  colH1,  stMN, stW,  stD,  stH4, stM15, stM5,  drawH1)
+f_scoreAndRender(stM15, colM15, stMN, stW,  stD,  stH4, stH1,  stM5,  drawM15)
+f_scoreAndRender(stM5,  colM5,  stMN, stW,  stD,  stH4, stH1,  stM15, drawM5)
 
 // #############################################################################
 // # SECTION 10 — DECISION ENGINE   (evaluates the whole environment → State)
