@@ -155,20 +155,39 @@ f_thresh(int n) =>
 // ═══════════════════════════════════════════════════════════════════════════
 // 4 · POWER LINE — one controlling level, chosen ONLY from the database
 // ═══════════════════════════════════════════════════════════════════════════
-f_power() =>
-    bi = -1
-    bv = -1.0
+// TWO FROZEN POWER LINES (W/D only) that FRAME price. Each re-anchors ONLY when
+// price closes through it (a real break) — never bar-to-bar — so they stop the
+// jumping. PL1 = the nearer (controlling) boundary, PL2 = the farther (target).
+// A broken boundary flips to the opposite side (support→resistance / vice-versa).
+f_nearWD(bool below) =>
+    best = float(na)
+    bd = 1.0e18
     if Dp.size() > 0
         for i = 0 to Dp.size() - 1
-            d = math.abs(close - Dp.get(i)) / atrRef
-            v = Dr.get(i) * (1.0 / (1.0 + 0.15 * d))
-            if v > bv
-                bv := v
-                bi := i
-    bi
-pI = f_power()
-pPrice = pI >= 0 ? Dp.get(pI) : na
-pRes   = pI >= 0 ? Ds.get(pI) == 1 : false
+            if Dtf.get(i) >= 2                       // Weekly / Daily only
+                px = Dp.get(i)
+                if (below and px < close) or (not below and px > close)
+                    d = math.abs(close - px)
+                    if d < bd
+                        bd := d
+                        best := px
+    best
+pwrBuf = atrRef * 0.25
+var float plLo = na       // frozen support boundary (below price)
+var float plHi = na       // frozen resistance boundary (above price)
+nbLo = f_nearWD(true)
+nbHi = f_nearWD(false)
+if na(plLo)
+    plLo := nbLo
+else if close < plLo - pwrBuf
+    plHi := plLo                                     // broken support flips up to resistance
+    plLo := nbLo                                     // re-anchor to the next support below
+if na(plHi)
+    plHi := nbHi
+else if close > plHi + pwrBuf
+    plLo := plHi                                     // broken resistance flips down to support
+    plHi := nbHi
+pl1 = na(plLo) ? plHi : na(plHi) ? plLo : (math.abs(close - plLo) <= math.abs(close - plHi) ? plLo : plHi)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 4b · DATABASE HASH — objective determinism proof (order-independent).
@@ -245,8 +264,10 @@ f_tag(int tf)  => tf == 3 ? "W" : tf == 2 ? "D" : "4H"
 
 var array<line>  drawn = array.new<line>()
 var array<label> drawnL = array.new<label>()
-var line  pLine = na
-var label pLbl  = na
+var line  pLnLo = na
+var line  pLnHi = na
+var label pLbLo = na
+var label pLbHi = na
 
 if barstate.islast
     if drawn.size() > 0
@@ -270,15 +291,26 @@ if barstate.islast
                 drawn.push(line.new(x1, dy, x2, dy, xloc = xloc.bar_index, extend = extend.both, color = col, width = lineWid, style = lStyle))
                 if showLbl
                     drawnL.push(label.new(x2, dy, f_tag(tf) + " " + (Ds.get(i) == 1 ? "R" : "S") + " " + str.tostring(math.round(rk)), xloc = xloc.bar_index, style = label.style_label_left, color = color.new(f_col(tf), 20), textcolor = color.white, size = size.small))
-    if not na(pLine)
-        line.delete(pLine)
-        pLine := na
-    if not na(pLbl)
-        label.delete(pLbl)
-        pLbl := na
-    if showPwr and not na(pPrice)
-        pLine := line.new(x1, pPrice, x2, pPrice, xloc = xloc.bar_index, extend = extend.both, color = colPwr, width = 3, style = line.style_solid)
-        pLbl  := label.new(x2, pPrice, "⚡ POWER " + str.tostring(pPrice, format.mintick) + " · " + (pRes ? "R" : "S"), xloc = xloc.bar_index, style = label.style_label_left, color = colPwr, textcolor = color.black, size = size.normal)
+    if not na(pLnLo)
+        line.delete(pLnLo)
+        pLnLo := na
+    if not na(pLnHi)
+        line.delete(pLnHi)
+        pLnHi := na
+    if not na(pLbLo)
+        label.delete(pLbLo)
+        pLbLo := na
+    if not na(pLbHi)
+        label.delete(pLbHi)
+        pLbHi := na
+    if showPwr and not na(plLo)
+        p1 = pl1 == plLo
+        pLnLo := line.new(x1, plLo, x2, plLo, xloc = xloc.bar_index, extend = extend.both, color = colPwr, width = p1 ? 3 : 2, style = line.style_solid)
+        pLbLo := label.new(x2, plLo, "⚡ " + (p1 ? "PL1" : "PL2") + " " + str.tostring(plLo, format.mintick) + " · S", xloc = xloc.bar_index, style = label.style_label_left, color = colPwr, textcolor = color.black, size = size.normal)
+    if showPwr and not na(plHi)
+        p1 = pl1 == plHi
+        pLnHi := line.new(x1, plHi, x2, plHi, xloc = xloc.bar_index, extend = extend.both, color = colPwr, width = p1 ? 3 : 2, style = line.style_solid)
+        pLbHi := label.new(x2, plHi, "⚡ " + (p1 ? "PL1" : "PL2") + " " + str.tostring(plHi, format.mintick) + " · R", xloc = xloc.bar_index, style = label.style_label_left, color = colPwr, textcolor = color.black, size = size.normal)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 6 · HASH READOUT — the validation instrument. Compare this value across
@@ -290,8 +322,8 @@ if barstate.islast
     table.cell(hud, 1, 0, str.tostring(dbHash), text_color = #00e676, text_size = size.normal)
     table.cell(hud, 0, 1, "Levels", text_color = color.gray, text_size = size.small)
     table.cell(hud, 1, 1, str.tostring(Dp.size()), text_color = color.silver, text_size = size.small)
-    table.cell(hud, 0, 2, "Power", text_color = color.gray, text_size = size.small)
-    table.cell(hud, 1, 2, na(pPrice) ? "—" : str.tostring(pPrice, format.mintick), text_color = color.white, text_size = size.small)
+    table.cell(hud, 0, 2, "PL1 / PL2", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 2, (na(plLo) ? "—" : str.tostring(plLo, format.mintick)) + " / " + (na(plHi) ? "—" : str.tostring(plHi, format.mintick)), text_color = color.white, text_size = size.small)
     table.cell(hud, 0, 3, "Replay A/B/C", text_color = color.gray, text_size = size.small)
     table.cell(hud, 1, 3, str.tostring(rA) + "/" + (na(rB) ? "—" : str.tostring(rB)) + "/" + (na(rC) ? "—" : str.tostring(rC)), text_color = color.silver, text_size = size.small)
     table.cell(hud, 0, 4, "Freeze test", text_color = color.gray, text_size = size.small)
