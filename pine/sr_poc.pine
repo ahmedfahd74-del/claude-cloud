@@ -38,7 +38,8 @@ colPwr   = input.color(#ffffff, "Power Line colour", group = "Display")
 //     Detection + freeze + break all computed on that timeframe's OWN bars, so
 //     the returned book is identical regardless of the chart timeframe.
 // ═══════════════════════════════════════════════════════════════════════════
-MAXBOOK = 24
+MAXBOOK = 400   // effectively append-only: confirmed levels are frozen records
+                // and must not age out within the freeze-test window
 
 f_book() =>
     var array<float> p = array.new<float>()   // frozen identity price (wick)
@@ -114,6 +115,7 @@ var array<float> Db  = array.new<float>()
 var array<int>   Ds  = array.new<int>()
 var array<float> Dr  = array.new<float>()   // ranked strength 0-100
 var array<int>   Dtf = array.new<int>()     // 3 W · 2 D · 1 4H
+var array<bool>  Dbk = array.new<bool>()    // broken/invalidated (kept as a FROZEN record)
 
 f_norm(float v) => v / (v + 3.0)
 
@@ -126,16 +128,19 @@ f_has(float px) =>
                 break
     hit
 
+// APPEND-ONLY: every confirmed level enters the database and NEVER leaves —
+// invalidation only flips its broken flag (a frozen event record). This is what
+// makes the freeze test pass: the set + identities are immutable over time.
 f_ingest(bool use, array<float> p, array<float> b, array<int> s, array<float> t, array<bool> k, float w, int tf) =>
     if use and not na(p) and p.size() > 0
         for i = 0 to p.size() - 1
-            if not k.get(i) and not f_has(p.get(i))
+            if not f_has(p.get(i))
                 Dp.push(p.get(i)), Db.push(b.get(i)), Ds.push(s.get(i))
                 Dr.push(math.min(100.0, (0.35 + 0.65 * f_norm(t.get(i))) * w * 100.0))
-                Dtf.push(tf)
+                Dtf.push(tf), Dbk.push(k.get(i))
 
 // Rebuilt each bar from the frozen HTF books → identical every bar / every chart.
-Dp.clear(), Db.clear(), Ds.clear(), Dr.clear(), Dtf.clear()
+Dp.clear(), Db.clear(), Ds.clear(), Dr.clear(), Dtf.clear(), Dbk.clear()
 f_ingest(true, wP,  wB,  wS,  wT,  wK,  1.00, 3)
 f_ingest(true, dP,  dB,  dS,  dT,  dK,  0.80, 2)
 f_ingest(true, h4P, h4B, h4S, h4T, h4K, 0.60, 1)
@@ -145,7 +150,8 @@ f_thresh(int n) =>
     tmp = array.new<float>()
     if Dr.size() > 0
         for i = 0 to Dr.size() - 1
-            tmp.push(Dr.get(i))
+            if not Dbk.get(i)
+                tmp.push(Dr.get(i))
     thr = -1.0
     if tmp.size() > n and n > 0
         tmp.sort(order.descending)
@@ -164,7 +170,7 @@ f_nearWD(bool below) =>
     bd = 1.0e18
     if Dp.size() > 0
         for i = 0 to Dp.size() - 1
-            if Dtf.get(i) >= 2                       // Weekly / Daily only
+            if Dtf.get(i) >= 2 and not Dbk.get(i)    // Weekly / Daily, unbroken
                 px = Dp.get(i)
                 if (below and px < close) or (not below and px > close)
                     d = math.abs(close - px)
@@ -200,9 +206,10 @@ f_hash() =>
     h = 0
     if Dp.size() > 0
         for i = 0 to Dp.size() - 1
-            tickP = int(math.round(Dp.get(i) / syminfo.mintick))
-            lh = tickP * 131 + Ds.get(i) * 17 + Dtf.get(i) * 7
-            h := int(math.abs((h + lh) % 99999989))
+            if not Dbk.get(i)
+                tickP = int(math.round(Dp.get(i) / syminfo.mintick))
+                lh = tickP * 131 + Ds.get(i) * 17 + Dtf.get(i) * 7
+                h := int(math.abs((h + lh) % 99999989))
     h
 dbHash = f_hash()
 
@@ -284,7 +291,7 @@ if barstate.islast
         for i = 0 to Dp.size() - 1
             tf = Dtf.get(i)
             rk = Dr.get(i)
-            if f_show(tf) and (thr < 0 or rk >= thr)
+            if f_show(tf) and not Dbk.get(i) and (thr < 0 or rk >= thr)
                 lvl = Dp.get(i)
                 dy  = lvl * (1.0 - anchorA) + Db.get(i) * anchorA   // visual anchor only
                 col = color.new(f_col(tf), lineTr)
