@@ -319,10 +319,12 @@ if barstate.islast
                 kd  = EKd.get(i)
                 x1  = math.max(bar_index - 300, 0)
                 if kd == 3
-                    // FVG — a zone: box from near edge (EL) to far edge (EL2)
+                    // FVG — a zone anchored at the bar it FORMED (EBir), extending
+                    // right through current price: box from near edge to far edge.
                     top = math.max(lvl, EL2.get(i))
                     bot = math.min(lvl, EL2.get(i))
-                    drawnBx.push(box.new(x1, top, x2, bot, xloc = xloc.bar_index, extend = extend.right, border_color = col, border_width = 1, bgcolor = color.new(col, fvgFill)))
+                    bx1 = math.min(EBir.get(i), bar_index - 1)
+                    drawnBx.push(box.new(bx1, top, x2, bot, xloc = xloc.bar_index, extend = extend.right, border_color = col, border_width = 1, bgcolor = color.new(col, fvgFill)))
                     if showLbl
                         drawnL.push(label.new(x2, top, f_tag(tf) + " FVG " + (ED.get(i) == 1 ? "▲" : "▼") + (EM.get(i) ? " ·mit" : ""), xloc = xloc.bar_index, style = label.style_label_left, color = col, textcolor = color.white, size = size.small))
                 else
