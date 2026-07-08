@@ -25,15 +25,17 @@ linePrio = input.string("Nearest to price", "Line priority", options = ["Nearest
 showW    = input.bool(true, "Show Weekly", inline = "s", group = "Display")
 showD    = input.bool(true, "Show Daily",  inline = "s", group = "Display")
 showH4   = input.bool(true, "Show 4H",     inline = "s", group = "Display")
-colW     = input.color(#d32f2f, "Weekly", inline = "c", group = "Display")
-colD     = input.color(#ffd700, "Daily",  inline = "c", group = "Display")
-colH4    = input.color(#2962ff, "4H",     inline = "c", group = "Display")
+// Levels are coloured by ROLE, not timeframe: a line below price acts as support
+// (green); above price acts as resistance (red). When a level is broken (price
+// closes through it) its role flips — a broken support becomes resistance and a
+// broken resistance becomes support — so the colour flips on break/retest.
+colSup   = input.color(#26a69a, "Support (below price)",    inline = "c", group = "Display")
+colRes   = input.color(#ef5350, "Resistance (above price)", inline = "c", group = "Display")
 lineWid  = input.int(2, "Line width", minval = 1, maxval = 6, group = "Display")
 lineTr   = input.int(0, "Line transparency", minval = 0, maxval = 90, group = "Display")
 styleS   = input.string("Solid", "Line style", options = ["Solid", "Dashed", "Dotted"], group = "Display")
 showLbl  = input.bool(true, "Labels", group = "Display")
 showPwr  = input.bool(true, "Power Line", group = "Display")
-colPwr   = input.color(#ffffff, "Power Line colour", group = "Display")
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 1 · PER-TIMEFRAME BOOK BUILDER — runs INSIDE request.security on its own TF.
@@ -257,28 +259,35 @@ replayPass = not na(rC) and rA == rB and rB == rC
 // 5 · RENDERER — READ-ONLY. Every setting here changes drawing only.
 // ═══════════════════════════════════════════════════════════════════════════
 lStyle  = styleS == "Dashed" ? line.style_dashed : styleS == "Dotted" ? line.style_dotted : line.style_solid
-f_col(int tf)  => tf == 3 ? colW : tf == 2 ? colD : colH4
 f_show(int tf) => tf == 3 ? showW : tf == 2 ? showD : showH4
 f_tag(int tf)  => tf == 3 ? "W" : tf == 2 ? "D" : "4H"
+// CURRENT ROLE (not the birth side): a level acts as resistance when it is an
+// unbroken high OR a broken low (price closed below a support → it flips up to
+// resistance); it acts as support when it is an unbroken low OR a broken high.
+// Ds = birth side (1 high, 0 low); Dbk = broken. Role = Ds XOR Dbk.
+f_res(int i)  => (Ds.get(i) == 1) != Dbk.get(i)   // true ⇒ resistance now, false ⇒ support now
+f_rcol(int i) => f_res(i) ? colRes : colSup
+f_rtag(int i) => f_res(i) ? "R" : "S"
 
-// READ-ONLY visual de-dup: hide a level when a HIGHER-timeframe unbroken level
-// sits within tolerance (uses live ATR — affects drawing only, never the DB).
+// READ-ONLY visual de-dup: hide a level when a HIGHER-timeframe level sits within
+// tolerance (uses live ATR — affects drawing only, never the DB).
 f_keep(int i) =>
     keep = true
     lvl = Dp.get(i)
     tf  = Dtf.get(i)
     if Dp.size() > 0
         for j = 0 to Dp.size() - 1
-            if j != i and not Dbk.get(j) and Dtf.get(j) > tf and math.abs(Dp.get(j) - lvl) <= atrRef * mergeATR
+            if j != i and Dtf.get(j) > tf and math.abs(Dp.get(j) - lvl) <= atrRef * mergeATR
                 keep := false
                 break
     keep
 
-// A level is eligible to draw when it is unbroken, its timeframe is shown, and
-// it survived visual de-dup. The Max-Lines budget is filled from this set only,
-// so the count is what you actually SEE (hidden TFs never eat the budget).
+// A level is eligible to draw when its timeframe is shown and it survived de-dup.
+// Broken levels ARE drawn — they flip role/colour rather than disappearing, so a
+// former support that price broke shows as red resistance (a retest candidate).
+// The Max-Lines budget is filled from this set only, so the count is what you SEE.
 nearMode = linePrio == "Nearest to price"
-f_eligible(int i) => not Dbk.get(i) and f_show(Dtf.get(i)) and f_keep(i)
+f_eligible(int i) => f_show(Dtf.get(i)) and f_keep(i)
 f_metric(int i)   => nearMode ? math.abs(close - Dp.get(i)) : Dr.get(i)
 
 // PER-TIMEFRAME budget: the cutoff is computed for ONE timeframe at a time, so
@@ -328,10 +337,10 @@ if barstate.islast
             rk = Dr.get(i)
             if f_eligible(i) and f_inbudget(i, tf == 3 ? cutW : tf == 2 ? cutD : cut4)
                 lvl = Dp.get(i)                                     // draw at the wick — the true level
-                col = color.new(f_col(tf), lineTr)
+                col = color.new(f_rcol(i), lineTr)                  // colour by CURRENT role (S green / R red)
                 drawn.push(line.new(x1, lvl, x2, lvl, xloc = xloc.bar_index, extend = extend.both, color = col, width = lineWid, style = lStyle))
                 if showLbl
-                    drawnL.push(label.new(x2, lvl, f_tag(tf) + " " + (Ds.get(i) == 1 ? "R" : "S") + " " + str.tostring(math.round(rk)), xloc = xloc.bar_index, style = label.style_label_left, color = color.new(f_col(tf), 20), textcolor = color.white, size = size.small))
+                    drawnL.push(label.new(x2, lvl, f_tag(tf) + " " + f_rtag(i) + " " + str.tostring(math.round(rk)), xloc = xloc.bar_index, style = label.style_label_left, color = color.new(f_rcol(i), 20), textcolor = color.white, size = size.small))
     if not na(pLnLo)
         line.delete(pLnLo)
         pLnLo := na
@@ -346,12 +355,12 @@ if barstate.islast
         pLbHi := na
     if showPwr and not na(plLo)
         p1 = pl1 == plLo
-        pLnLo := line.new(x1, plLo, x2, plLo, xloc = xloc.bar_index, extend = extend.both, color = colPwr, width = p1 ? 3 : 2, style = line.style_solid)
-        pLbLo := label.new(x2, plLo, "⚡ " + (p1 ? "PL1" : "PL2") + " " + str.tostring(plLo, format.mintick) + " · S", xloc = xloc.bar_index, style = label.style_label_left, color = colPwr, textcolor = color.black, size = size.normal)
+        pLnLo := line.new(x1, plLo, x2, plLo, xloc = xloc.bar_index, extend = extend.both, color = colSup, width = p1 ? 3 : 2, style = line.style_solid)
+        pLbLo := label.new(x2, plLo, "⚡ " + (p1 ? "PL1" : "PL2") + " " + str.tostring(plLo, format.mintick) + " · S", xloc = xloc.bar_index, style = label.style_label_left, color = colSup, textcolor = color.white, size = size.normal)
     if showPwr and not na(plHi)
         p1 = pl1 == plHi
-        pLnHi := line.new(x1, plHi, x2, plHi, xloc = xloc.bar_index, extend = extend.both, color = colPwr, width = p1 ? 3 : 2, style = line.style_solid)
-        pLbHi := label.new(x2, plHi, "⚡ " + (p1 ? "PL1" : "PL2") + " " + str.tostring(plHi, format.mintick) + " · R", xloc = xloc.bar_index, style = label.style_label_left, color = colPwr, textcolor = color.black, size = size.normal)
+        pLnHi := line.new(x1, plHi, x2, plHi, xloc = xloc.bar_index, extend = extend.both, color = colRes, width = p1 ? 3 : 2, style = line.style_solid)
+        pLbHi := label.new(x2, plHi, "⚡ " + (p1 ? "PL1" : "PL2") + " " + str.tostring(plHi, format.mintick) + " · R", xloc = xloc.bar_index, style = label.style_label_left, color = colRes, textcolor = color.white, size = size.normal)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 6 · HASH READOUT — the validation instrument. Compare DB HASH across
