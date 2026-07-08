@@ -32,11 +32,9 @@ maxEv      = input.int(8, "Max events per timeframe", minval = 1, maxval = 40, g
      tooltip = "Per timeframe: draw up to this many events, nearest to price first. Never moves an event; only changes how many show.")
 showActive = input.bool(true, "Only active (hide invalidated)", group = "Display")
 hideMit    = input.bool(false, "Hide mitigated", group = "Display")
-showW      = input.bool(true, "Show Weekly", inline = "s1", group = "Display")
-showD      = input.bool(true, "Show Daily",  inline = "s1", group = "Display")
-showH4     = input.bool(true, "Show 4H",     inline = "s1", group = "Display")
-show1H     = input.bool(true, "Show 1H",     inline = "s2", group = "Display")
-show15     = input.bool(true, "Show 15m",    inline = "s2", group = "Display")
+showW      = input.bool(true, "Show Weekly", inline = "s", group = "Display")
+showD      = input.bool(true, "Show Daily",  inline = "s", group = "Display")
+showH4     = input.bool(true, "Show 4H",     inline = "s", group = "Display")
 colBull    = input.color(#26a69a, "Bullish sweep (liquidity below)", group = "Display")
 colBear    = input.color(#ef5350, "Bearish sweep (liquidity above)", group = "Display")
 colMit     = input.color(#787b86, "Mitigated (dimmed)", group = "Display")
@@ -114,8 +112,6 @@ f_sweeps() =>
 [wL,  wD,  wT,  wX,  wM,  wV]  = request.security(syminfo.tickerid, "W",   f_sweeps(), lookahead = barmerge.lookahead_off)
 [dL,  dD,  dT,  dX,  dM,  dV]  = request.security(syminfo.tickerid, "D",   f_sweeps(), lookahead = barmerge.lookahead_off)
 [h4L, h4D, h4T, h4X, h4M, h4V] = request.security(syminfo.tickerid, "240", f_sweeps(), lookahead = barmerge.lookahead_off)
-[h1L, h1D, h1T, h1X, h1M, h1V] = request.security(syminfo.tickerid, "60",  f_sweeps(), lookahead = barmerge.lookahead_off)
-[m15L, m15D, m15T, m15X, m15M, m15V] = request.security(syminfo.tickerid, "15", f_sweeps(), lookahead = barmerge.lookahead_off)
 atrD   = request.security(syminfo.tickerid, "D", ta.atr(14), lookahead = barmerge.lookahead_off)
 atrRef = na(atrD) or atrD <= 0 ? close * 0.005 : atrD
 dayOpen = request.security(syminfo.tickerid, "D", time, lookahead = barmerge.lookahead_off)
@@ -143,7 +139,7 @@ f_ingest(bool use, array<float> l, array<int> d, array<int> t, array<float> x, a
         for i = 0 to l.size() - 1
             px  = l.get(i)
             key = int(math.round(px / syminfo.mintick))
-            ck  = key * 16 + d.get(i) * 8 + tf     // dir ∈ {0,1}, tf ∈ {1..5}; *8 & *16 keep buckets disjoint
+            ck  = key * 32 + d.get(i) * 4 + tf     // dir ∈ {0,1}, tf ∈ {1,2,3}; *4 & *32 keep buckets disjoint
             if Eidx.contains(ck)
                 idx = Eidx.get(ck)
                 EM.set(idx, m.get(i)), EV.set(idx, v.get(i))   // refresh live flags only
@@ -153,11 +149,9 @@ f_ingest(bool use, array<float> l, array<int> d, array<int> t, array<float> x, a
                 Eidx.put(ck, EL.size() - 1)
                 EBir.push(bar_index)
 
-f_ingest(true, wL,   wD,   wT,   wX,   wM,   wV,   5)
-f_ingest(true, dL,   dD,   dT,   dX,   dM,   dV,   4)
-f_ingest(true, h4L,  h4D,  h4T,  h4X,  h4M,  h4V,  3)
-f_ingest(true, h1L,  h1D,  h1T,  h1X,  h1M,  h1V,  2)
-f_ingest(true, m15L, m15D, m15T, m15X, m15M, m15V, 1)
+f_ingest(true, wL,  wD,  wT,  wX,  wM,  wV,  3)
+f_ingest(true, dL,  dD,  dT,  dX,  dM,  dV,  2)
+f_ingest(true, h4L, h4D, h4T, h4X, h4M, h4V, 1)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 4 · SWEEP DB HASH (canonical window) + counts for the debug panel
@@ -217,8 +211,8 @@ replayPass = not na(rC) and rA == rB and rB == rC
 // 5 · RENDERER — READ-ONLY. Draws each active sweep at its swept level.
 // ═══════════════════════════════════════════════════════════════════════════
 lStyle  = styleS == "Solid" ? line.style_solid : styleS == "Dotted" ? line.style_dotted : line.style_dashed
-f_show(int tf) => tf == 5 ? showW : tf == 4 ? showD : tf == 3 ? showH4 : tf == 2 ? show1H : show15
-f_tag(int tf)  => tf == 5 ? "W" : tf == 4 ? "D" : tf == 3 ? "4H" : tf == 2 ? "1H" : "15m"
+f_show(int tf) => tf == 3 ? showW : tf == 2 ? showD : showH4
+f_tag(int tf)  => tf == 3 ? "W" : tf == 2 ? "D" : "4H"
 f_ecol(int i)  => EM.get(i) ? colMit : (ED.get(i) == 1 ? colBear : colBull)
 
 // eligible = shown TF, and passes the active / mitigated display filters
@@ -255,14 +249,14 @@ if barstate.islast
         for i = 0 to drawnL.size() - 1
             label.delete(drawnL.get(i))
     drawn.clear(), drawnL.clear()
-    cutArr = array.new<float>(6, na)                 // one nearest-cutoff per timeframe (tf 1..5)
-    for tf = 1 to 5
-        cutArr.set(tf, f_cutoffTF(maxEv, tf))
+    cutW = f_cutoffTF(maxEv, 3)
+    cutD = f_cutoffTF(maxEv, 2)
+    cut4 = f_cutoffTF(maxEv, 1)
     x2 = bar_index + 1
     if EL.size() > 0
         for i = 0 to EL.size() - 1
             tf = ETf.get(i)
-            if f_eligible(i) and f_inbudget(i, cutArr.get(tf))
+            if f_eligible(i) and f_inbudget(i, tf == 3 ? cutW : tf == 2 ? cutD : cut4)
                 lvl = EL.get(i)
                 col = f_ecol(i)
                 x1 = math.max(bar_index - 300, 0)
