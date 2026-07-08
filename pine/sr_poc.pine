@@ -25,6 +25,8 @@ maxLines = input.int(6, "Max lines per timeframe", minval = 1, maxval = 40, grou
      tooltip = "Applied PER timeframe: each shown timeframe draws up to this many levels. Enabling another timeframe adds its lines and never removes a level from a different timeframe.")
 linePrio = input.string("Nearest to price", "Line priority", options = ["Nearest to price", "Highest strength"], group = "Display",
      tooltip = "Which levels fill each timeframe's budget first. Nearest = the closest levels to current price always show (most tradeable). Strength = the highest-ranked levels regardless of distance.")
+clusterATR = input.float(0.5, "Merge lines closer than (× ATR)", minval = 0.0, maxval = 5.0, step = 0.1, group = "Display",
+     tooltip = "Visual de-clutter (drawing only — never moves a line or changes the database). Lines sitting within this many daily-ATR of each other collapse to the single most important one (higher timeframe, then higher rank). 0 = draw every line, no merging. Raise it to thin out dense zones.")
 showW    = input.bool(true, "Show Weekly", inline = "s", group = "Display")
 showD    = input.bool(true, "Show Daily",  inline = "s", group = "Display")
 showH4   = input.bool(true, "Show 4H",     inline = "s", group = "Display")
@@ -272,17 +274,27 @@ f_res(int i)  => Dp.get(i) > close   // above price ⇒ resistance (red); below 
 f_rcol(int i) => f_res(i) ? colRes : colSup
 f_rtag(int i) => f_res(i) ? "R" : "S"
 
-// READ-ONLY visual de-dup: hide a level when a HIGHER-timeframe level sits within
-// tolerance (uses live ATR — affects drawing only, never the DB).
+// READ-ONLY visual CLUSTER de-dup: when several drawn lines sit within the
+// spacing budget (clusterATR × daily-ATR) of each other, keep only the most
+// important one and hide the rest — so dense zones collapse to a single line.
+// "Most important" is a strict total order: higher timeframe wins; tie → higher
+// rank; tie → lower index (deterministic). It only HIDES lines, never moves one,
+// and touches only drawing — never the database or the hash.
 f_keep(int i) =>
     keep = true
-    lvl = Dp.get(i)
-    tf  = Dtf.get(i)
-    if Dp.size() > 0
+    lvl  = Dp.get(i)
+    tf   = Dtf.get(i)
+    rk   = Dr.get(i)
+    tol  = atrRef * clusterATR
+    if clusterATR > 0 and Dp.size() > 0
         for j = 0 to Dp.size() - 1
-            if j != i and Dtf.get(j) > tf and math.abs(Dp.get(j) - lvl) <= atrRef * mergeATR
-                keep := false
-                break
+            if j != i and f_show(Dtf.get(j)) and math.abs(Dp.get(j) - lvl) <= tol
+                tfj = Dtf.get(j)
+                rkj = Dr.get(j)
+                wins = tfj > tf or (tfj == tf and (rkj > rk or (rkj == rk and j < i)))
+                if wins
+                    keep := false
+                    break
     keep
 
 // A level is eligible to draw when its timeframe is shown and it survived de-dup.
