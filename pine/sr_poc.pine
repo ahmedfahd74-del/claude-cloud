@@ -18,7 +18,9 @@ mergeATR = input.float(0.40, "Merge distance (× TF-ATR)", minval = 0.05, maxval
 brkATR   = input.float(0.30, "Break distance (× TF-ATR)", minval = 0.05, maxval = 2.0, step = 0.05, group = "Detection")
 
 // ─── Display (read-only — must never change the database) ──────────────────
-maxLines = input.int(10, "Max Lines (top-ranked drawn)", minval = 1, maxval = 40, group = "Display")
+maxLines = input.int(10, "Max Lines (drawn)", minval = 1, maxval = 40, group = "Display")
+linePrio = input.string("Nearest to price", "Line priority", options = ["Nearest to price", "Highest strength"], group = "Display",
+     tooltip = "Which levels fill the Max-Lines budget first. Nearest = the closest levels to current price always show (most tradeable). Strength = the highest-ranked levels regardless of distance.")
 showW    = input.bool(true, "Show Weekly", inline = "s", group = "Display")
 showD    = input.bool(true, "Show Daily",  inline = "s", group = "Display")
 showH4   = input.bool(true, "Show 4H",     inline = "s", group = "Display")
@@ -162,19 +164,6 @@ f_ingest(true, wP,  wB,  wS,  wT,  wK,  wBT,  1.00, 3)
 f_ingest(true, dP,  dB,  dS,  dT,  dK,  dBT,  0.80, 2)
 f_ingest(true, h4P, h4B, h4S, h4T, h4K, h4BT, 0.60, 1)
 
-// Nth-highest strength for the Max-Lines display filter (read-only).
-f_thresh(int n) =>
-    tmp = array.new<float>()
-    if Dr.size() > 0
-        for i = 0 to Dr.size() - 1
-            if not Dbk.get(i)
-                tmp.push(Dr.get(i))
-    thr = -1.0
-    if tmp.size() > n and n > 0
-        tmp.sort(order.descending)
-        thr := tmp.get(n - 1)
-    thr
-
 // ═══════════════════════════════════════════════════════════════════════════
 // 4 · POWER LINE — one controlling level, chosen ONLY from the database
 // ═══════════════════════════════════════════════════════════════════════════
@@ -293,6 +282,32 @@ f_keep(int i) =>
                 break
     keep
 
+// A level is eligible to draw when it is unbroken, its timeframe is shown, and
+// it survived visual de-dup. The Max-Lines budget is filled from this set only,
+// so the count is what you actually SEE (hidden TFs never eat the budget).
+nearMode = linePrio == "Nearest to price"
+f_eligible(int i) => not Dbk.get(i) and f_show(Dtf.get(i)) and f_keep(i)
+f_metric(int i)   => nearMode ? math.abs(close - Dp.get(i)) : Dr.get(i)
+
+// Cutoff metric value at rank n over the eligible set. Nearest → n-th SMALLEST
+// distance to price (closest levels win first); Strength → n-th LARGEST rank.
+// na ⇒ fewer than n eligible levels, so everything eligible is drawn.
+f_cutoff(int n) =>
+    tmp = array.new<float>()
+    if Dp.size() > 0
+        for i = 0 to Dp.size() - 1
+            if f_eligible(i)
+                tmp.push(f_metric(i))
+    cut = float(na)
+    if tmp.size() > n and n > 0
+        tmp.sort(nearMode ? order.ascending : order.descending)
+        cut := tmp.get(n - 1)
+    cut
+
+// Does level i make the Max-Lines cut? (nearest ⇒ within cutoff distance;
+// strength ⇒ at or above cutoff rank.)
+f_inbudget(int i, float cut) => na(cut) or (nearMode ? f_metric(i) <= cut : f_metric(i) >= cut)
+
 var array<line>  drawn = array.new<line>()
 var array<label> drawnL = array.new<label>()
 var line  pLnLo = na
@@ -308,14 +323,14 @@ if barstate.islast
         for i = 0 to drawnL.size() - 1
             label.delete(drawnL.get(i))
     drawn.clear(), drawnL.clear()
-    thr = f_thresh(maxLines)
+    cut = f_cutoff(maxLines)
     x1 = bar_index - 1
     x2 = bar_index + 1
     if Dp.size() > 0
         for i = 0 to Dp.size() - 1
             tf = Dtf.get(i)
             rk = Dr.get(i)
-            if f_show(tf) and not Dbk.get(i) and f_keep(i) and (thr < 0 or rk >= thr)
+            if f_eligible(i) and f_inbudget(i, cut)
                 lvl = Dp.get(i)
                 dy  = lvl * (1.0 - anchorA) + Db.get(i) * anchorA   // visual anchor only
                 col = color.new(f_col(tf), lineTr)
