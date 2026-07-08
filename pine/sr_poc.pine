@@ -185,21 +185,14 @@ f_nearWD(bool below) =>
                         bd := d
                         best := px
     best
-pwrBuf = atrRef * 0.25
-var float plLo = na       // frozen support boundary (below price)
-var float plHi = na       // frozen resistance boundary (above price)
-nbLo = f_nearWD(true)
-nbHi = f_nearWD(false)
-if na(plLo)
-    plLo := nbLo
-else if close < plLo - pwrBuf
-    plHi := plLo                                     // broken support flips up to resistance
-    plLo := nbLo                                     // re-anchor to the next support below
-if na(plHi)
-    plHi := nbHi
-else if close > plHi + pwrBuf
-    plLo := plHi                                     // broken resistance flips down to support
-    plHi := nbHi
+// STATELESS power lines — no var, no path-dependent state. Each is a pure
+// function of the current database + price, so given the same DB and last-bar
+// price (both identical across chart timeframes) the result is byte-identical
+// on every timeframe. They still change only when price actually CROSSES a W/D
+// level (the nearest bracket shifts) — never bar-to-bar — so there is no jump.
+// plLo = nearest unbroken Weekly/Daily level below price; plHi = nearest above.
+plLo = f_nearWD(true)
+plHi = f_nearWD(false)
 pl1 = na(plLo) ? plHi : na(plHi) ? plLo : (math.abs(close - plLo) <= math.abs(close - plHi) ? plLo : plHi)
 
 // ═══════════════════════════════════════════════════════════════════════════
