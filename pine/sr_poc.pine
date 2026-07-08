@@ -101,46 +101,63 @@ f_book() =>
 // ═══════════════════════════════════════════════════════════════════════════
 // 2 · FETCH FROZEN BOOKS (one security call per TF) + chart-independent ATR
 // ═══════════════════════════════════════════════════════════════════════════
-[wP, wB, wS, wT, wK]     = request.security(syminfo.tickerid, "W",   f_book(), lookahead = barmerge.lookahead_off)
-[dP, dB, dS, dT, dK]     = request.security(syminfo.tickerid, "D",   f_book(), lookahead = barmerge.lookahead_off)
+[wP,  wB,  wS,  wT,  wK]  = request.security(syminfo.tickerid, "W",   f_book(), lookahead = barmerge.lookahead_off)
+[dP,  dB,  dS,  dT,  dK]  = request.security(syminfo.tickerid, "D",   f_book(), lookahead = barmerge.lookahead_off)
 [h4P, h4B, h4S, h4T, h4K] = request.security(syminfo.tickerid, "240", f_book(), lookahead = barmerge.lookahead_off)
 atrD = request.security(syminfo.tickerid, "D", ta.atr(14), lookahead = barmerge.lookahead_off)
 atrRef = na(atrD) or atrD <= 0 ? close * 0.005 : atrD
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 3 · MERGE INTO ONE DATABASE + RANK ONCE (deterministic; dedupe across TFs)
+// 3 · ONE PERSISTENT DATABASE — APPEND-ONLY UNION, WRITE-ONCE IDENTITY.
+//
+//     The combined DB is the pure UNION of the three frozen per-TF books. A
+//     level enters exactly once — the first bar its (price-tick, timeframe)
+//     identity appears — and never leaves; later bars only refresh live fields
+//     (rank, broken). NOTHING is ever dropped, so membership does not depend on
+//     the order in which levels appear. That matters twice:
+//       · cross-TF — the union is the same set on every chart timeframe
+//         (commutative hash ⇒ identical dbHash), and
+//       · over time — for any fixed cut bar, {levels born ≤ cut} is immutable,
+//         which is exactly what the freeze/replay test measures.
+//     Near-duplicate levels from different timeframes are kept as distinct
+//     records here (different provenance); the RENDERER de-duplicates them
+//     visually (read-only), so de-dup never touches the database or the hash.
 // ═══════════════════════════════════════════════════════════════════════════
-var array<float> Dp  = array.new<float>()
-var array<float> Db  = array.new<float>()
-var array<int>   Ds  = array.new<int>()
-var array<float> Dr  = array.new<float>()   // ranked strength 0-100
-var array<int>   Dtf = array.new<int>()     // 3 W · 2 D · 1 4H
-var array<bool>  Dbk = array.new<bool>()    // broken/invalidated (kept as a FROZEN record)
+var array<float> Dp   = array.new<float>()   // frozen identity price (wick)
+var array<float> Db   = array.new<float>()   // body edge (visual anchor only)
+var array<int>   Ds   = array.new<int>()     // 1 = resistance, 0 = support
+var array<float> Dr   = array.new<float>()   // ranked strength 0-100 (live)
+var array<int>   Dtf  = array.new<int>()     // 3 W · 2 D · 1 4H
+var array<bool>  Dbk  = array.new<bool>()    // broken/invalidated (live flag)
+var array<int>   Dkey = array.new<int>()     // frozen identity key (price in ticks)
+var array<int>   Dbir = array.new<int>()     // frozen birth bar_index
 
 f_norm(float v) => v / (v + 3.0)
 
-f_has(float px) =>
-    hit = false
-    if Dp.size() > 0
-        for i = 0 to Dp.size() - 1
-            if math.abs(Dp.get(i) - px) <= atrRef * mergeATR
-                hit := true
+// Find an existing level with this exact (key, tf) identity, else -1.
+f_find(int key, int tf) =>
+    idx = -1
+    if Dkey.size() > 0
+        for j = 0 to Dkey.size() - 1
+            if Dkey.get(j) == key and Dtf.get(j) == tf
+                idx := j
                 break
-    hit
+    idx
 
-// APPEND-ONLY: every confirmed level enters the database and NEVER leaves —
-// invalidation only flips its broken flag (a frozen event record). This is what
-// makes the freeze test pass: the set + identities are immutable over time.
 f_ingest(bool use, array<float> p, array<float> b, array<int> s, array<float> t, array<bool> k, float w, int tf) =>
     if use and not na(p) and p.size() > 0
         for i = 0 to p.size() - 1
-            if not f_has(p.get(i))
-                Dp.push(p.get(i)), Db.push(b.get(i)), Ds.push(s.get(i))
-                Dr.push(math.min(100.0, (0.35 + 0.65 * f_norm(t.get(i))) * w * 100.0))
+            px  = p.get(i)
+            key = int(math.round(px / syminfo.mintick))
+            rk  = math.min(100.0, (0.35 + 0.65 * f_norm(t.get(i))) * w * 100.0)
+            idx = f_find(key, tf)
+            if idx >= 0
+                Dr.set(idx, rk), Dbk.set(idx, k.get(i))     // refresh live fields only
+            else
+                Dp.push(px), Db.push(b.get(i)), Ds.push(s.get(i)), Dr.push(rk)
                 Dtf.push(tf), Dbk.push(k.get(i))
+                Dkey.push(key), Dbir.push(bar_index)         // write-once identity + birth bar
 
-// Rebuilt each bar from the frozen HTF books → identical every bar / every chart.
-Dp.clear(), Db.clear(), Ds.clear(), Dr.clear(), Dtf.clear(), Dbk.clear()
 f_ingest(true, wP,  wB,  wS,  wT,  wK,  1.00, 3)
 f_ingest(true, dP,  dB,  dS,  dT,  dK,  0.80, 2)
 f_ingest(true, h4P, h4B, h4S, h4T, h4K, 0.60, 1)
@@ -215,43 +232,21 @@ dbHash = f_hash()
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 4c · REPLAY / FREEZE-INTEGRITY TEST — the "solid enough to build on" proof.
-//      Registers each level's FIRST-SEEN bar, then hashes only the FROZEN
-//      window (levels born before last_bar − windowBars). That window is closed
-//      and immutable, so its hash sampled now / 500 / 1000 bars ago MUST be
-//      equal on a non-repainting engine: A = B = C ⇒ freeze integrity holds.
+//      Hashes ONLY the frozen window: levels whose write-once birth bar is at or
+//      before last_bar − windowBars. Because the DB is append-only with frozen
+//      identities, that window's membership can never change, so its hash
+//      sampled now / 500 / 1000 bars ago MUST match on a non-repainting engine.
+//      A = B = C ⇒ freeze integrity holds. (Broken flag is deliberately NOT in
+//      the hash — invalidation is a live overlay, not part of level identity.)
 // ═══════════════════════════════════════════════════════════════════════════
 windowBars = input.int(1200, "Replay window (bars, must exceed 1000)", minval = 1050, group = "Detection")
-var array<int> seenKey = array.new<int>()
-var array<int> seenBar = array.new<int>()
-if Dp.size() > 0
-    for i = 0 to Dp.size() - 1
-        key = int(math.round(Dp.get(i) / syminfo.mintick))
-        found = false
-        if seenKey.size() > 0
-            for j = 0 to seenKey.size() - 1
-                if seenKey.get(j) == key
-                    found := true
-                    break
-        if not found
-            seenKey.push(key), seenBar.push(bar_index)
-
-f_birth(int key) =>
-    bb = -1
-    if seenKey.size() > 0
-        for j = 0 to seenKey.size() - 1
-            if seenKey.get(j) == key
-                bb := seenBar.get(j)
-                break
-    bb
 
 f_whash(int cut) =>
     h = 0
     if Dp.size() > 0
         for i = 0 to Dp.size() - 1
-            key = int(math.round(Dp.get(i) / syminfo.mintick))
-            bb = f_birth(key)
-            if bb >= 0 and bb <= cut
-                h := int(math.abs((h + key * 131 + Ds.get(i) * 17 + Dtf.get(i) * 7) % 99999989))
+            if Dbir.get(i) <= cut
+                h := int(math.abs((h + Dkey.get(i) * 131 + Ds.get(i) * 17 + Dtf.get(i) * 7) % 99999989))
     h
 winCut = last_bar_index - windowBars
 wHash  = f_whash(winCut)
@@ -268,6 +263,19 @@ lStyle  = styleS == "Dashed" ? line.style_dashed : styleS == "Dotted" ? line.sty
 f_col(int tf)  => tf == 3 ? colW : tf == 2 ? colD : colH4
 f_show(int tf) => tf == 3 ? showW : tf == 2 ? showD : showH4
 f_tag(int tf)  => tf == 3 ? "W" : tf == 2 ? "D" : "4H"
+
+// READ-ONLY visual de-dup: hide a level when a HIGHER-timeframe unbroken level
+// sits within tolerance (uses live ATR — affects drawing only, never the DB).
+f_keep(int i) =>
+    keep = true
+    lvl = Dp.get(i)
+    tf  = Dtf.get(i)
+    if Dp.size() > 0
+        for j = 0 to Dp.size() - 1
+            if j != i and not Dbk.get(j) and Dtf.get(j) > tf and math.abs(Dp.get(j) - lvl) <= atrRef * mergeATR
+                keep := false
+                break
+    keep
 
 var array<line>  drawn = array.new<line>()
 var array<label> drawnL = array.new<label>()
@@ -291,7 +299,7 @@ if barstate.islast
         for i = 0 to Dp.size() - 1
             tf = Dtf.get(i)
             rk = Dr.get(i)
-            if f_show(tf) and not Dbk.get(i) and (thr < 0 or rk >= thr)
+            if f_show(tf) and not Dbk.get(i) and f_keep(i) and (thr < 0 or rk >= thr)
                 lvl = Dp.get(i)
                 dy  = lvl * (1.0 - anchorA) + Db.get(i) * anchorA   // visual anchor only
                 col = color.new(f_col(tf), lineTr)
