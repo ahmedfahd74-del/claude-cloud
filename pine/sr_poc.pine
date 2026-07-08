@@ -18,9 +18,10 @@ mergeATR = input.float(0.40, "Merge distance (× TF-ATR)", minval = 0.05, maxval
 brkATR   = input.float(0.30, "Break distance (× TF-ATR)", minval = 0.05, maxval = 2.0, step = 0.05, group = "Detection")
 
 // ─── Display (read-only — must never change the database) ──────────────────
-maxLines = input.int(10, "Max Lines (drawn)", minval = 1, maxval = 40, group = "Display")
+maxLines = input.int(6, "Max lines per timeframe", minval = 1, maxval = 40, group = "Display",
+     tooltip = "Applied PER timeframe: each shown timeframe draws up to this many levels. Enabling another timeframe adds its lines and never removes a level from a different timeframe.")
 linePrio = input.string("Nearest to price", "Line priority", options = ["Nearest to price", "Highest strength"], group = "Display",
-     tooltip = "Which levels fill the Max-Lines budget first. Nearest = the closest levels to current price always show (most tradeable). Strength = the highest-ranked levels regardless of distance.")
+     tooltip = "Which levels fill each timeframe's budget first. Nearest = the closest levels to current price always show (most tradeable). Strength = the highest-ranked levels regardless of distance.")
 showW    = input.bool(true, "Show Weekly", inline = "s", group = "Display")
 showD    = input.bool(true, "Show Daily",  inline = "s", group = "Display")
 showH4   = input.bool(true, "Show 4H",     inline = "s", group = "Display")
@@ -289,14 +290,16 @@ nearMode = linePrio == "Nearest to price"
 f_eligible(int i) => not Dbk.get(i) and f_show(Dtf.get(i)) and f_keep(i)
 f_metric(int i)   => nearMode ? math.abs(close - Dp.get(i)) : Dr.get(i)
 
-// Cutoff metric value at rank n over the eligible set. Nearest → n-th SMALLEST
-// distance to price (closest levels win first); Strength → n-th LARGEST rank.
-// na ⇒ fewer than n eligible levels, so everything eligible is drawn.
-f_cutoff(int n) =>
+// PER-TIMEFRAME budget: the cutoff is computed for ONE timeframe at a time, so
+// each shown timeframe gets its own n-nearest (or n-strongest) allowance.
+// Enabling another timeframe therefore ADDS its lines and never evicts a level
+// from a different timeframe. Nearest → n-th SMALLEST distance to price;
+// Strength → n-th LARGEST rank. na ⇒ fewer than n eligible in that TF, draw all.
+f_cutoffTF(int n, int tf) =>
     tmp = array.new<float>()
     if Dp.size() > 0
         for i = 0 to Dp.size() - 1
-            if f_eligible(i)
+            if f_eligible(i) and Dtf.get(i) == tf
                 tmp.push(f_metric(i))
     cut = float(na)
     if tmp.size() > n and n > 0
@@ -323,14 +326,16 @@ if barstate.islast
         for i = 0 to drawnL.size() - 1
             label.delete(drawnL.get(i))
     drawn.clear(), drawnL.clear()
-    cut = f_cutoff(maxLines)
+    cutW = f_cutoffTF(maxLines, 3)   // one budget per timeframe — independent layers
+    cutD = f_cutoffTF(maxLines, 2)
+    cut4 = f_cutoffTF(maxLines, 1)
     x1 = bar_index - 1
     x2 = bar_index + 1
     if Dp.size() > 0
         for i = 0 to Dp.size() - 1
             tf = Dtf.get(i)
             rk = Dr.get(i)
-            if f_eligible(i) and f_inbudget(i, cut)
+            if f_eligible(i) and f_inbudget(i, tf == 3 ? cutW : tf == 2 ? cutD : cut4)
                 lvl = Dp.get(i)
                 dy  = lvl * (1.0 - anchorA) + Db.get(i) * anchorA   // visual anchor only
                 col = color.new(f_col(tf), lineTr)
