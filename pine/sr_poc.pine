@@ -205,8 +205,8 @@ pl1 = na(plLo) ? plHi : na(plHi) ? plLo : (math.abs(close - plLo) <= math.abs(cl
 //      window the level SET is identical on every resolution ⇒ identical hash.
 //      Order-independent (commutative sum mod a prime). No eyeballing.
 // ═══════════════════════════════════════════════════════════════════════════
-canonDays = input.int(90, "Canonical hash window (days)", minval = 3, maxval = 365, group = "Detection",
-     tooltip = "Cross-TF hash covers levels confirmed in the last N days. Keep N ≤ the calendar history your LOWEST timeframe loads (15m/1h/1D load months → 90 is fine; a 1m chart loads ~1 week → drop to ~5 for 1m parity).")
+canonDays = input.int(30, "Canonical hash window (days)", minval = 3, maxval = 365, group = "Detection",
+     tooltip = "The cross-TF DB HASH covers levels confirmed in the last N days. For the hash to match across timeframes, N must be INSIDE the history every chart loaded — near a chart's history edge one old level can be present on one timeframe but not another, changing the sum. Lower N → more robust low-timeframe parity (1m matching 1D); raise it for wider coverage when comparing higher timeframes only. If two timeframes disagree, lower N until they match.")
 canonCut  = dayOpen - canonDays * 86400000
 f_inWin(int i) => not na(dayOpen) and Dbt.get(i) >= canonCut
 f_hash() =>
