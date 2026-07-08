@@ -31,7 +31,6 @@ colH4    = input.color(#2962ff, "4H",     inline = "c", group = "Display")
 lineWid  = input.int(2, "Line width", minval = 1, maxval = 6, group = "Display")
 lineTr   = input.int(0, "Line transparency", minval = 0, maxval = 90, group = "Display")
 styleS   = input.string("Solid", "Line style", options = ["Solid", "Dashed", "Dotted"], group = "Display")
-anchorS  = input.string("Wick", "Anchor (visual only)", options = ["Wick", "Mid", "Body"], group = "Display")
 showLbl  = input.bool(true, "Labels", group = "Display")
 showPwr  = input.bool(true, "Power Line", group = "Display")
 colPwr   = input.color(#ffffff, "Power Line colour", group = "Display")
@@ -131,7 +130,7 @@ dayOpen = request.security(syminfo.tickerid, "D", time, lookahead = barmerge.loo
 //     visually (read-only), so de-dup never touches the database or the hash.
 // ═══════════════════════════════════════════════════════════════════════════
 var array<float> Dp   = array.new<float>()   // frozen identity price (wick)
-var array<float> Db   = array.new<float>()   // body edge (visual anchor only)
+var array<float> Db   = array.new<float>()   // body edge (frozen; retained for future use — not drawn)
 var array<int>   Ds   = array.new<int>()     // 1 = resistance, 0 = support
 var array<float> Dr   = array.new<float>()   // ranked strength 0-100 (live)
 var array<int>   Dtf  = array.new<int>()     // 3 W · 2 D · 1 4H
@@ -257,7 +256,6 @@ replayPass = not na(rC) and rA == rB and rB == rC
 // ═══════════════════════════════════════════════════════════════════════════
 // 5 · RENDERER — READ-ONLY. Every setting here changes drawing only.
 // ═══════════════════════════════════════════════════════════════════════════
-anchorA = anchorS == "Body" ? 1.0 : anchorS == "Mid" ? 0.5 : 0.0
 lStyle  = styleS == "Dashed" ? line.style_dashed : styleS == "Dotted" ? line.style_dotted : line.style_solid
 f_col(int tf)  => tf == 3 ? colW : tf == 2 ? colD : colH4
 f_show(int tf) => tf == 3 ? showW : tf == 2 ? showD : showH4
@@ -329,12 +327,11 @@ if barstate.islast
             tf = Dtf.get(i)
             rk = Dr.get(i)
             if f_eligible(i) and f_inbudget(i, tf == 3 ? cutW : tf == 2 ? cutD : cut4)
-                lvl = Dp.get(i)
-                dy  = lvl * (1.0 - anchorA) + Db.get(i) * anchorA   // visual anchor only
+                lvl = Dp.get(i)                                     // draw at the wick — the true level
                 col = color.new(f_col(tf), lineTr)
-                drawn.push(line.new(x1, dy, x2, dy, xloc = xloc.bar_index, extend = extend.both, color = col, width = lineWid, style = lStyle))
+                drawn.push(line.new(x1, lvl, x2, lvl, xloc = xloc.bar_index, extend = extend.both, color = col, width = lineWid, style = lStyle))
                 if showLbl
-                    drawnL.push(label.new(x2, dy, f_tag(tf) + " " + (Ds.get(i) == 1 ? "R" : "S") + " " + str.tostring(math.round(rk)), xloc = xloc.bar_index, style = label.style_label_left, color = color.new(f_col(tf), 20), textcolor = color.white, size = size.small))
+                    drawnL.push(label.new(x2, lvl, f_tag(tf) + " " + (Ds.get(i) == 1 ? "R" : "S") + " " + str.tostring(math.round(rk)), xloc = xloc.bar_index, style = label.style_label_left, color = color.new(f_col(tf), 20), textcolor = color.white, size = size.small))
     if not na(pLnLo)
         line.delete(pLnLo)
         pLnLo := na
