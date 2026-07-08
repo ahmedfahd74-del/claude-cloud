@@ -261,11 +261,11 @@ replayPass = not na(rC) and rA == rB and rB == rC
 lStyle  = styleS == "Dashed" ? line.style_dashed : styleS == "Dotted" ? line.style_dotted : line.style_solid
 f_show(int tf) => tf == 3 ? showW : tf == 2 ? showD : showH4
 f_tag(int tf)  => tf == 3 ? "W" : tf == 2 ? "D" : "4H"
-// CURRENT ROLE (not the birth side): a level acts as resistance when it is an
-// unbroken high OR a broken low (price closed below a support → it flips up to
-// resistance); it acts as support when it is an unbroken low OR a broken high.
-// Ds = birth side (1 high, 0 low); Dbk = broken. Role = Ds XOR Dbk.
-f_res(int i)  => (Ds.get(i) == 1) != Dbk.get(i)   // true ⇒ resistance now, false ⇒ support now
+// CURRENT ROLE by PRICE POSITION (not the birth side): every level above the
+// current price acts as resistance (red); every level below acts as support
+// (green). When price crosses a level the role — and colour — flips. Pure
+// function of price + level, so it is identical across chart timeframes.
+f_res(int i)  => Dp.get(i) > close   // above price ⇒ resistance (red); below ⇒ support (green)
 f_rcol(int i) => f_res(i) ? colRes : colSup
 f_rtag(int i) => f_res(i) ? "R" : "S"
 
