@@ -1,0 +1,287 @@
+// © Institutional Event Database — Deterministic MTF Proof of Concept (Phase 2)
+//
+// PROOF OF CONCEPT. Same architecture proven in the S/R POC: detect events
+// INSIDE request.security() on each timeframe's own bars → freeze each event as
+// an immutable record → append-only union across timeframes → order-independent
+// hash → replay/freeze test (A=B=C) → read-only renderer + debug panel.
+//
+// Phase 2 · Step 1 — the FIRST institutional event: the LIQUIDITY SWEEP.
+// (BOS / CHoCH / FVG / Order Block / mitigation / retest / reaction follow, each
+//  a frozen event added on top of this same spine.)
+//
+// A sweep = price takes liquidity beyond a prior swing then rejects back inside:
+//   · bearish sweep — a bar's HIGH exceeds a prior swing high but CLOSE is back
+//     below it (buy-stops above grabbed, rejection down)
+//   · bullish sweep — a bar's LOW breaks a prior swing low but CLOSE is back
+//     above it (sell-stops below grabbed, rejection up)
+// Lifecycle (all computed in-security, chart-independent): mitigated when price
+// revisits the swept level; invalidated when the sweep's own wick extreme is
+// reclaimed on a close.
+
+//@version=6
+indicator("IA-Event · Institutional Event DB POC", "IA-Event POC", overlay = true,
+     max_lines_count = 200, max_labels_count = 200, max_boxes_count = 200, max_bars_back = 5000)
+
+// ─── Detection constants — FROZEN, NOT user inputs (the database is objective) ─
+pivLen  = 5      // swing strength (bars each side)
+MAXSW   = 200    // per-TF swing registry cap
+MAXEV   = 400    // per-TF event cap (effectively append-only within the window)
+
+// ─── Display (read-only — must never change the database) ──────────────────
+maxEv      = input.int(8, "Max events per timeframe", minval = 1, maxval = 40, group = "Display",
+     tooltip = "Per timeframe: draw up to this many events, nearest to price first. Never moves an event; only changes how many show.")
+showActive = input.bool(true, "Only active (hide invalidated)", group = "Display")
+hideMit    = input.bool(false, "Hide mitigated", group = "Display")
+showW      = input.bool(true, "Show Weekly", inline = "s", group = "Display")
+showD      = input.bool(true, "Show Daily",  inline = "s", group = "Display")
+showH4     = input.bool(true, "Show 4H",     inline = "s", group = "Display")
+colBull    = input.color(#26a69a, "Bullish sweep (liquidity below)", group = "Display")
+colBear    = input.color(#ef5350, "Bearish sweep (liquidity above)", group = "Display")
+colMit     = input.color(#787b86, "Mitigated (dimmed)", group = "Display")
+lineWid    = input.int(2, "Line width", minval = 1, maxval = 6, group = "Display")
+styleS     = input.string("Dashed", "Line style", options = ["Solid", "Dashed", "Dotted"], group = "Display")
+showLbl    = input.bool(true, "Labels", group = "Display")
+
+// ─── Validation (proof instruments — affect only the debug panel) ──────────
+canonDays  = input.int(30, "Canonical hash window (days)", minval = 3, maxval = 365, group = "Validation",
+     tooltip = "The cross-TF sweep hash covers events confirmed in the last N days — keep it inside the history every timeframe loads so the hash matches across resolutions.")
+windowBars = input.int(1200, "Replay window (bars, must exceed 1000)", minval = 1050, group = "Validation")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 1 · PER-TIMEFRAME SWEEP BOOK — runs INSIDE request.security on its own TF.
+//     Swing registry + sweep detection + lifecycle all on that TF's own bars,
+//     so the returned event book is identical regardless of chart timeframe.
+// ═══════════════════════════════════════════════════════════════════════════
+f_sweeps() =>
+    var array<float> shP = array.new<float>()   // swing-high prices (liquidity above)
+    var array<bool>  shX = array.new<bool>()    // swept?
+    var array<float> slP = array.new<float>()   // swing-low prices (liquidity below)
+    var array<bool>  slX = array.new<bool>()
+    var array<float> eL  = array.new<float>()   // swept level price (identity)
+    var array<int>   eD  = array.new<int>()     // 1 bearish (swept high), 0 bullish (swept low)
+    var array<int>   eT  = array.new<int>()     // birth time (HTF bar time — chart-independent)
+    var array<float> eX  = array.new<float>()   // sweep wick extreme
+    var array<bool>  eM  = array.new<bool>()    // mitigated (level revisited)
+    var array<bool>  eV  = array.new<bool>()    // invalidated (extreme reclaimed)
+
+    // 1a · lifecycle FIRST — so an event never mitigates on its own birth bar
+    if eL.size() > 0
+        for i = 0 to eL.size() - 1
+            if not eV.get(i)
+                bear = eD.get(i) == 1
+                lvl  = eL.get(i)
+                ext  = eX.get(i)
+                if (bear and high >= lvl) or (not bear and low <= lvl)
+                    eM.set(i, true)                       // swept level revisited
+                if (bear and close > ext) or (not bear and close < ext)
+                    eV.set(i, true)                       // wick extreme reclaimed → invalid
+
+    // 1b · register newly-confirmed swings
+    ph = ta.pivothigh(pivLen, pivLen)
+    pl = ta.pivotlow(pivLen, pivLen)
+    if not na(ph)
+        shP.push(ph), shX.push(false)
+    if not na(pl)
+        slP.push(pl), slX.push(false)
+
+    // 1c · detect sweeps against unswept swings on THIS bar
+    if shP.size() > 0
+        for i = 0 to shP.size() - 1
+            if not shX.get(i) and high > shP.get(i) and close < shP.get(i)
+                shX.set(i, true)
+                eL.push(shP.get(i)), eD.push(1), eT.push(time), eX.push(high), eM.push(false), eV.push(false)
+    if slP.size() > 0
+        for i = 0 to slP.size() - 1
+            if not slX.get(i) and low < slP.get(i) and close > slP.get(i)
+                slX.set(i, true)
+                eL.push(slP.get(i)), eD.push(0), eT.push(time), eX.push(low), eM.push(false), eV.push(false)
+
+    // 1d · bound memory (swept swings and old invalidated events age out first)
+    if shP.size() > MAXSW
+        shP.remove(0), shX.remove(0)
+    if slP.size() > MAXSW
+        slP.remove(0), slX.remove(0)
+    if eL.size() > MAXEV
+        eL.remove(0), eD.remove(0), eT.remove(0), eX.remove(0), eM.remove(0), eV.remove(0)
+
+    [eL, eD, eT, eX, eM, eV]
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 2 · FETCH FROZEN SWEEP BOOKS (one security call per TF) + chart-indep. anchors
+// ═══════════════════════════════════════════════════════════════════════════
+[wL,  wD,  wT,  wX,  wM,  wV]  = request.security(syminfo.tickerid, "W",   f_sweeps(), lookahead = barmerge.lookahead_off)
+[dL,  dD,  dT,  dX,  dM,  dV]  = request.security(syminfo.tickerid, "D",   f_sweeps(), lookahead = barmerge.lookahead_off)
+[h4L, h4D, h4T, h4X, h4M, h4V] = request.security(syminfo.tickerid, "240", f_sweeps(), lookahead = barmerge.lookahead_off)
+atrD   = request.security(syminfo.tickerid, "D", ta.atr(14), lookahead = barmerge.lookahead_off)
+atrRef = na(atrD) or atrD <= 0 ? close * 0.005 : atrD
+dayOpen = request.security(syminfo.tickerid, "D", time, lookahead = barmerge.lookahead_off)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 3 · ONE PERSISTENT EVENT DATABASE — APPEND-ONLY UNION, WRITE-ONCE IDENTITY.
+//     Identity = (swept-level tick, direction, timeframe). An event enters once
+//     and never leaves; later bars only refresh live flags (mitigated / invalid).
+//     Nothing is dropped, so membership is order-independent → same hash on every
+//     chart timeframe, and immutable per fixed cut over time (freeze test).
+// ═══════════════════════════════════════════════════════════════════════════
+var array<float> EL   = array.new<float>()   // frozen swept-level price
+var array<int>   ED   = array.new<int>()     // 1 bearish · 0 bullish
+var array<int>   ETf  = array.new<int>()     // 3 W · 2 D · 1 4H
+var array<int>   EBt  = array.new<int>()     // frozen confirmation time
+var array<float> EX   = array.new<float>()   // frozen wick extreme
+var array<bool>  EM   = array.new<bool>()    // mitigated (live)
+var array<bool>  EV   = array.new<bool>()    // invalidated (live)
+var array<int>   EKey = array.new<int>()     // frozen identity key (price ticks)
+var array<int>   EBir = array.new<int>()     // frozen birth bar_index
+var map<int, int> Eidx = map.new<int, int>() // combined-key → array index (O(1) lookup)
+
+f_ingest(bool use, array<float> l, array<int> d, array<int> t, array<float> x, array<bool> m, array<bool> v, int tf) =>
+    if use and not na(l) and l.size() > 0
+        for i = 0 to l.size() - 1
+            px  = l.get(i)
+            key = int(math.round(px / syminfo.mintick))
+            ck  = key * 32 + d.get(i) * 4 + tf     // dir ∈ {0,1}, tf ∈ {1,2,3}; *4 & *32 keep buckets disjoint
+            if Eidx.contains(ck)
+                idx = Eidx.get(ck)
+                EM.set(idx, m.get(i)), EV.set(idx, v.get(i))   // refresh live flags only
+            else
+                EL.push(px), ED.push(d.get(i)), ETf.push(tf), EBt.push(t.get(i)), EX.push(x.get(i))
+                EM.push(m.get(i)), EV.push(v.get(i)), EKey.push(key)
+                Eidx.put(ck, EL.size() - 1)
+                EBir.push(bar_index)
+
+f_ingest(true, wL,  wD,  wT,  wX,  wM,  wV,  3)
+f_ingest(true, dL,  dD,  dT,  dX,  dM,  dV,  2)
+f_ingest(true, h4L, h4D, h4T, h4X, h4M, h4V, 1)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 4 · SWEEP DB HASH (canonical window) + counts for the debug panel
+// ═══════════════════════════════════════════════════════════════════════════
+canonCut = dayOpen - canonDays * 86400000
+f_inWin(int i) => not na(dayOpen) and EBt.get(i) >= canonCut
+f_hash() =>
+    h = 0
+    if EL.size() > 0
+        for i = 0 to EL.size() - 1
+            if not EV.get(i) and f_inWin(i)
+                tickP = int(math.round(EL.get(i) / syminfo.mintick))
+                lh = tickP * 131 + ED.get(i) * 17 + ETf.get(i) * 7
+                h := int(math.abs((h + lh) % 99999989))
+    h
+dbHash = f_hash()
+
+// counts (active = not invalidated)
+cActive = 0
+cBull = 0
+cBear = 0
+cMit = 0
+cUnmit = 0
+if EL.size() > 0
+    for i = 0 to EL.size() - 1
+        if not EV.get(i)
+            cActive += 1
+            if ED.get(i) == 1
+                cBear += 1
+            else
+                cBull += 1
+            if EM.get(i)
+                cMit += 1
+            else
+                cUnmit += 1
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 4b · REPLAY / FREEZE-INTEGRITY TEST — hashes only events whose write-once birth
+//      bar ≤ last_bar − windowBars. Append-only + frozen identity ⇒ that window is
+//      immutable, so the hash now / 500 / 1000 bars ago must match: A = B = C.
+// ═══════════════════════════════════════════════════════════════════════════
+f_whash(int cut) =>
+    h = 0
+    if EL.size() > 0
+        for i = 0 to EL.size() - 1
+            if EBir.get(i) <= cut
+                h := int(math.abs((h + EKey.get(i) * 131 + ED.get(i) * 17 + ETf.get(i) * 7) % 99999989))
+    h
+winCut = last_bar_index - windowBars
+wHash  = f_whash(winCut)
+rA = wHash
+rB = wHash[500]
+rC = wHash[1000]
+replayPass = not na(rC) and rA == rB and rB == rC
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 5 · RENDERER — READ-ONLY. Draws each active sweep at its swept level.
+// ═══════════════════════════════════════════════════════════════════════════
+lStyle  = styleS == "Solid" ? line.style_solid : styleS == "Dotted" ? line.style_dotted : line.style_dashed
+f_show(int tf) => tf == 3 ? showW : tf == 2 ? showD : showH4
+f_tag(int tf)  => tf == 3 ? "W" : tf == 2 ? "D" : "4H"
+f_ecol(int i)  => EM.get(i) ? colMit : (ED.get(i) == 1 ? colBear : colBull)
+
+// eligible = shown TF, and passes the active / mitigated display filters
+f_eligible(int i) =>
+    ok = f_show(ETf.get(i))
+    if showActive and EV.get(i)
+        ok := false
+    if hideMit and EM.get(i)
+        ok := false
+    ok
+
+// per-timeframe nearest-to-price budget (never moves an event; only limits count)
+f_cutoffTF(int n, int tf) =>
+    tmp = array.new<float>()
+    if EL.size() > 0
+        for i = 0 to EL.size() - 1
+            if f_eligible(i) and ETf.get(i) == tf
+                tmp.push(math.abs(close - EL.get(i)))
+    cut = float(na)
+    if tmp.size() > n and n > 0
+        tmp.sort(order.ascending)
+        cut := tmp.get(n - 1)
+    cut
+f_inbudget(int i, float cut) => na(cut) or math.abs(close - EL.get(i)) <= cut
+
+var array<line>  drawn  = array.new<line>()
+var array<label> drawnL = array.new<label>()
+
+if barstate.islast
+    if drawn.size() > 0
+        for i = 0 to drawn.size() - 1
+            line.delete(drawn.get(i))
+    if drawnL.size() > 0
+        for i = 0 to drawnL.size() - 1
+            label.delete(drawnL.get(i))
+    drawn.clear(), drawnL.clear()
+    cutW = f_cutoffTF(maxEv, 3)
+    cutD = f_cutoffTF(maxEv, 2)
+    cut4 = f_cutoffTF(maxEv, 1)
+    x2 = bar_index + 1
+    if EL.size() > 0
+        for i = 0 to EL.size() - 1
+            tf = ETf.get(i)
+            if f_eligible(i) and f_inbudget(i, tf == 3 ? cutW : tf == 2 ? cutD : cut4)
+                lvl = EL.get(i)
+                col = f_ecol(i)
+                x1 = math.max(bar_index - 300, 0)
+                drawn.push(line.new(x1, lvl, x2, lvl, xloc = xloc.bar_index, extend = extend.right, color = col, width = lineWid, style = lStyle))
+                if showLbl
+                    arrow = ED.get(i) == 1 ? "▼" : "▲"
+                    mtag  = EM.get(i) ? " ·mit" : ""
+                    drawnL.push(label.new(x2, lvl, f_tag(tf) + " SWEEP " + arrow + mtag, xloc = xloc.bar_index, style = label.style_label_left, color = col, textcolor = color.white, size = size.small))
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 6 · DEBUG PANEL — sweep DB hash + lifecycle counts + freeze test
+// ═══════════════════════════════════════════════════════════════════════════
+var table hud = table.new(position.top_right, 2, 7, bgcolor = color.new(#0a1a3a, 10), border_width = 1, border_color = color.new(color.gray, 60))
+if barstate.islast
+    table.cell(hud, 0, 0, "SWEEP HASH", text_color = color.white, text_size = size.normal)
+    table.cell(hud, 1, 0, str.tostring(dbHash), text_color = #00e676, text_size = size.normal)
+    table.cell(hud, 0, 1, "Active", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 1, str.tostring(cActive), text_color = color.silver, text_size = size.small)
+    table.cell(hud, 0, 2, "Bull / Bear", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 2, str.tostring(cBull) + " / " + str.tostring(cBear), text_color = color.silver, text_size = size.small)
+    table.cell(hud, 0, 3, "Mit / Unmit", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 3, str.tostring(cMit) + " / " + str.tostring(cUnmit), text_color = color.silver, text_size = size.small)
+    table.cell(hud, 0, 4, "Total events", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 4, str.tostring(EL.size()), text_color = color.silver, text_size = size.small)
+    table.cell(hud, 0, 5, "Replay A/B/C", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 5, str.tostring(rA) + "/" + (na(rB) ? "—" : str.tostring(rB)) + "/" + (na(rC) ? "—" : str.tostring(rC)), text_color = color.silver, text_size = size.small)
+    table.cell(hud, 0, 6, "Freeze test", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 6, na(rC) ? "need 1000+ bars" : replayPass ? "PASS ✓" : "FAIL ✗", text_color = na(rC) ? color.gray : replayPass ? #00e676 : #ff1744, text_size = size.normal)
