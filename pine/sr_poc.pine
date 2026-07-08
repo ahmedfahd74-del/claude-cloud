@@ -149,9 +149,9 @@ f_ingest(bool use, array<float> p, array<float> b, array<int> s, array<float> t,
                 Dr.set(idx, rk), Dbk.set(idx, k.get(i))     // refresh live fields only
             else
                 Dp.push(px), Db.push(b.get(i)), Ds.push(s.get(i)), Dr.push(rk)
-                Dtf.push(tf), Dbk.push(k.get(i))
-                Dkey.push(key), Dbir.push(bar_index)         // write-once identity + birth bar
-                Didx.put(ck, Dp.size() - 1)                  // index the new level for O(1) reuse
+                Dtf.push(tf), Dbk.push(k.get(i)), Dkey.push(key)
+                Didx.put(ck, Dp.size() - 1)                  // index new level (returns prev value)
+                Dbir.push(bar_index)                         // void tail → both if/else branches void
 
 f_ingest(true, wP,  wB,  wS,  wT,  wK,  1.00, 3)
 f_ingest(true, dP,  dB,  dS,  dT,  dK,  0.80, 2)
