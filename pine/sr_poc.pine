@@ -47,6 +47,7 @@ f_book() =>
     var array<int>   s = array.new<int>()     // 1 = resistance, 0 = support
     var array<float> t = array.new<float>()   // touch evidence
     var array<bool>  k = array.new<bool>()     // broken
+    var array<int>   bt = array.new<int>()     // confirmation time (HTF bar time — chart-independent)
     a  = ta.atr(14)
     md = a * mergeATR
     bf = a * brkATR
@@ -64,7 +65,7 @@ f_book() =>
                     hit := true
                     break
         if not hit
-            p.push(ph), b.push(bodyHi), s.push(1), t.push(1.0), k.push(false)
+            p.push(ph), b.push(bodyHi), s.push(1), t.push(1.0), k.push(false), bt.push(time[pivLen])
     // new support
     if not na(pl)
         hit = false
@@ -75,7 +76,7 @@ f_book() =>
                     hit := true
                     break
         if not hit
-            p.push(pl), b.push(bodyLo), s.push(0), t.push(1.0), k.push(false)
+            p.push(pl), b.push(bodyLo), s.push(0), t.push(1.0), k.push(false), bt.push(time[pivLen])
     // touches + breaks on THIS timeframe's closes (chart-independent)
     if p.size() > 0
         for i = 0 to p.size() - 1
@@ -95,17 +96,20 @@ f_book() =>
             if sc < wv
                 wv := sc
                 w := i
-        p.remove(w), b.remove(w), s.remove(w), t.remove(w), k.remove(w)
-    [p, b, s, t, k]
+        p.remove(w), b.remove(w), s.remove(w), t.remove(w), k.remove(w), bt.remove(w)
+    [p, b, s, t, k, bt]
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 2 · FETCH FROZEN BOOKS (one security call per TF) + chart-independent ATR
 // ═══════════════════════════════════════════════════════════════════════════
-[wP,  wB,  wS,  wT,  wK]  = request.security(syminfo.tickerid, "W",   f_book(), lookahead = barmerge.lookahead_off)
-[dP,  dB,  dS,  dT,  dK]  = request.security(syminfo.tickerid, "D",   f_book(), lookahead = barmerge.lookahead_off)
-[h4P, h4B, h4S, h4T, h4K] = request.security(syminfo.tickerid, "240", f_book(), lookahead = barmerge.lookahead_off)
+[wP,  wB,  wS,  wT,  wK,  wBT]  = request.security(syminfo.tickerid, "W",   f_book(), lookahead = barmerge.lookahead_off)
+[dP,  dB,  dS,  dT,  dK,  dBT]  = request.security(syminfo.tickerid, "D",   f_book(), lookahead = barmerge.lookahead_off)
+[h4P, h4B, h4S, h4T, h4K, h4BT] = request.security(syminfo.tickerid, "240", f_book(), lookahead = barmerge.lookahead_off)
 atrD = request.security(syminfo.tickerid, "D", ta.atr(14), lookahead = barmerge.lookahead_off)
 atrRef = na(atrD) or atrD <= 0 ? close * 0.005 : atrD
+// Chart-INDEPENDENT "today 00:00" anchor: the current daily bar's open time is
+// the same timestamp on every chart resolution — the base for the canonical window.
+dayOpen = request.security(syminfo.tickerid, "D", time, lookahead = barmerge.lookahead_off)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 3 · ONE PERSISTENT DATABASE — APPEND-ONLY UNION, WRITE-ONCE IDENTITY.
@@ -130,14 +134,15 @@ var array<float> Dr   = array.new<float>()   // ranked strength 0-100 (live)
 var array<int>   Dtf  = array.new<int>()     // 3 W · 2 D · 1 4H
 var array<bool>  Dbk  = array.new<bool>()    // broken/invalidated (live flag)
 var array<int>   Dkey = array.new<int>()     // frozen identity key (price in ticks)
-var array<int>   Dbir = array.new<int>()     // frozen birth bar_index
+var array<int>   Dbir = array.new<int>()     // frozen birth bar_index (per-chart — freeze window)
+var array<int>   Dbt  = array.new<int>()     // frozen confirmation TIME (chart-independent — canon window)
 var map<int, int> Didx = map.new<int, int>() // combined-key → array index (O(1) identity lookup)
 
 f_norm(float v) => v / (v + 3.0)
 
 // Identity is (price-tick, timeframe). ck packs both collision-free: tf ∈ {1,2,3}
 // < 4 and the price-tick key is ≥ 0, so key*4 never overlaps an adjacent bucket.
-f_ingest(bool use, array<float> p, array<float> b, array<int> s, array<float> t, array<bool> k, float w, int tf) =>
+f_ingest(bool use, array<float> p, array<float> b, array<int> s, array<float> t, array<bool> k, array<int> bt, float w, int tf) =>
     if use and not na(p) and p.size() > 0
         for i = 0 to p.size() - 1
             px  = p.get(i)
@@ -151,11 +156,11 @@ f_ingest(bool use, array<float> p, array<float> b, array<int> s, array<float> t,
                 Dp.push(px), Db.push(b.get(i)), Ds.push(s.get(i)), Dr.push(rk)
                 Dtf.push(tf), Dbk.push(k.get(i)), Dkey.push(key)
                 Didx.put(ck, Dp.size() - 1)                  // index new level (returns prev value)
-                Dbir.push(bar_index)                         // void tail → both if/else branches void
+                Dbir.push(bar_index), Dbt.push(bt.get(i))    // void tail → both if/else branches void
 
-f_ingest(true, wP,  wB,  wS,  wT,  wK,  1.00, 3)
-f_ingest(true, dP,  dB,  dS,  dT,  dK,  0.80, 2)
-f_ingest(true, h4P, h4B, h4S, h4T, h4K, 0.60, 1)
+f_ingest(true, wP,  wB,  wS,  wT,  wK,  wBT,  1.00, 3)
+f_ingest(true, dP,  dB,  dS,  dT,  dK,  dBT,  0.80, 2)
+f_ingest(true, h4P, h4B, h4S, h4T, h4K, h4BT, 0.60, 1)
 
 // Nth-highest strength for the Max-Lines display filter (read-only).
 f_thresh(int n) =>
@@ -208,22 +213,38 @@ else if close > plHi + pwrBuf
 pl1 = na(plLo) ? plHi : na(plHi) ? plLo : (math.abs(close - plLo) <= math.abs(close - plHi) ? plLo : plHi)
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 4b · DATABASE HASH — objective determinism proof (order-independent).
-//      A pure function of the frozen database contents (tick-rounded price +
-//      side + timeframe per level, summed mod a prime — commutative, so it is
-//      independent of insertion order). If this value is IDENTICAL on every
-//      chart timeframe, the database is provably identical. No eyeballing.
+// 4b · CANONICAL DATABASE HASH — resolution-independent cross-TF proof.
+//      A chart's resolution limits how much HTF history request.security loads,
+//      so a 1D chart legitimately knows older levels a 15m chart cannot even
+//      load. To make the hash comparable across ALL resolutions, it covers only
+//      the CANONICAL window: levels confirmed within the last `canonDays`
+//      calendar days. BOTH the cutoff (from the daily-security "today" anchor)
+//      and each level's confirmation time are chart-independent, so within the
+//      window the level SET is identical on every resolution ⇒ identical hash.
+//      Order-independent (commutative sum mod a prime). No eyeballing.
 // ═══════════════════════════════════════════════════════════════════════════
+canonDays = input.int(90, "Canonical hash window (days)", minval = 3, maxval = 365, group = "Detection",
+     tooltip = "Cross-TF hash covers levels confirmed in the last N days. Keep N ≤ the calendar history your LOWEST timeframe loads (15m/1h/1D load months → 90 is fine; a 1m chart loads ~1 week → drop to ~5 for 1m parity).")
+canonCut  = dayOpen - canonDays * 86400000
+f_inWin(int i) => not na(dayOpen) and Dbt.get(i) >= canonCut
 f_hash() =>
     h = 0
     if Dp.size() > 0
         for i = 0 to Dp.size() - 1
-            if not Dbk.get(i)
+            if not Dbk.get(i) and f_inWin(i)
                 tickP = int(math.round(Dp.get(i) / syminfo.mintick))
                 lh = tickP * 131 + Ds.get(i) * 17 + Dtf.get(i) * 7
                 h := int(math.abs((h + lh) % 99999989))
     h
-dbHash = f_hash()
+f_wincount() =>
+    c = 0
+    if Dp.size() > 0
+        for i = 0 to Dp.size() - 1
+            if not Dbk.get(i) and f_inWin(i)
+                c += 1
+    c
+dbHash    = f_hash()
+winLevels = f_wincount()
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 4c · REPLAY / FREEZE-INTEGRITY TEST — the "solid enough to build on" proof.
@@ -323,15 +344,17 @@ if barstate.islast
         pLbHi := label.new(x2, plHi, "⚡ " + (p1 ? "PL1" : "PL2") + " " + str.tostring(plHi, format.mintick) + " · R", xloc = xloc.bar_index, style = label.style_label_left, color = colPwr, textcolor = color.black, size = size.normal)
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 6 · HASH READOUT — the validation instrument. Compare this value across
-//     1M / 5M / 15M / 1H / 4H / 1D: identical hash ⇒ identical database.
+// 6 · HASH READOUT — the validation instrument. Compare DB HASH across
+//     1M / 5M / 15M / 1H / 4H / 1D: identical hash ⇒ identical canonical DB.
+//     "Levels win/all" — the WINDOW count matches across TFs; the TOTAL may
+//     differ because higher-TF charts load more HTF history (expected, benign).
 // ═══════════════════════════════════════════════════════════════════════════
 var table hud = table.new(position.top_right, 2, 5, bgcolor = color.new(#0a1a3a, 10), border_width = 1, border_color = color.new(color.gray, 60))
 if barstate.islast
     table.cell(hud, 0, 0, "DB HASH", text_color = color.white, text_size = size.normal)
     table.cell(hud, 1, 0, str.tostring(dbHash), text_color = #00e676, text_size = size.normal)
-    table.cell(hud, 0, 1, "Levels", text_color = color.gray, text_size = size.small)
-    table.cell(hud, 1, 1, str.tostring(Dp.size()), text_color = color.silver, text_size = size.small)
+    table.cell(hud, 0, 1, "Levels win/all", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 1, str.tostring(winLevels) + " / " + str.tostring(Dp.size()), text_color = color.silver, text_size = size.small)
     table.cell(hud, 0, 2, "PL1 / PL2", text_color = color.gray, text_size = size.small)
     table.cell(hud, 1, 2, (na(plLo) ? "—" : str.tostring(plLo, format.mintick)) + " / " + (na(plHi) ? "—" : str.tostring(plHi, format.mintick)), text_color = color.white, text_size = size.small)
     table.cell(hud, 0, 3, "Replay A/B/C", text_color = color.gray, text_size = size.small)
