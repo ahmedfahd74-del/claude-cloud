@@ -350,21 +350,23 @@ if barstate.islast
                 lvl = EL.get(i)
                 col = f_ecol(i)
                 kd  = EKd.get(i)
-                x1  = math.max(bar_index - 300, 0)
+                bt  = EBt.get(i)                                        // formation TIME (left anchor)
+                // Everything is anchored at the bar it FORMED and drawn to the
+                // current bar. Only Order Blocks project further right (extended
+                // through), since an OB is a forward zone price returns to.
+                ext = kd == 4 ? extend.right : extend.none
                 if kd == 3 or kd == 4
-                    // ZONE (FVG / OB) — box anchored at the TIME it formed (EBt),
-                    // extending right through price. Time coords avoid the bar-index
-                    // distance limit and stay chart-independent. near→far edge.
+                    // ZONE (FVG / OB) — box from near edge to far edge
                     top = math.max(lvl, EL2.get(i))
                     bot = math.min(lvl, EL2.get(i))
-                    drawnBx.push(box.new(EBt.get(i), top, time, bot, xloc = xloc.bar_time, extend = extend.right, border_color = col, border_width = 1, bgcolor = color.new(col, fvgFill)))
+                    drawnBx.push(box.new(bt, top, time, bot, xloc = xloc.bar_time, extend = ext, border_color = col, border_width = 1, bgcolor = color.new(col, fvgFill)))
                     if showLbl
                         ztxt = kd == 4 ? "OB" : "FVG"
                         drawnL.push(label.new(x2, top, f_tag(tf) + " " + ztxt + " " + (ED.get(i) == 1 ? "▲" : "▼") + (EM.get(i) ? " ·mit" : ""), xloc = xloc.bar_index, style = label.style_label_left, color = col, textcolor = color.white, size = size.small))
                 else
                     sty = kd == 0 ? line.style_dashed : line.style_solid   // sweep dashed; BOS/CHoCH solid
                     wid = kd == 2 ? lineWid + 1 : lineWid                  // CHoCH heavier (trend change)
-                    drawn.push(line.new(x1, lvl, x2, lvl, xloc = xloc.bar_index, extend = extend.right, color = col, width = wid, style = sty))
+                    drawn.push(line.new(bt, lvl, time, lvl, xloc = xloc.bar_time, extend = ext, color = col, width = wid, style = sty))
                     if showLbl
                         arrow = ED.get(i) == 1 ? "▲" : "▼"
                         ktxt  = kd == 2 ? "CHoCH" : kd == 1 ? "BOS" : "SWEEP"
