@@ -307,12 +307,14 @@ f_eligible(int i) =>
         ok := false
     ok
 
-// per-timeframe nearest-to-price budget (never moves an event; only limits count)
-f_cutoffTF(int n, int tf) =>
+// PER (timeframe × kind) nearest-to-price budget: each kind on each timeframe
+// gets its own n-nearest allowance, so enabling a kind ADDS its events and never
+// displaces another kind's. Never moves an event; only limits count.
+f_cutoff(int n, int tf, int kd) =>
     tmp = array.new<float>()
     if EL.size() > 0
         for i = 0 to EL.size() - 1
-            if f_eligible(i) and ETf.get(i) == tf
+            if f_eligible(i) and ETf.get(i) == tf and EKd.get(i) == kd
                 tmp.push(math.abs(close - EL.get(i)))
     cut = float(na)
     if tmp.size() > n and n > 0
@@ -336,14 +338,15 @@ if barstate.islast
         for i = 0 to drawnBx.size() - 1
             box.delete(drawnBx.get(i))
     drawn.clear(), drawnL.clear(), drawnBx.clear()
-    cutW = f_cutoffTF(maxEv, 3)
-    cutD = f_cutoffTF(maxEv, 2)
-    cut4 = f_cutoffTF(maxEv, 1)
+    cuts = array.new<float>(40, na)                  // one cutoff per (tf,kind): index tf*8+kd
+    for tf = 1 to 3
+        for kd = 0 to 4
+            cuts.set(tf * 8 + kd, f_cutoff(maxEv, tf, kd))
     x2 = bar_index + 1
     if EL.size() > 0
         for i = 0 to EL.size() - 1
             tf = ETf.get(i)
-            if f_eligible(i) and f_inbudget(i, tf == 3 ? cutW : tf == 2 ? cutD : cut4)
+            if f_eligible(i) and f_inbudget(i, cuts.get(tf * 8 + EKd.get(i)))
                 lvl = EL.get(i)
                 col = f_ecol(i)
                 kd  = EKd.get(i)
