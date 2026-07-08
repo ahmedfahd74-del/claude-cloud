@@ -12,10 +12,13 @@
 indicator("IA-SR · MTF Determinism POC", "IA-SR POC", overlay = true,
      max_lines_count = 200, max_labels_count = 200, max_boxes_count = 200, max_bars_back = 5000)
 
-// ─── Detection (pre-freeze) ───────────────────────────────────────────────
-pivLen   = input.int(5, "Swing strength (bars each side)", minval = 2, maxval = 30, group = "Detection")
-mergeATR = input.float(0.40, "Merge distance (× TF-ATR)", minval = 0.05, maxval = 2.0, step = 0.05, group = "Detection")
-brkATR   = input.float(0.30, "Break distance (× TF-ATR)", minval = 0.05, maxval = 2.0, step = 0.05, group = "Detection")
+// ─── Detection constants — FROZEN, NOT user inputs ─────────────────────────
+// These define HOW swings become levels (the database itself). They are hard
+// constants on purpose: the level database is objective, so NO setting can ever
+// reshape it or move a line. Only "Max lines per timeframe" changes what shows.
+pivLen   = 5      // swing strength (bars each side)
+mergeATR = 0.40   // merge distance (× TF-ATR)
+brkATR   = 0.30   // break distance (× TF-ATR)
 
 // ─── Display (read-only — must never change the database) ──────────────────
 maxLines = input.int(6, "Max lines per timeframe", minval = 1, maxval = 40, group = "Display",
@@ -207,7 +210,7 @@ pl1 = na(plLo) ? plHi : na(plHi) ? plLo : (math.abs(close - plLo) <= math.abs(cl
 //      window the level SET is identical on every resolution ⇒ identical hash.
 //      Order-independent (commutative sum mod a prime). No eyeballing.
 // ═══════════════════════════════════════════════════════════════════════════
-canonDays = input.int(30, "Canonical hash window (days)", minval = 3, maxval = 365, group = "Detection",
+canonDays = input.int(30, "Canonical hash window (days)", minval = 3, maxval = 365, group = "Validation",
      tooltip = "The cross-TF DB HASH covers levels confirmed in the last N days. For the hash to match across timeframes, N must be INSIDE the history every chart loaded — near a chart's history edge one old level can be present on one timeframe but not another, changing the sum. Lower N → more robust low-timeframe parity (1m matching 1D); raise it for wider coverage when comparing higher timeframes only. If two timeframes disagree, lower N until they match.")
 canonCut  = dayOpen - canonDays * 86400000
 f_inWin(int i) => not na(dayOpen) and Dbt.get(i) >= canonCut
@@ -239,7 +242,7 @@ winLevels = f_wincount()
 //      A = B = C ⇒ freeze integrity holds. (Broken flag is deliberately NOT in
 //      the hash — invalidation is a live overlay, not part of level identity.)
 // ═══════════════════════════════════════════════════════════════════════════
-windowBars = input.int(1200, "Replay window (bars, must exceed 1000)", minval = 1050, group = "Detection")
+windowBars = input.int(1200, "Replay window (bars, must exceed 1000)", minval = 1050, group = "Validation")
 
 f_whash(int cut) =>
     h = 0
