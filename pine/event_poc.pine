@@ -30,8 +30,9 @@ MAXEV   = 150    // per-TF event cap (bounds in-security memory; the union retai
 // ─── Display (read-only — must never change the database) ──────────────────
 maxEv      = input.int(8, "Max events per timeframe", minval = 1, maxval = 40, group = "Display",
      tooltip = "Per timeframe: draw up to this many events, nearest to price first. Never moves an event; only changes how many show.")
-showSweep  = input.bool(true, "Show sweeps", inline = "k", group = "Display")
-showBOS    = input.bool(true, "Show BOS",    inline = "k", group = "Display")
+showSweep  = input.bool(true, "Sweeps", inline = "k", group = "Display")
+showBOS    = input.bool(true, "BOS",    inline = "k", group = "Display")
+showChoch  = input.bool(true, "CHoCH",  inline = "k", group = "Display")
 showActive = input.bool(true, "Only active (hide invalidated)", group = "Display")
 hideMit    = input.bool(false, "Hide mitigated", group = "Display")
 showW      = input.bool(true, "Show Weekly", inline = "s", group = "Display")
@@ -67,6 +68,7 @@ f_events() =>
     var array<float> eX  = array.new<float>()   // extreme (invalidation reference)
     var array<bool>  eM  = array.new<bool>()    // mitigated (level revisited)
     var array<bool>  eV  = array.new<bool>()    // invalidated (extreme reclaimed)
+    var int trend = -1                          // structure trend: 1 bull · 0 bear · -1 unset
 
     // 1a · lifecycle FIRST — so an event never mitigates on its own birth bar
     if eL.size() > 0
@@ -96,7 +98,9 @@ f_events() =>
                 sh = shP.get(i)
                 if close > sh
                     shB.set(i, true)
-                    eL.push(sh), eD.push(1), eK.push(1), eT.push(time), eX.push(sh), eM.push(false), eV.push(false)
+                    knd = trend == 0 ? 2 : 1          // break UP against a bearish trend = CHoCH
+                    trend := 1
+                    eL.push(sh), eD.push(1), eK.push(knd), eT.push(time), eX.push(sh), eM.push(false), eV.push(false)
                 else if not shX.get(i) and high > sh and close < sh
                     shX.set(i, true)
                     eL.push(sh), eD.push(0), eK.push(0), eT.push(time), eX.push(high), eM.push(false), eV.push(false)
@@ -109,7 +113,9 @@ f_events() =>
                 sl = slP.get(i)
                 if close < sl
                     slB.set(i, true)
-                    eL.push(sl), eD.push(0), eK.push(1), eT.push(time), eX.push(sl), eM.push(false), eV.push(false)
+                    knd = trend == 1 ? 2 : 1          // break DOWN against a bullish trend = CHoCH
+                    trend := 0
+                    eL.push(sl), eD.push(0), eK.push(knd), eT.push(time), eX.push(sl), eM.push(false), eV.push(false)
                 else if not slX.get(i) and low < sl and close > sl
                     slX.set(i, true)
                     eL.push(sl), eD.push(1), eK.push(0), eT.push(time), eX.push(low), eM.push(false), eV.push(false)
@@ -156,7 +162,7 @@ f_ingest(bool use, array<float> l, array<int> d, array<int> k, array<int> t, arr
         for i = 0 to l.size() - 1
             px  = l.get(i)
             key = int(math.round(px / syminfo.mintick))
-            ck  = key * 16 + k.get(i) * 8 + d.get(i) * 4 + tf   // kind,dir,tf buckets disjoint
+            ck  = key * 32 + k.get(i) * 8 + d.get(i) * 4 + tf   // kind ∈{0,1,2},dir,tf buckets disjoint (*32 > 23)
             if Eidx.contains(ck)
                 idx = Eidx.get(ck)
                 EM.set(idx, m.get(i)), EV.set(idx, v.get(i))    // refresh live flags only
@@ -190,6 +196,7 @@ dbHash = f_hash()
 cActive = 0
 cSweep = 0
 cBOS = 0
+cChoch = 0
 cBull = 0
 cBear = 0
 cMit = 0
@@ -198,7 +205,9 @@ if EL.size() > 0
     for i = 0 to EL.size() - 1
         if not EV.get(i)
             cActive += 1
-            if EKd.get(i) == 1
+            if EKd.get(i) == 2
+                cChoch += 1
+            else if EKd.get(i) == 1
                 cBOS += 1
             else
                 cSweep += 1
@@ -241,9 +250,8 @@ f_ecol(int i)  => EM.get(i) ? colMit : (ED.get(i) == 1 ? colBull : colBear)
 // eligible = shown TF, shown kind, and passes the active / mitigated filters
 f_eligible(int i) =>
     ok = f_show(ETf.get(i))
-    if EKd.get(i) == 1 and not showBOS
-        ok := false
-    if EKd.get(i) == 0 and not showSweep
+    kd = EKd.get(i)
+    if (kd == 0 and not showSweep) or (kd == 1 and not showBOS) or (kd == 2 and not showChoch)
         ok := false
     if showActive and EV.get(i)
         ok := false
@@ -286,15 +294,16 @@ if barstate.islast
             if f_eligible(i) and f_inbudget(i, tf == 3 ? cutW : tf == 2 ? cutD : cut4)
                 lvl = EL.get(i)
                 col = f_ecol(i)
-                bos = EKd.get(i) == 1
-                sty = bos ? line.style_solid : line.style_dashed   // BOS solid, sweep dashed
+                kd  = EKd.get(i)
+                sty = kd == 0 ? line.style_dashed : line.style_solid   // sweep dashed; BOS/CHoCH solid
+                wid = kd == 2 ? lineWid + 1 : lineWid                  // CHoCH heavier (trend change)
                 x1  = math.max(bar_index - 300, 0)
-                drawn.push(line.new(x1, lvl, x2, lvl, xloc = xloc.bar_index, extend = extend.right, color = col, width = lineWid, style = sty))
+                drawn.push(line.new(x1, lvl, x2, lvl, xloc = xloc.bar_index, extend = extend.right, color = col, width = wid, style = sty))
                 if showLbl
                     arrow = ED.get(i) == 1 ? "▲" : "▼"
-                    kind  = bos ? "BOS" : "SWEEP"
+                    ktxt  = kd == 2 ? "CHoCH" : kd == 1 ? "BOS" : "SWEEP"
                     mtag  = EM.get(i) ? " ·mit" : ""
-                    drawnL.push(label.new(x2, lvl, f_tag(tf) + " " + kind + " " + arrow + mtag, xloc = xloc.bar_index, style = label.style_label_left, color = col, textcolor = color.white, size = size.small))
+                    drawnL.push(label.new(x2, lvl, f_tag(tf) + " " + ktxt + " " + arrow + mtag, xloc = xloc.bar_index, style = label.style_label_left, color = col, textcolor = color.white, size = size.small))
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 6 · DEBUG PANEL — event DB hash + per-kind / lifecycle counts + freeze test
@@ -305,8 +314,8 @@ if barstate.islast
     table.cell(hud, 1, 0, str.tostring(dbHash), text_color = #00e676, text_size = size.normal)
     table.cell(hud, 0, 1, "Active", text_color = color.gray, text_size = size.small)
     table.cell(hud, 1, 1, str.tostring(cActive), text_color = color.silver, text_size = size.small)
-    table.cell(hud, 0, 2, "Sweep / BOS", text_color = color.gray, text_size = size.small)
-    table.cell(hud, 1, 2, str.tostring(cSweep) + " / " + str.tostring(cBOS), text_color = color.silver, text_size = size.small)
+    table.cell(hud, 0, 2, "Sw/BOS/CHoCH", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 2, str.tostring(cSweep) + "/" + str.tostring(cBOS) + "/" + str.tostring(cChoch), text_color = color.silver, text_size = size.small)
     table.cell(hud, 0, 3, "Bull / Bear", text_color = color.gray, text_size = size.small)
     table.cell(hud, 1, 3, str.tostring(cBull) + " / " + str.tostring(cBear), text_color = color.silver, text_size = size.small)
     table.cell(hud, 0, 4, "Mit / Unmit", text_color = color.gray, text_size = size.small)
