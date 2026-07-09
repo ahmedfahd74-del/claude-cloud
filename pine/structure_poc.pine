@@ -7,12 +7,14 @@
 // engines: confirmed-HTF-only detection, append-only union with sequence
 // identity, order-independent hash, time-based replay/freeze test.
 //
-// Institutional swing confirmation (all on the source TF's own CLOSED bars):
-//   · candle-close-confirmed pivot (ta.pivot with a leg on each side)
-//   · minimum structure distance from the last same-side structure (ATR filter)
-//   · minimum impulse / displacement leg into the point (ATR filter)
+// CANDLE CLOSE is the single source of truth for structure:
+//   · wick pivots are CANDIDATES only — never structure on their own
+//   · a candidate swing high/low becomes confirmed HH/HL/LH/LL ONLY when a candle
+//     CLOSES beyond it (a wick through it without a close is a liquidity sweep,
+//     handled by the Liquidity Engine — never confirmed here)
+//   · minimum structure distance from the last same-side point (ATR filter)
 //   · classification vs the last confirmed same-side point → HH/HL/LH/LL
-//   · a confidence score per point from displacement + distance
+//   · confidence from the close-through displacement + distance
 // Once stored a point is immutable (write-once identity, never repaints).
 //
 // Types: 0 HH · 1 HL · 2 LH · 3 LL   (HH/HL bullish structure, LH/LL bearish)
@@ -25,7 +27,6 @@ indicator("IA-Structure · Market Structure Engine POC", "IA-Struct", overlay = 
 pivLen  = input.int(5, "Swing strength (bars each side)", minval = 2, maxval = 30, group = "Structure",
      tooltip = "Institutional swing sensitivity (pivot leg). Detection input — changing it re-detects structure and changes the hash.")
 MINDIST = 0.50   // min structure distance from last same-side point (× ATR) — frozen
-IMPULSE = 1.00   // min impulse / displacement leg into the point (× ATR) — frozen
 MAXPT   = 200    // per-TF structure cap (bounds in-security memory; union retains history)
 
 // ─── Display (read-only — must never change the database) ──────────────────
@@ -61,43 +62,56 @@ f_struct() =>
     var array<int>   sCf  = array.new<int>()     // confidence 0-100 (frozen)
     var array<int>   sSq  = array.new<int>()     // per-TF sequence id (identity)
     var int seq  = 0
-    var float LSH = na                           // last confirmed swing-high price
-    var float LSL = na                           // last confirmed swing-low price
+    // CANDIDATE swings come from wick pivots — they are NOT structure yet.
+    var float candH  = na    // candidate swing high (wick) awaiting a close-break
+    var int   candHt = na
+    var float candL  = na    // candidate swing low (wick) awaiting a close-break
+    var int   candLt = na
+    var float lastH  = na    // last CONFIRMED structure-high price
+    var float lastL  = na    // last CONFIRMED structure-low price
+    var int trend = 0
 
     atr = ta.atr(14)                             // ta.* every bar (never conditional)
-    ph  = ta.pivothigh(pivLen, pivLen)
-    pl  = ta.pivotlow(pivLen, pivLen)
+    ph  = ta.pivothigh(high, pivLen, pivLen)     // wick candidate high (high series)
+    pl  = ta.pivotlow(low, pivLen, pivLen)       // wick candidate low  (low series)
 
     if barstate.isconfirmed
-        // new swing HIGH → HH (above last high) or LH (below), if it clears the
-        // min structure distance AND the impulse leg up from the last low.
+        // 1 · register CANDIDATES from wicks (candidate only — not confirmed structure)
         if not na(ph)
-            if na(LSH)
-                LSH := ph
-            else
-                dist = math.abs(ph - LSH)
-                leg  = na(LSL) ? dist : math.abs(ph - LSL)
-                if dist >= atr * MINDIST and leg >= atr * IMPULSE
-                    ds = math.min(1.0, leg / (atr * 3.0))
-                    dd = math.min(1.0, dist / (atr * 2.0))
-                    cf = int(math.round(30 + 40 * ds + 30 * dd))
-                    sP.push(ph), sTy.push(ph > LSH ? 0 : 2), sT.push(time[pivLen]), sPar.push(LSH), sCf.push(cf), sSq.push(seq)
-                    seq += 1
-                    LSH := ph
-        // new swing LOW → HL (above last low) or LL (below)
+            candH := ph
+            candHt := time[pivLen]
         if not na(pl)
-            if na(LSL)
-                LSL := pl
-            else
-                dist = math.abs(pl - LSL)
-                leg  = na(LSH) ? dist : math.abs(LSH - pl)
-                if dist >= atr * MINDIST and leg >= atr * IMPULSE
-                    ds = math.min(1.0, leg / (atr * 3.0))
-                    dd = math.min(1.0, dist / (atr * 2.0))
-                    cf = int(math.round(30 + 40 * ds + 30 * dd))
-                    sP.push(pl), sTy.push(pl > LSL ? 1 : 3), sT.push(time[pivLen]), sPar.push(LSL), sCf.push(cf), sSq.push(seq)
-                    seq += 1
-                    LSL := pl
+            candL := pl
+            candLt := time[pivLen]
+
+        // 2 · CONFIRM by CANDLE CLOSE. A candidate swing high becomes real structure
+        //     only when a candle CLOSES above it (a wick through it is a liquidity
+        //     sweep, handled by the Liquidity Engine — never confirmed here).
+        if not na(candH) and close > candH
+            dist = na(lastH) ? atr * MINDIST : math.abs(candH - lastH)
+            if dist >= atr * MINDIST
+                ty  = na(lastH) or candH > lastH ? 0 : 2                 // HH or LH
+                dsp = math.min(1.0, (close - candH) / (atr * 1.5))       // close-through displacement
+                cf  = int(math.round(40 + 30 * dsp + 30 * math.min(1.0, dist / (atr * 2.0))))
+                sP.push(candH), sTy.push(ty), sT.push(candHt), sPar.push(na(lastH) ? candH : lastH), sCf.push(cf), sSq.push(seq)
+                seq += 1
+                lastH := candH
+                trend := 1
+            candH := na                                                  // consumed by the close-break
+
+        // 3 · a candidate swing low becomes real structure only on a candle CLOSE below it
+        if not na(candL) and close < candL
+            dist = na(lastL) ? atr * MINDIST : math.abs(candL - lastL)
+            if dist >= atr * MINDIST
+                ty  = na(lastL) or candL < lastL ? 3 : 1                 // LL or HL
+                dsp = math.min(1.0, (candL - close) / (atr * 1.5))
+                cf  = int(math.round(40 + 30 * dsp + 30 * math.min(1.0, dist / (atr * 2.0))))
+                sP.push(candL), sTy.push(ty), sT.push(candLt), sPar.push(na(lastL) ? candL : lastL), sCf.push(cf), sSq.push(seq)
+                seq += 1
+                lastL := candL
+                trend := 0
+            candL := na
+
         // bound memory (oldest points age out first; the union retains history)
         if sP.size() > MAXPT
             sP.remove(0), sTy.remove(0), sT.remove(0), sPar.remove(0), sCf.remove(0), sSq.remove(0)
