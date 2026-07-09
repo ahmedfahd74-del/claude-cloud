@@ -12,13 +12,14 @@
 indicator("IA-SR · MTF Determinism POC", "IA-SR POC", overlay = true,
      max_lines_count = 200, max_labels_count = 200, max_boxes_count = 200, max_bars_back = 5000)
 
-// ─── Detection constants — FROZEN, NOT user inputs ─────────────────────────
-// These define HOW swings become levels (the database itself). They are hard
-// constants on purpose: the level database is objective, so NO setting can ever
-// reshape it or move a line. Only "Max lines per timeframe" changes what shows.
-pivLen   = 5      // swing strength (bars each side)
-mergeATR = 0.40   // merge distance (× TF-ATR)
-brkATR   = 0.30   // break distance (× TF-ATR)
+// ─── Structure detection ───────────────────────────────────────────────────
+// Swing strength IS a detection parameter: changing it re-detects swings and
+// reshapes the level database (positions + hash change). Merge/Break stay frozen
+// constants so only swing strength is tunable.
+pivLen   = input.int(5, "Swing strength (bars each side)", minval = 2, maxval = 30, group = "Structure",
+     tooltip = "Institutional swing sensitivity — the pivot leg length. This re-detects swings, so changing it MOVES levels and changes the DB hash (it is a detection input, not a display one).")
+mergeATR = 0.40   // merge distance (× TF-ATR) — frozen
+brkATR   = 0.30   // break distance (× TF-ATR) — frozen
 
 // ─── Display (read-only — must never change the database) ──────────────────
 maxLines = input.int(6, "Max lines per timeframe", minval = 1, maxval = 40, group = "Display",
@@ -27,6 +28,8 @@ linePrio = input.string("Nearest to price", "Line priority", options = ["Nearest
      tooltip = "Which levels fill each timeframe's budget first. Nearest = the closest levels to current price always show (most tradeable). Strength = the highest-ranked levels regardless of distance.")
 clusterATR = input.float(0.5, "Merge lines closer than (× ATR)", minval = 0.0, maxval = 5.0, step = 0.1, group = "Display",
      tooltip = "Visual de-clutter (drawing only — never moves a line or changes the database). Lines sitting within this many daily-ATR of each other collapse to the single most important one (higher timeframe, then higher rank). 0 = draw every line, no merging. Raise it to thin out dense zones.")
+minTouch = input.float(0.0, "Min touches to show", minval = 0.0, maxval = 20.0, step = 0.25, group = "Display",
+     tooltip = "Display filter (read-only — never changes the database). Hide levels whose touch evidence is below this. A fresh level counts 1; each retest/merge adds evidence. 0 = show all.")
 showW    = input.bool(true, "Show Weekly", inline = "s", group = "Display")
 showD    = input.bool(true, "Show Daily",  inline = "s", group = "Display")
 showH4   = input.bool(true, "Show 4H",     inline = "s", group = "Display")
@@ -140,6 +143,7 @@ var array<float> Dp   = array.new<float>()   // frozen identity price (wick)
 var array<float> Db   = array.new<float>()   // body edge (frozen; retained for future use — not drawn)
 var array<int>   Ds   = array.new<int>()     // 1 = resistance, 0 = support
 var array<float> Dr   = array.new<float>()   // ranked strength 0-100 (live)
+var array<float> Dt   = array.new<float>()   // touch evidence (live) — for the touch-count filter
 var array<int>   Dtf  = array.new<int>()     // 3 W · 2 D · 1 4H
 var array<bool>  Dbk  = array.new<bool>()    // broken/invalidated (live flag)
 var array<int>   Dkey = array.new<int>()     // frozen identity key (price in ticks)
@@ -160,9 +164,9 @@ f_ingest(bool use, array<float> p, array<float> b, array<int> s, array<float> t,
             rk  = math.min(100.0, (0.35 + 0.65 * f_norm(t.get(i))) * w * 100.0)
             if Didx.contains(ck)
                 idx = Didx.get(ck)
-                Dr.set(idx, rk), Dbk.set(idx, k.get(i))     // refresh live fields only
+                Dr.set(idx, rk), Dt.set(idx, t.get(i)), Dbk.set(idx, k.get(i))   // refresh live fields
             else
-                Dp.push(px), Db.push(b.get(i)), Ds.push(s.get(i)), Dr.push(rk)
+                Dp.push(px), Db.push(b.get(i)), Ds.push(s.get(i)), Dr.push(rk), Dt.push(t.get(i))
                 Dtf.push(tf), Dbk.push(k.get(i)), Dkey.push(key)
                 Didx.put(ck, Dp.size() - 1)                  // index new level (returns prev value)
                 Dbir.push(bar_index), Dbt.push(bt.get(i))    // void tail → both if/else branches void
@@ -302,7 +306,7 @@ f_keep(int i) =>
 // former support that price broke shows as red resistance (a retest candidate).
 // The Max-Lines budget is filled from this set only, so the count is what you SEE.
 nearMode = linePrio == "Nearest to price"
-f_eligible(int i) => f_show(Dtf.get(i)) and f_keep(i)
+f_eligible(int i) => f_show(Dtf.get(i)) and f_keep(i) and Dt.get(i) >= minTouch
 f_metric(int i)   => nearMode ? math.abs(close - Dp.get(i)) : Dr.get(i)
 
 // PER-TIMEFRAME budget: the cutoff is computed for ONE timeframe at a time, so
