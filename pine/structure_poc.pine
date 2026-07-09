@@ -36,13 +36,16 @@ showLH   = input.bool(true, "LH", inline = "t", group = "Display")
 showLL   = input.bool(true, "LL", inline = "t", group = "Display")
 minConf  = input.int(0, "Min confidence to show", minval = 0, maxval = 100, group = "Display",
      tooltip = "Display filter (read-only). Hide structure points below this confidence score.")
-maxPts   = input.int(12, "Max points per timeframe", minval = 1, maxval = 60, group = "Display")
+maxPts   = input.int(6, "Max points per timeframe", minval = 1, maxval = 60, group = "Display")
+showTfTag = input.bool(false, "Show timeframe tag", inline = "d", group = "Display")
+showConf  = input.bool(false, "Show confidence",    inline = "d", group = "Display")
+lblSizeS = input.string("Tiny", "Label size", options = ["Tiny", "Small", "Normal"], group = "Display")
 showW    = input.bool(true, "Show Weekly", inline = "s", group = "Display")
 showD    = input.bool(true, "Show Daily",  inline = "s", group = "Display")
-showH4   = input.bool(true, "Show 4H",     inline = "s", group = "Display")
+showH4   = input.bool(false, "Show 4H",    inline = "s", group = "Display")
 colBull  = input.color(#26a69a, "Bullish structure (HH/HL)", group = "Display")
 colBear  = input.color(#ef5350, "Bearish structure (LH/LL)", group = "Display")
-linkPts  = input.bool(true, "Link points (structure zigzag)", group = "Display")
+linkPts  = input.bool(false, "Link points (structure zigzag)", group = "Display")
 
 // ─── Validation (proof instruments — affect only the debug panel) ──────────
 canonDays  = input.int(30, "Canonical hash window (days)", minval = 3, maxval = 365, group = "Validation",
@@ -238,6 +241,7 @@ f_tag(int tf)   => tf == 3 ? "W" : tf == 2 ? "D" : "4H"
 f_tyname(int t) => t == 0 ? "HH" : t == 1 ? "HL" : t == 2 ? "LH" : "LL"
 f_tyshow(int t) => t == 0 ? showHH : t == 1 ? showHL : t == 2 ? showLH : showLL
 f_tycol(int t)  => (t == 0 or t == 1) ? colBull : colBear
+lblSize = lblSizeS == "Normal" ? size.normal : lblSizeS == "Small" ? size.small : size.tiny
 
 var array<label> drawnL = array.new<label>()
 var array<line>  drawnZ = array.new<line>()
@@ -277,9 +281,10 @@ if barstate.islast
                 ty  = STy.get(i)
                 col = f_tycol(ty)
                 up  = ty == 0 or ty == 2   // a high sits above its bar, a low below
-                drawnL.push(label.new(SBt.get(i), SP.get(i), f_tag(tf) + " " + f_tyname(ty) + " " + str.tostring(SCf.get(i)), xloc = xloc.bar_time, yloc = yloc.price, style = up ? label.style_label_down : label.style_label_up, color = col, textcolor = color.white, size = size.small))
+                txt = (showTfTag ? f_tag(tf) + " " : "") + f_tyname(ty) + (showConf ? " " + str.tostring(SCf.get(i)) : "")
+                drawnL.push(label.new(SBt.get(i), SP.get(i), txt, xloc = xloc.bar_time, yloc = yloc.price, style = up ? label.style_label_down : label.style_label_up, color = color.new(col, 15), textcolor = color.white, size = lblSize))
                 if linkPts and not na(prevX)
-                    drawnZ.push(line.new(prevX, prevY, SBt.get(i), SP.get(i), xloc = xloc.bar_time, color = color.new(color.gray, 40), width = 1, style = line.style_dotted))
+                    drawnZ.push(line.new(prevX, prevY, SBt.get(i), SP.get(i), xloc = xloc.bar_time, color = color.new(color.gray, 55), width = 1, style = line.style_dotted))
                 prevX := SBt.get(i)
                 prevY := SP.get(i)
 
