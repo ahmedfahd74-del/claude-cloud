@@ -19,7 +19,7 @@
 //  · freeze test keys on birth TIME (chart-independent), not bar_index
 
 //@version=6
-indicator("IA-Event · Institutional Event DB POC", "IA-Event POC", overlay = true,
+indicator("IA-Event · Institutional Event DB POC", "IA-Evt POC", overlay = true,
      max_lines_count = 200, max_labels_count = 200, max_boxes_count = 200, max_bars_back = 2000)
 
 // ─── Detection constants — FROZEN, NOT user inputs (the database is objective) ─
@@ -219,8 +219,8 @@ f_ingest(bool use, array<float> l, array<int> d, array<int> k, array<int> t, arr
                 EM.set(idx, m.get(i)), EV.set(idx, v.get(i))    // refresh live flags only
             else
                 EL.push(l.get(i)), ED.push(d.get(i)), EKd.push(k.get(i)), ETf.push(tf), EBt.push(t.get(i)), EL2.push(x.get(i))
-                EM.push(m.get(i)), EV.push(v.get(i))
-                Eidx.put(ck, EL.size() - 1)
+                Eidx.put(ck, EL.size() - 1)                       // returns prev value (int)
+                EM.push(m.get(i)), EV.push(v.get(i))              // void tail → both if/else branches void
 
 f_ingest(true, wL,  wD,  wK,  wT,  wX,  wM,  wV,  wS,  3)
 f_ingest(true, dL,  dD,  dK,  dT,  dX,  dM,  dV,  dS,  2)
