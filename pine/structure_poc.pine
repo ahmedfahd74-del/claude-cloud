@@ -21,7 +21,7 @@
 
 //@version=6
 indicator("IA-Structure · Market Structure Engine POC", "IA-Struct", overlay = true,
-     max_lines_count = 300, max_labels_count = 300, max_bars_back = 2000)
+     max_lines_count = 300, max_labels_count = 300, max_bars_back = 1100)
 
 // ─── Structure detection ───────────────────────────────────────────────────
 revSens = input.float(1.5, "Swing strength (reversal × ATR)", minval = 0.3, maxval = 5.0, step = 0.1, group = "Structure",
@@ -63,8 +63,6 @@ f_struct() =>
     var array<int>   sT   = array.new<int>()     // birth time (chart-independent)
     var array<float> sPar = array.new<float>()   // parent (previous same-side point)
     var array<int>   sCf  = array.new<int>()     // confidence 0-100 (frozen)
-    var array<int>   sSq  = array.new<int>()     // per-TF sequence id (identity)
-    var int seq  = 0
     // CLOSE-based swing tracker (no wicks, no ta.pivot). A leg's extreme is the
     // highest/lowest CLOSE; a swing is confirmed only when a later CLOSE reverses
     // by REVATR×ATR — that reversal filters insignificant swings.
@@ -102,8 +100,7 @@ f_struct() =>
                     ty  = na(lastH) or ext > lastH ? 0 : 2                  // HH or LH
                     dsp = math.min(1.0, (ext - c) / (atr * 2.0))
                     cf  = int(math.round(40 + 30 * dsp + 30 * math.min(1.0, dist / (atr * 2.0))))
-                    sP.push(ext), sTy.push(ty), sT.push(extT), sPar.push(na(lastH) ? ext : lastH), sCf.push(cf), sSq.push(seq)
-                    seq += 1
+                    sP.push(ext), sTy.push(ty), sT.push(extT), sPar.push(na(lastH) ? ext : lastH), sCf.push(cf)
                     lastH := ext
                 dir := -1
                 ext := c
@@ -119,31 +116,33 @@ f_struct() =>
                     ty  = na(lastL) or ext < lastL ? 3 : 1                  // LL or HL
                     dsp = math.min(1.0, (c - ext) / (atr * 2.0))
                     cf  = int(math.round(40 + 30 * dsp + 30 * math.min(1.0, dist / (atr * 2.0))))
-                    sP.push(ext), sTy.push(ty), sT.push(extT), sPar.push(na(lastL) ? ext : lastL), sCf.push(cf), sSq.push(seq)
-                    seq += 1
+                    sP.push(ext), sTy.push(ty), sT.push(extT), sPar.push(na(lastL) ? ext : lastL), sCf.push(cf)
                     lastL := ext
                 dir := 1
                 ext := c
                 extT := time
 
-        // bound memory (oldest points age out first; the union retains history)
+        // bound per-TF book memory (oldest points age out first)
         if sP.size() > MAXPT
-            sP.remove(0), sTy.remove(0), sT.remove(0), sPar.remove(0), sCf.remove(0), sSq.remove(0)
+            sP.remove(0), sTy.remove(0), sT.remove(0), sPar.remove(0), sCf.remove(0)
 
-    [sP, sTy, sT, sPar, sCf, sSq, trend]
+    [sP, sTy, sT, sPar, sCf, trend]
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 2 · FETCH FROZEN STRUCTURE BOOKS (one security call per TF) + chart anchors
 // ═══════════════════════════════════════════════════════════════════════════
-[wP,  wTy,  wT,  wPar,  wCf,  wSq,  wTr]  = request.security(syminfo.tickerid, "W",   f_struct(), lookahead = barmerge.lookahead_off)
-[dP,  dTy,  dT,  dPar,  dCf,  dSq,  dTr]  = request.security(syminfo.tickerid, "D",   f_struct(), lookahead = barmerge.lookahead_off)
-[h4P, h4Ty, h4T, h4Par, h4Cf, h4Sq, h4Tr] = request.security(syminfo.tickerid, "240", f_struct(), lookahead = barmerge.lookahead_off)
+[wP,  wTy,  wT,  wPar,  wCf,  wTr]  = request.security(syminfo.tickerid, "W",   f_struct(), lookahead = barmerge.lookahead_off)
+[dP,  dTy,  dT,  dPar,  dCf,  dTr]  = request.security(syminfo.tickerid, "D",   f_struct(), lookahead = barmerge.lookahead_off)
+[h4P, h4Ty, h4T, h4Par, h4Cf, h4Tr] = request.security(syminfo.tickerid, "240", f_struct(), lookahead = barmerge.lookahead_off)
 dayOpen = request.security(syminfo.tickerid, "D", time, lookahead = barmerge.lookahead_off)
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 3 · ONE PERSISTENT STRUCTURE DATABASE — APPEND-ONLY UNION, WRITE-ONCE IDENTITY.
-//     Identity = (timeframe, per-TF sequence id) → every confirmed point is a
-//     distinct immutable record. Enters once, never leaves, never repaints.
+// 3 · MARKET STRUCTURE DATABASE — REBUILT each bar from the (bounded) per-TF
+//     books, so the union never grows unbounded (fixes the memory limit). The
+//     books are append-only and frozen internally, so the rebuilt union is
+//     deterministic and identical across chart timeframes; a confirmed point
+//     never moves. No persistent map / write-once identity needed — the books
+//     already hold each distinct point once.
 // ═══════════════════════════════════════════════════════════════════════════
 var array<float> SP   = array.new<float>()   // price
 var array<int>   STy  = array.new<int>()     // type 0..3
@@ -151,19 +150,16 @@ var array<int>   STf  = array.new<int>()     // 3 W · 2 D · 1 4H
 var array<int>   SBt  = array.new<int>()     // frozen birth time
 var array<float> SPar = array.new<float>()   // parent price
 var array<int>   SCf  = array.new<int>()     // confidence
-var map<int, int> Sidx = map.new<int, int>() // identity key → index
 
-f_ingest(bool use, array<float> p, array<int> ty, array<int> t, array<float> par, array<int> cf, array<int> sq, int tf) =>
+f_ingest(bool use, array<float> p, array<int> ty, array<int> t, array<float> par, array<int> cf, int tf) =>
     if use and not na(p) and p.size() > 0
         for i = 0 to p.size() - 1
-            ck = tf * 1000000000 + sq.get(i)     // (tf, seq) — unique per distinct point
-            if not Sidx.contains(ck)
-                Sidx.put(ck, SP.size())          // index = size BEFORE push (returns int, not last)
-                SP.push(p.get(i)), STy.push(ty.get(i)), STf.push(tf), SBt.push(t.get(i)), SPar.push(par.get(i)), SCf.push(cf.get(i))
+            SP.push(p.get(i)), STy.push(ty.get(i)), STf.push(tf), SBt.push(t.get(i)), SPar.push(par.get(i)), SCf.push(cf.get(i))
 
-f_ingest(true, wP,  wTy,  wT,  wPar,  wCf,  wSq,  3)
-f_ingest(true, dP,  dTy,  dT,  dPar,  dCf,  dSq,  2)
-f_ingest(true, h4P, h4Ty, h4T, h4Par, h4Cf, h4Sq, 1)
+SP.clear(), STy.clear(), STf.clear(), SBt.clear(), SPar.clear(), SCf.clear()
+f_ingest(true, wP,  wTy,  wT,  wPar,  wCf,  3)
+f_ingest(true, dP,  dTy,  dT,  dPar,  dCf,  2)
+f_ingest(true, h4P, h4Ty, h4T, h4Par, h4Cf, 1)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 4 · STRUCTURE HASH (canonical time window) + per-type counts
