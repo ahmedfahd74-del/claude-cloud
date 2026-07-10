@@ -21,7 +21,7 @@
 
 //@version=6
 indicator("IA-Structure · Market Structure Engine POC", "IA-Struct", overlay = true,
-     max_lines_count = 300, max_labels_count = 300, max_bars_back = 1100)
+     max_lines_count = 300, max_labels_count = 300, max_bars_back = 300)
 
 // ─── Structure detection ───────────────────────────────────────────────────
 revSens = input.float(1.5, "Swing strength (reversal × ATR)", minval = 0.3, maxval = 5.0, step = 0.1, group = "Structure",
@@ -215,9 +215,19 @@ f_whash(int cutT) =>
                 h := int(math.abs((h + f_lh(i)) % 99999989))
     h
 wHash = f_whash(freezeCutT)
-rA = wHash
-rB = wHash[500]
-rC = wHash[1000]
+// Capture the frozen-window hash at three fixed anchor bars into var scalars — NO
+// series-history indexing (wHash[500]/[1000]) that would force Pine to buffer 1000
+// bars of every series, including the request.security arrays, and exceed the
+// memory limit (RE10139) on deep-history forex. A = B = C ⇒ freeze integrity.
+var int rA = na
+var int rB = na
+var int rC = na
+if bar_index == last_bar_index
+    rA := wHash
+if bar_index == last_bar_index - 500
+    rB := wHash
+if bar_index == last_bar_index - 1000
+    rC := wHash
 replayPass = not na(rC) and rA == rB and rB == rC
 
 // ═══════════════════════════════════════════════════════════════════════════
