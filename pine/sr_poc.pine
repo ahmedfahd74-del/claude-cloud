@@ -10,7 +10,15 @@
 
 //@version=6
 indicator("IA-SR · MTF Determinism POC", "IA-SR POC", overlay = true,
-     max_lines_count = 200, max_labels_count = 200, max_boxes_count = 200, max_bars_back = 300)
+     max_lines_count = 200, max_labels_count = 200, max_boxes_count = 200, max_bars_back = 300,
+     calc_bars_count = 5000)
+// calc_bars_count caps the script to the most recent 5000 chart bars. Forex symbols
+// carry decades of history (crypto far less), so an ungated script processes an
+// order of magnitude more bars on forex — and request.security replays the full
+// HTF history to seed its in-security books — which is what exhausts the runtime
+// budget (RE10139/RE10110) on forex but not crypto. 5000 bars comfortably spans
+// the 1200-bar freeze window and the 30-day canonical hash on any intraday chart,
+// so determinism and the freeze test are unaffected.
 
 // ─── Structure detection ───────────────────────────────────────────────────
 // Swing strength IS a detection parameter: changing it re-detects swings and
