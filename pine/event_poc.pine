@@ -20,20 +20,22 @@
 
 //@version=6
 indicator("IA-Event · Institutional Event DB POC", "IA-Evt POC", overlay = true,
-     max_lines_count = 200, max_labels_count = 200, max_boxes_count = 200, max_bars_back = 100,
-     calc_bars_count = 5000)
-// calc_bars_count caps the script to the most recent 5000 chart bars. Forex symbols
-// carry decades of history (crypto far less), so an ungated script processes an
-// order of magnitude more bars on forex — and request.security replays the full
-// HTF history to seed its in-security books — which is what exhausts the runtime
-// budget (RE10139/RE10110) on forex but not crypto. 5000 bars comfortably spans
-// the 1200-bar freeze window and the 30-day canonical hash on any intraday chart,
-// so determinism and the freeze test are unaffected.
+     max_lines_count = 200, max_labels_count = 200, max_boxes_count = 200, max_bars_back = 120,
+     calc_bars_count = 2500)
+// calc_bars_count caps the script to the most recent 2500 chart bars, bounding both
+// memory and the number of events formed so the per-TF book stays under MAXEV (no
+// frozen-window event is evicted → the A=B=C freeze test stays valid). 2500 bars
+// spans the 1200-bar freeze window with warm-up to spare on any intraday chart.
+
+// ─── Market length — the ONLY detection input (it re-detects swings, so it moves
+//     events and changes the DB hash: a detection parameter, not a display one) ──
+pivLen   = input.int(5, "Market length (swing bars each side)", minval = 2, maxval = 50, group = "Structure",
+     tooltip = "Institutional swing sensitivity — the pivot leg length used to find the swing highs/lows that seed sweeps, BOS and CHoCH. Larger = only bigger, more significant structure; smaller = more, finer events. This RE-DETECTS structure, so it changes which events exist and the DB hash (a detection input, not a display filter).")
 
 // ─── Detection constants — FROZEN, NOT user inputs (the database is objective) ─
-pivLen   = 5      // swing strength (bars each side)
-MAXSW    = 60     // per-TF swing registry cap (trimmed to shrink request.security array memory — RE10139)
-MAXEV    = 80     // per-TF event cap (bounds in-security memory; the union retains history)
+MAXSW    = 250    // per-TF swing registry cap
+MAXEV    = 500    // per-TF event cap. Must exceed events formed within calc_bars_count so a
+                  // frozen-window event is NEVER evicted (eviction would break the A=B=C freeze).
 FVGMIN   = 0.15   // minimum FVG size in ATR
 DISPBODY = 0.55   // displacement: breaking-candle body ≥ this × ATR ...
 DISPRNG  = 1.00   // ... OR breaking-candle range ≥ this × ATR
@@ -196,11 +198,23 @@ f_events() =>
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 2 · FETCH FROZEN EVENT BOOKS (one security call per TF) + chart-indep. anchors
+//
+//     RE10139 fix for high chart timeframes: request.security() of a timeframe
+//     BELOW the chart TF replays that lower TF's ENTIRE history in-security
+//     (≈6× the chart bars on 1D for the 4H book, ≈30× on 1W), exhausting memory
+//     on 1D/1W. So a book is only BUILT-and-MERGED when its native TF ≥ the chart
+//     TF; otherwise its request is clamped to the chart TF (a cheap same-TF call)
+//     and the book is dropped from the union. Sub-chart events are not shown on a
+//     higher chart. The freeze test is a same-chart invariant, so it is unaffected.
 // ═══════════════════════════════════════════════════════════════════════════
-[wL,  wD,  wK,  wT,  wX,  wM,  wV,  wS]  = request.security(syminfo.tickerid, "W",   f_events(), lookahead = barmerge.lookahead_off)
-[dL,  dD,  dK,  dT,  dX,  dM,  dV,  dS]  = request.security(syminfo.tickerid, "D",   f_events(), lookahead = barmerge.lookahead_off)
-[h4L, h4D, h4K, h4T, h4X, h4M, h4V, h4S] = request.security(syminfo.tickerid, "240", f_events(), lookahead = barmerge.lookahead_off)
-dayOpen = request.security(syminfo.tickerid, "D", time, lookahead = barmerge.lookahead_off)
+f_reqtf(string tf) => timeframe.in_seconds(tf) < timeframe.in_seconds() ? timeframe.period : tf
+useW  = timeframe.in_seconds("W")   >= timeframe.in_seconds()
+useD  = timeframe.in_seconds("D")   >= timeframe.in_seconds()
+use4  = timeframe.in_seconds("240") >= timeframe.in_seconds()
+[wL,  wD,  wK,  wT,  wX,  wM,  wV,  wS]  = request.security(syminfo.tickerid, f_reqtf("W"),   f_events(), lookahead = barmerge.lookahead_off)
+[dL,  dD,  dK,  dT,  dX,  dM,  dV,  dS]  = request.security(syminfo.tickerid, f_reqtf("D"),   f_events(), lookahead = barmerge.lookahead_off)
+[h4L, h4D, h4K, h4T, h4X, h4M, h4V, h4S] = request.security(syminfo.tickerid, f_reqtf("240"), f_events(), lookahead = barmerge.lookahead_off)
+dayOpen = request.security(syminfo.tickerid, f_reqtf("D"), time, lookahead = barmerge.lookahead_off)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 3 · ONE PERSISTENT EVENT DATABASE — APPEND-ONLY UNION, WRITE-ONCE IDENTITY.
@@ -227,9 +241,9 @@ f_ingest(bool use, array<float> l, array<int> d, array<int> k, array<int> t, arr
             EL.push(l.get(i)), ED.push(d.get(i)), EKd.push(k.get(i)), ETf.push(tf), EBt.push(t.get(i)), EL2.push(x.get(i)), EM.push(m.get(i)), EV.push(v.get(i))
 
 EL.clear(), ED.clear(), EKd.clear(), ETf.clear(), EBt.clear(), EL2.clear(), EM.clear(), EV.clear()
-f_ingest(true, wL,  wD,  wK,  wT,  wX,  wM,  wV,  3)
-f_ingest(true, dL,  dD,  dK,  dT,  dX,  dM,  dV,  2)
-f_ingest(true, h4L, h4D, h4K, h4T, h4X, h4M, h4V, 1)
+f_ingest(useW, wL,  wD,  wK,  wT,  wX,  wM,  wV,  3)
+f_ingest(useD, dL,  dD,  dK,  dT,  dX,  dM,  dV,  2)
+f_ingest(use4, h4L, h4D, h4K, h4T, h4X, h4M, h4V, 1)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 4 · EVENT DB HASH (canonical time window) + counts. Content hash folds near +

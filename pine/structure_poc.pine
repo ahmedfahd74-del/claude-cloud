@@ -8,34 +8,33 @@
 // identity, order-independent hash, time-based replay/freeze test.
 //
 // CANDLE CLOSE is the single source of truth for structure:
-//   · wick pivots are CANDIDATES only — never structure on their own
-//   · a candidate swing high/low becomes confirmed HH/HL/LH/LL ONLY when a candle
-//     CLOSES beyond it (a wick through it without a close is a liquidity sweep,
-//     handled by the Liquidity Engine — never confirmed here)
+//   · swings are CLOSE pivots — ta.pivothigh/low run on the CLOSE series, so a
+//     swing is the highest/lowest CLOSE across `pivot length` bars each side
+//     (wick highs/lows never define structure; a wick through a level without a
+//     close is a liquidity sweep, handled by the Liquidity Engine)
 //   · minimum structure distance from the last same-side point (ATR filter)
 //   · classification vs the last confirmed same-side point → HH/HL/LH/LL
-//   · confidence from the close-through displacement + distance
+//   · market bias from confirmed close BOS/CHoCH (trend), not label counts
+//   · confidence from the swing distance vs ATR
 // Once stored a point is immutable (write-once identity, never repaints).
 //
 // Types: 0 HH · 1 HL · 2 LH · 3 LL   (HH/HL bullish structure, LH/LL bearish)
 
 //@version=6
 indicator("IA-Structure · Market Structure Engine POC", "IA-Struct", overlay = true,
-     max_lines_count = 300, max_labels_count = 300, max_bars_back = 100,
-     calc_bars_count = 5000)
-// calc_bars_count caps the script to the most recent 5000 chart bars. Forex symbols
-// carry decades of history (crypto far less), so an ungated script processes an
-// order of magnitude more bars on forex — and request.security replays the full
-// HTF history to seed its in-security books — which is what exhausts the runtime
-// budget (RE10139/RE10110) on forex but not crypto. 5000 bars comfortably spans
-// the 1200-bar freeze window and the 30-day canonical hash on any intraday chart,
-// so determinism and the freeze test are unaffected.
+     max_lines_count = 300, max_labels_count = 300, max_bars_back = 120,
+     calc_bars_count = 2500)
+// calc_bars_count caps the script to the most recent 2500 chart bars, bounding both
+// memory and the number of structure points formed so the per-TF book stays under
+// MAXPT (no frozen-window point is evicted → the A=B=C freeze test stays valid).
+// 2500 bars spans the 1200-bar freeze window with warm-up to spare on any chart.
 
 // ─── Structure detection ───────────────────────────────────────────────────
-revSens = input.float(1.5, "Swing strength (reversal × ATR)", minval = 0.3, maxval = 5.0, step = 0.1, group = "Structure",
-     tooltip = "How far a CLOSE must reverse against a leg's extreme (in ATR) to confirm a swing. Higher = fewer, larger institutional swings. Detection input — changing it re-detects structure and changes the hash.")
+pivLen  = input.int(5, "Pivot length (swing bars each side)", minval = 2, maxval = 50, group = "Structure",
+     tooltip = "Institutional swing sensitivity — the pivot leg length. A swing high/low is confirmed when a CLOSE is the highest/lowest close across pivLen bars on each side. Larger = fewer, bigger structure points; smaller = more, finer ones. Detection input — changing it re-detects structure and changes the hash. (Swings are still taken from CLOSES, never wicks.)")
 MINDIST = 0.50   // min structure distance from last same-side point (× ATR) — frozen
-MAXPT   = 100    // per-TF structure cap (trimmed to shrink request.security array memory — RE10139)
+MAXPT   = 300    // per-TF structure cap. Must exceed points formed within calc_bars_count so a
+                 // frozen-window point is NEVER evicted (eviction would break the A=B=C freeze).
 
 // ─── Display (read-only — must never change the database) ──────────────────
 showHH   = input.bool(true, "HH", inline = "t", group = "Display")
@@ -71,64 +70,41 @@ f_struct() =>
     var array<int>   sT   = array.new<int>()     // birth time (chart-independent)
     var array<float> sPar = array.new<float>()   // parent (previous same-side point)
     var array<int>   sCf  = array.new<int>()     // confidence 0-100 (frozen)
-    // CLOSE-based swing tracker (no wicks, no ta.pivot). A leg's extreme is the
-    // highest/lowest CLOSE; a swing is confirmed only when a later CLOSE reverses
-    // by REVATR×ATR — that reversal filters insignificant swings.
-    var int   dir  = 0       // current leg: 1 up, -1 down, 0 unset
-    var float ext  = na      // current leg extreme (close)
-    var int   extT = na
     var float lastH = na     // last CONFIRMED structure-high close
     var float lastL = na     // last CONFIRMED structure-low close
     var int trend = 0        // market trend from CONFIRMED close BOS/CHoCH: 1 bull · -1 bear · 0 none
 
-    atr = ta.atr(14)         // ta.* every bar (never conditional) — no ta.pivot used
+    // PIVOT-LENGTH swing detection on the CLOSE series (never wicks). A swing high
+    // is a close that is the highest close across pivLen bars on each side; a swing
+    // low the lowest. ta.* MUST run every bar (never inside a conditional).
+    atr = ta.atr(14)
+    ph  = ta.pivothigh(close, pivLen, pivLen)   // CLOSE pivot high (confirmed pivLen bars later)
+    pl  = ta.pivotlow(close,  pivLen, pivLen)   // CLOSE pivot low
+    pTime = time[pivLen]                         // the pivot bar's own time (chart-independent)
 
     if barstate.isconfirmed
-        c   = close
-        rev = atr * revSens
         // BOS / CHoCH — bias source: a CLOSE beyond the last confirmed swing flips
         // trend (BOS = with trend, CHoCH = against). Wicks never count here.
-        if not na(lastH) and c > lastH
+        if not na(lastH) and close > lastH
             trend := 1
-        if not na(lastL) and c < lastL
+        if not na(lastL) and close < lastL
             trend := -1
-        // seed the first leg
-        if dir == 0
-            ext := c
-            extT := time
-            dir := 1
-        else if dir == 1
-            // up leg: extend the high on higher closes; a REVATR close-down confirms it
-            if c > ext
-                ext := c
-                extT := time
-            else if c <= ext - rev
-                dist = na(lastH) ? atr * MINDIST : math.abs(ext - lastH)
-                if dist >= atr * MINDIST
-                    ty  = na(lastH) or ext > lastH ? 0 : 2                  // HH or LH
-                    dsp = math.min(1.0, (ext - c) / (atr * 2.0))
-                    cf  = int(math.round(40 + 30 * dsp + 30 * math.min(1.0, dist / (atr * 2.0))))
-                    sP.push(ext), sTy.push(ty), sT.push(extT), sPar.push(na(lastH) ? ext : lastH), sCf.push(cf)
-                    lastH := ext
-                dir := -1
-                ext := c
-                extT := time
-        else
-            // down leg: extend the low on lower closes; a REVATR close-up confirms it
-            if c < ext
-                ext := c
-                extT := time
-            else if c >= ext + rev
-                dist = na(lastL) ? atr * MINDIST : math.abs(ext - lastL)
-                if dist >= atr * MINDIST
-                    ty  = na(lastL) or ext < lastL ? 3 : 1                  // LL or HL
-                    dsp = math.min(1.0, (c - ext) / (atr * 2.0))
-                    cf  = int(math.round(40 + 30 * dsp + 30 * math.min(1.0, dist / (atr * 2.0))))
-                    sP.push(ext), sTy.push(ty), sT.push(extT), sPar.push(na(lastL) ? ext : lastL), sCf.push(cf)
-                    lastL := ext
-                dir := 1
-                ext := c
-                extT := time
+        // new swing HIGH (close pivot). MINDIST filters insignificant swings.
+        if not na(ph)
+            dist = na(lastH) ? atr * MINDIST : math.abs(ph - lastH)
+            if dist >= atr * MINDIST
+                ty = na(lastH) or ph > lastH ? 0 : 2                    // HH or LH
+                cf = int(math.round(50 + 50 * math.min(1.0, dist / (atr * 3.0))))
+                sP.push(ph), sTy.push(ty), sT.push(pTime), sPar.push(na(lastH) ? ph : lastH), sCf.push(cf)
+                lastH := ph
+        // new swing LOW (close pivot)
+        if not na(pl)
+            dist = na(lastL) ? atr * MINDIST : math.abs(pl - lastL)
+            if dist >= atr * MINDIST
+                ty = na(lastL) or pl < lastL ? 3 : 1                    // LL or HL
+                cf = int(math.round(50 + 50 * math.min(1.0, dist / (atr * 3.0))))
+                sP.push(pl), sTy.push(ty), sT.push(pTime), sPar.push(na(lastL) ? pl : lastL), sCf.push(cf)
+                lastL := pl
 
         // bound per-TF book memory (oldest points age out first)
         if sP.size() > MAXPT
@@ -138,11 +114,23 @@ f_struct() =>
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 2 · FETCH FROZEN STRUCTURE BOOKS (one security call per TF) + chart anchors
+//
+//     RE10139 fix for high chart timeframes: request.security() of a timeframe
+//     BELOW the chart TF replays that lower TF's ENTIRE history in-security
+//     (≈6× the chart bars on 1D for the 4H book, ≈30× on 1W), exhausting memory
+//     on 1D/1W. So a book is only BUILT-and-MERGED when its native TF ≥ the chart
+//     TF; otherwise its request is clamped to the chart TF (a cheap same-TF call)
+//     and dropped from the union. Sub-chart structure is not shown on a higher
+//     chart. The freeze test is a same-chart invariant, so it is unaffected.
 // ═══════════════════════════════════════════════════════════════════════════
-[wP,  wTy,  wT,  wPar,  wCf,  wTr]  = request.security(syminfo.tickerid, "W",   f_struct(), lookahead = barmerge.lookahead_off)
-[dP,  dTy,  dT,  dPar,  dCf,  dTr]  = request.security(syminfo.tickerid, "D",   f_struct(), lookahead = barmerge.lookahead_off)
-[h4P, h4Ty, h4T, h4Par, h4Cf, h4Tr] = request.security(syminfo.tickerid, "240", f_struct(), lookahead = barmerge.lookahead_off)
-dayOpen = request.security(syminfo.tickerid, "D", time, lookahead = barmerge.lookahead_off)
+f_reqtf(string tf) => timeframe.in_seconds(tf) < timeframe.in_seconds() ? timeframe.period : tf
+useW  = timeframe.in_seconds("W")   >= timeframe.in_seconds()
+useD  = timeframe.in_seconds("D")   >= timeframe.in_seconds()
+use4  = timeframe.in_seconds("240") >= timeframe.in_seconds()
+[wP,  wTy,  wT,  wPar,  wCf,  wTr]  = request.security(syminfo.tickerid, f_reqtf("W"),   f_struct(), lookahead = barmerge.lookahead_off)
+[dP,  dTy,  dT,  dPar,  dCf,  dTr]  = request.security(syminfo.tickerid, f_reqtf("D"),   f_struct(), lookahead = barmerge.lookahead_off)
+[h4P, h4Ty, h4T, h4Par, h4Cf, h4Tr] = request.security(syminfo.tickerid, f_reqtf("240"), f_struct(), lookahead = barmerge.lookahead_off)
+dayOpen = request.security(syminfo.tickerid, f_reqtf("D"), time, lookahead = barmerge.lookahead_off)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 3 · MARKET STRUCTURE DATABASE — REBUILT each bar from the (bounded) per-TF
@@ -165,9 +153,9 @@ f_ingest(bool use, array<float> p, array<int> ty, array<int> t, array<float> par
             SP.push(p.get(i)), STy.push(ty.get(i)), STf.push(tf), SBt.push(t.get(i)), SPar.push(par.get(i)), SCf.push(cf.get(i))
 
 SP.clear(), STy.clear(), STf.clear(), SBt.clear(), SPar.clear(), SCf.clear()
-f_ingest(true, wP,  wTy,  wT,  wPar,  wCf,  3)
-f_ingest(true, dP,  dTy,  dT,  dPar,  dCf,  2)
-f_ingest(true, h4P, h4Ty, h4T, h4Par, h4Cf, 1)
+f_ingest(useW, wP,  wTy,  wT,  wPar,  wCf,  3)
+f_ingest(useD, dP,  dTy,  dT,  dPar,  dCf,  2)
+f_ingest(use4, h4P, h4Ty, h4T, h4Par, h4Cf, 1)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 4 · STRUCTURE HASH (canonical time window) + per-type counts

@@ -10,15 +10,15 @@
 
 //@version=6
 indicator("IA-SR · MTF Determinism POC", "IA-SR POC", overlay = true,
-     max_lines_count = 200, max_labels_count = 200, max_boxes_count = 200, max_bars_back = 100,
-     calc_bars_count = 5000)
-// calc_bars_count caps the script to the most recent 5000 chart bars. Forex symbols
+     max_lines_count = 200, max_labels_count = 200, max_boxes_count = 200, max_bars_back = 120,
+     calc_bars_count = 2500)
+// calc_bars_count caps the script to the most recent 2500 chart bars. Forex symbols
 // carry decades of history (crypto far less), so an ungated script processes an
 // order of magnitude more bars on forex — and request.security replays the full
 // HTF history to seed its in-security books — which is what exhausts the runtime
-// budget (RE10139/RE10110) on forex but not crypto. 5000 bars comfortably spans
-// the 1200-bar freeze window and the 30-day canonical hash on any intraday chart,
-// so determinism and the freeze test are unaffected.
+// budget (RE10139/RE10110) on forex but not crypto. 2500 bars comfortably spans
+// the 1200-bar freeze window while keeping the per-TF book under MAXBOOK (so no
+// frozen record is ever evicted — the A=B=C freeze test stays valid).
 
 // ─── Structure detection ───────────────────────────────────────────────────
 // Swing strength IS a detection parameter: changing it re-detects swings and
@@ -58,8 +58,9 @@ showPwr  = input.bool(true, "Power Line", group = "Display")
 //     Detection + freeze + break all computed on that timeframe's OWN bars, so
 //     the returned book is identical regardless of the chart timeframe.
 // ═══════════════════════════════════════════════════════════════════════════
-MAXBOOK = 150   // trimmed to shrink request.security array memory (RE10139); still holds
-                // far more than any chart draws, and confirmed levels stay frozen records
+MAXBOOK = 500   // must exceed the number of levels formed within calc_bars_count, so a
+                // frozen-window record is NEVER evicted (eviction would break A=B=C).
+                // calc_bars_count caps how many bars form levels, so this stays bounded.
 
 f_book() =>
     var array<float> p = array.new<float>()   // frozen identity price (wick)
@@ -121,11 +122,25 @@ f_book() =>
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 2 · FETCH FROZEN BOOKS (one security call per TF) + chart-independent ATR
+//
+//     RE10139 fix for high chart timeframes: request.security() of a timeframe
+//     BELOW the chart TF forces the in-security book to replay that lower TF's
+//     ENTIRE history (≈6× the chart bars on a 1D chart for the 4H book, ≈30× on
+//     1W) — which exhausts memory on 1D/1W even though intraday charts are fine.
+//     So a book is only BUILT-and-MERGED when its native TF is ≥ the chart TF;
+//     otherwise its request is clamped to the chart TF (a cheap same-TF call) and
+//     the book is dropped from the union (use=false). You never need sub-chart
+//     S/R levels on a higher chart anyway. The freeze/replay test is a SAME-chart
+//     invariant, so dropping sub-chart books does not affect it.
 // ═══════════════════════════════════════════════════════════════════════════
-[wP,  wB,  wS,  wT,  wK,  wBT]  = request.security(syminfo.tickerid, "W",   f_book(), lookahead = barmerge.lookahead_off)
-[dP,  dB,  dS,  dT,  dK,  dBT]  = request.security(syminfo.tickerid, "D",   f_book(), lookahead = barmerge.lookahead_off)
-[h4P, h4B, h4S, h4T, h4K, h4BT] = request.security(syminfo.tickerid, "240", f_book(), lookahead = barmerge.lookahead_off)
-atrD = request.security(syminfo.tickerid, "D", ta.atr(14), lookahead = barmerge.lookahead_off)
+f_reqtf(string tf) => timeframe.in_seconds(tf) < timeframe.in_seconds() ? timeframe.period : tf
+useW  = timeframe.in_seconds("W")   >= timeframe.in_seconds()
+useD  = timeframe.in_seconds("D")   >= timeframe.in_seconds()
+use4  = timeframe.in_seconds("240") >= timeframe.in_seconds()
+[wP,  wB,  wS,  wT,  wK,  wBT]  = request.security(syminfo.tickerid, f_reqtf("W"),   f_book(), lookahead = barmerge.lookahead_off)
+[dP,  dB,  dS,  dT,  dK,  dBT]  = request.security(syminfo.tickerid, f_reqtf("D"),   f_book(), lookahead = barmerge.lookahead_off)
+[h4P, h4B, h4S, h4T, h4K, h4BT] = request.security(syminfo.tickerid, f_reqtf("240"), f_book(), lookahead = barmerge.lookahead_off)
+atrD = request.security(syminfo.tickerid, f_reqtf("D"), ta.atr(14), lookahead = barmerge.lookahead_off)
 atrRef = na(atrD) or atrD <= 0 ? close * 0.005 : atrD
 // Chart-INDEPENDENT "today 00:00" anchor: the current daily bar's open time is
 // the same timestamp on every chart resolution — the base for the canonical window.
@@ -177,9 +192,9 @@ f_ingest(bool use, array<float> p, array<float> b, array<int> s, array<float> t,
             Dtf.push(tf), Dbk.push(k.get(i)), Dkey.push(key), Dbt.push(bt.get(i))
 
 Dp.clear(), Db.clear(), Ds.clear(), Dr.clear(), Dt.clear(), Dtf.clear(), Dbk.clear(), Dkey.clear(), Dbt.clear()
-f_ingest(true, wP,  wB,  wS,  wT,  wK,  wBT,  1.00, 3)
-f_ingest(true, dP,  dB,  dS,  dT,  dK,  dBT,  0.80, 2)
-f_ingest(true, h4P, h4B, h4S, h4T, h4K, h4BT, 0.60, 1)
+f_ingest(useW, wP,  wB,  wS,  wT,  wK,  wBT,  1.00, 3)
+f_ingest(useD, dP,  dB,  dS,  dT,  dK,  dBT,  0.80, 2)
+f_ingest(use4, h4P, h4B, h4S, h4T, h4K, h4BT, 0.60, 1)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 4 · POWER LINE — one controlling level, chosen ONLY from the database
