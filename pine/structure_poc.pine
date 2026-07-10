@@ -22,18 +22,19 @@
 
 //@version=6
 indicator("IA-Structure · Market Structure Engine POC", "IA-Struct", overlay = true,
-     max_lines_count = 300, max_labels_count = 300, max_bars_back = 120,
-     calc_bars_count = 2500)
-// calc_bars_count caps the script to the most recent 2500 chart bars, bounding both
-// memory and the number of structure points formed so the per-TF book stays under
-// MAXPT (no frozen-window point is evicted → the A=B=C freeze test stays valid).
-// 2500 bars spans the 1200-bar freeze window with warm-up to spare on any chart.
+     max_lines_count = 300, max_labels_count = 300, max_bars_back = 80,
+     calc_bars_count = 1600)
+// calc_bars_count caps the script to the most recent 1600 chart bars. This bounds
+// BOTH memory (fewer bars → fewer points → smaller request.security arrays, so it
+// runs on every timeframe) AND the number of points formed, so the per-TF book
+// stays under MAXPT and no frozen-window point is ever evicted → A=B=C stays valid.
+// 1600 > the 1200-bar freeze window with warm-up to spare.
 
 // ─── Structure detection ───────────────────────────────────────────────────
-pivLen  = input.int(5, "Pivot length (swing bars each side)", minval = 2, maxval = 50, group = "Structure",
+pivLen  = input.int(5, "Pivot length (swing bars each side)", minval = 2, maxval = 30, group = "Structure",
      tooltip = "Institutional swing sensitivity — the pivot leg length. A swing high/low is confirmed when a CLOSE is the highest/lowest close across pivLen bars on each side. Larger = fewer, bigger structure points; smaller = more, finer ones. Detection input — changing it re-detects structure and changes the hash. (Swings are still taken from CLOSES, never wicks.)")
 MINDIST = 0.50   // min structure distance from last same-side point (× ATR) — frozen
-MAXPT   = 300    // per-TF structure cap. Must exceed points formed within calc_bars_count so a
+MAXPT   = 600    // per-TF structure cap. Must exceed points formed within calc_bars_count so a
                  // frozen-window point is NEVER evicted (eviction would break the A=B=C freeze).
 
 // ─── Display (read-only — must never change the database) ──────────────────
