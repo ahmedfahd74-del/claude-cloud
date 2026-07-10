@@ -21,7 +21,7 @@
 
 //@version=6
 indicator("IA-Structure · Market Structure Engine POC", "IA-Struct", overlay = true,
-     max_lines_count = 300, max_labels_count = 300, max_bars_back = 300,
+     max_lines_count = 300, max_labels_count = 300, max_bars_back = 100,
      calc_bars_count = 5000)
 // calc_bars_count caps the script to the most recent 5000 chart bars. Forex symbols
 // carry decades of history (crypto far less), so an ungated script processes an
@@ -35,7 +35,7 @@ indicator("IA-Structure · Market Structure Engine POC", "IA-Struct", overlay = 
 revSens = input.float(1.5, "Swing strength (reversal × ATR)", minval = 0.3, maxval = 5.0, step = 0.1, group = "Structure",
      tooltip = "How far a CLOSE must reverse against a leg's extreme (in ATR) to confirm a swing. Higher = fewer, larger institutional swings. Detection input — changing it re-detects structure and changes the hash.")
 MINDIST = 0.50   // min structure distance from last same-side point (× ATR) — frozen
-MAXPT   = 200    // per-TF structure cap (bounds in-security memory; union retains history)
+MAXPT   = 100    // per-TF structure cap (trimmed to shrink request.security array memory — RE10139)
 
 // ─── Display (read-only — must never change the database) ──────────────────
 showHH   = input.bool(true, "HH", inline = "t", group = "Display")
