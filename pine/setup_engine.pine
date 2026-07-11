@@ -41,11 +41,28 @@ showLL   = input.bool(true, "LL", inline = "t", group = "Display")
 extOnly  = input.bool(false, "External swings only", group = "Display",
      tooltip = "Hide internal (minor) structure; show only major external swings.")
 markSW   = input.bool(true, "Mark strong/weak (● strong · ○ weak)", group = "Display")
-showBreaks = input.bool(true, "Show BOS / CHoCH / MSS", group = "Display")
 maxPts   = input.int(8, "Max labels per side", minval = 1, maxval = 60, group = "Display")
 lblSizeS = input.string("Small", "Label size", options = ["Tiny", "Small", "Normal"], group = "Display")
 colBull  = input.color(#26a69a, "Bullish structure (HH/HL)", group = "Display")
 colBear  = input.color(#ef5350, "Bearish structure (LH/LL)", group = "Display")
+
+// ─── Pivot lines ────────────────────────────────────────────────────────────
+gPiv     = "Pivot lines"
+showPivLines = input.bool(false, "Show pivot-point lines", group = gPiv,
+     tooltip = "Draw a horizontal line at each shown swing point (HH/HL/LH/LL).")
+pivExt   = input.string("Right", "Pivot line extend", options = ["None", "Left", "Right", "Both"], group = gPiv)
+pivStyleS= input.string("Dotted", "Pivot line style", options = ["Solid", "Dashed", "Dotted"], group = gPiv)
+pivWid   = input.int(1, "Pivot line width", minval = 1, maxval = 4, group = gPiv)
+
+// ─── Break lines (BOS / CHoCH / MSS) — internal vs external, own extend ──────
+gBrk     = "Break lines (BOS / CHoCH / MSS)"
+showBOS   = input.bool(true, "BOS",   inline = "b1", group = gBrk)
+showChoCH = input.bool(true, "CHoCH", inline = "b1", group = gBrk)
+showMSS   = input.bool(true, "MSS",   inline = "b1", group = gBrk)
+showBrkExt = input.bool(true, "External (major)", inline = "b2", group = gBrk)
+showBrkInt = input.bool(false, "Internal (minor)", inline = "b2", group = gBrk)
+brkExt   = input.string("Right", "Break line extend", options = ["None", "Left", "Right", "Both"], group = gBrk)
+brkLineLen = input.int(3, "Break tick length (bars, when extend = None)", minval = 1, maxval = 50, group = gBrk)
 
 // ─── Liquidity Map (spec §2) — the actionable levels the Power Line snaps to ──
 gLiq     = "Liquidity Map"
@@ -98,6 +115,7 @@ var array<int>   eBar = array.new<int>()
 var array<int>   eBt  = array.new<int>()
 var array<int>   eKind= array.new<int>()       // 0 BOS · 1 CHoCH · 2 MSS
 var array<int>   eDir = array.new<int>()       // +1 bull · -1 bear
+var array<bool>  eExt = array.new<bool>()      // true = external (major) · false = internal
 MAXEVT = 300
 
 atr = ta.atr(atrLen)
@@ -110,69 +128,61 @@ pBr = bar_index[pivotLen]
 
 f_strength(float legMove) => int(math.round(50.0 + 50.0 * math.min(1.0, legMove / (extSwingATR * atr * 2.0))))
 
+bullBreak = false
+bearBreak = false
 if barstate.isconfirmed
-    // 1a · register a new swing HIGH
+    // 1a · register a new swing HIGH. A HIGHER HIGH (ty == HH) is a bullish structural
+    //      break (BOS with trend, CHoCH/MSS against); an LH is just a pullback high.
+    //      The DOMINANT trend follows the EXTERNAL HH/LL sequence, so it always agrees
+    //      with the HH/HL/LH/LL labels on every timeframe (weekly LH/LL → bearish,
+    //      daily HH → bullish). protHigh/protLow are still tracked for the entry engine.
     if not na(ph) and pRange >= noiseATR * atr
         okDist = na(prevSwingHigh) or math.abs(ph - prevSwingHigh) >= minSwingATR * atr
         if okDist
             isExt = na(extLo) or math.abs(ph - extLo) >= extSwingATR * atr
+            brokeLvl = prevSwingHigh
             ty = na(prevSwingHigh) or ph > prevSwingHigh ? 0 : 2      // HH or LH
             legMove = na(extLo) ? extSwingATR * atr : math.abs(ph - extLo)
             sP.push(ph), sTy.push(ty), sBt.push(pBt), sBar.push(pBr), sExt.push(isExt)
             sStr.push(f_strength(legMove)), sState.push(0), sBroken.push(false)
             prevSwingHigh := ph
             if isExt
-                // a new external high arms the PROTECTED LOW (the low it left behind)
-                // and becomes the running external high. protHigh only moves on a new
-                // external LOW (§1b) — so bounce highs never lower the bull trigger.
                 if not na(extLo)
                     protLow := extLo
                 extHi := ph
-    // 1b · register a new swing LOW
+            // structural break on a HIGHER HIGH
+            if ty == 0 and not na(brokeLvl)
+                againstT = trend < 0
+                disp = legMove >= dispRngATR * atr
+                kind = againstT ? (disp ? 2 : 1) : 0                  // MSS/CHoCH vs BOS
+                eLv.push(brokeLvl), eBar.push(bar_index), eBt.push(pBt), eKind.push(kind), eDir.push(1), eExt.push(isExt)
+                if isExt
+                    trend := 1
+                    bullBreak := true
+    // 1b · register a new swing LOW. A LOWER LOW (LL) is a bearish structural break.
     if not na(pl) and pRange >= noiseATR * atr
         okDist = na(prevSwingLow) or math.abs(pl - prevSwingLow) >= minSwingATR * atr
         if okDist
             isExt = na(extHi) or math.abs(pl - extHi) >= extSwingATR * atr
+            brokeLvl = prevSwingLow
             ty = na(prevSwingLow) or pl < prevSwingLow ? 3 : 1        // LL or HL
             legMove = na(extHi) ? extSwingATR * atr : math.abs(pl - extHi)
             sP.push(pl), sTy.push(ty), sBt.push(pBt), sBar.push(pBr), sExt.push(isExt)
             sStr.push(f_strength(legMove)), sState.push(0), sBroken.push(false)
             prevSwingLow := pl
             if isExt
-                // a new external low arms the PROTECTED HIGH (the high it left behind)
-                // and becomes the running external low. protLow only moves on a new
-                // external HIGH — so pullback lows never raise the bear trigger.
                 if not na(extHi)
                     protHigh := extHi
                 extLo := pl
-
-    // 1c · BOS / CHoCH / MSS on the confirmed close vs the PROTECTED levels. Because
-    //      protHigh only steps down on a new external LOW (not on bounce highs) and
-    //      protLow only steps up on a new external HIGH, a downtrend keeps making lower
-    //      lows (bearish BOS) and a shallow bounce cannot flip it — the bull trigger
-    //      stays pinned at the protected high. A countertrend break flips the dominant
-    //      trend only with displacement (MSS); a plain CHoCH is labelled but does not
-    //      flip. Each protected level is consumed on break and re-armed by the next
-    //      opposite external swing, so the trend can never get "stuck".
-    dispOK = math.abs(close - open) >= dispBodyATR * atr or (high - low) >= dispRngATR * atr
-    bullBreak = false
-    bearBreak = false
-    if not na(protHigh) and close > protHigh
-        against = trend < 0
-        if not against or dispOK
-            kind = against ? (dispOK ? 2 : 1) : 0                      // CHoCH/MSS vs BOS
-            eLv.push(protHigh), eBar.push(bar_index), eBt.push(time), eKind.push(kind), eDir.push(1)
-            trend := 1
-            protHigh := na
-            bullBreak := true
-    if not na(protLow) and close < protLow
-        against = trend > 0
-        if not against or dispOK
-            kind = against ? (dispOK ? 2 : 1) : 0
-            eLv.push(protLow), eBar.push(bar_index), eBt.push(time), eKind.push(kind), eDir.push(-1)
-            trend := -1
-            protLow := na
-            bearBreak := true
+            // structural break on a LOWER LOW
+            if ty == 3 and not na(brokeLvl)
+                againstT = trend > 0
+                disp = legMove >= dispRngATR * atr
+                kind = againstT ? (disp ? 2 : 1) : 0
+                eLv.push(brokeLvl), eBar.push(bar_index), eBt.push(pBt), eKind.push(kind), eDir.push(-1), eExt.push(isExt)
+                if isExt
+                    trend := -1
+                    bearBreak := true
 
     // 1d · strong/weak maintenance (LIVE): a high taken by a close → weak; unbroken
     //      highs at a bearish break → strong (mirror for lows). Identity never changes.
@@ -193,7 +203,7 @@ if barstate.isconfirmed
         sP.remove(0), sTy.remove(0), sBt.remove(0), sBar.remove(0), sExt.remove(0)
         sStr.remove(0), sState.remove(0), sBroken.remove(0)
     if eLv.size() > MAXEVT
-        eLv.remove(0), eBar.remove(0), eBt.remove(0), eKind.remove(0), eDir.remove(0)
+        eLv.remove(0), eBar.remove(0), eBt.remove(0), eKind.remove(0), eDir.remove(0), eExt.remove(0)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 2 · IDENTITY HASH (canonical window) + BAND-BASED FREEZE / REPLAY TEST
@@ -393,6 +403,12 @@ f_tyname(int t) => t == 0 ? "HH" : t == 1 ? "HL" : t == 2 ? "LH" : "LL"
 f_tyshow(int t) => t == 0 ? showHH : t == 1 ? showHL : t == 2 ? showLH : showLL
 f_tycol(int t)  => (t == 0 or t == 1) ? colBull : colBear
 lblSize = lblSizeS == "Normal" ? size.normal : lblSizeS == "Tiny" ? size.tiny : size.small
+f_ext(string s)    => s == "Both" ? extend.both : s == "Left" ? extend.left : s == "Right" ? extend.right : extend.none
+f_lstyle(string s) => s == "Dashed" ? line.style_dashed : s == "Dotted" ? line.style_dotted : line.style_solid
+pivStyle = f_lstyle(pivStyleS)
+pivExtV  = f_ext(pivExt)
+brkExtV  = f_ext(brkExt)
+f_kindShow(int k) => k == 0 ? showBOS : k == 1 ? showChoCH : showMSS
 
 var array<label> drawn = array.new<label>()
 var array<line>  drawnB = array.new<line>()
@@ -427,6 +443,7 @@ if barstate.islast
         tmpLo.sort(order.descending)
         cutLo := tmpLo.get(maxPts - 1)
 
+    tfMs = timeframe.in_seconds() * 1000
     if n > 0
         for i = 0 to n - 1
             ty = sTy.get(i)
@@ -439,23 +456,28 @@ if barstate.islast
                 drawn.push(label.new(sBt.get(i), sP.get(i), txt, xloc = xloc.bar_time, yloc = yloc.price,
                      style = isHi ? label.style_label_down : label.style_label_up,
                      color = color.new(col, sExt.get(i) ? 0 : 45), textcolor = color.white, size = lblSize))
+                // optional pivot-point line at the swing price (own extend / style)
+                if showPivLines
+                    drawnB.push(line.new(sBt.get(i), sP.get(i), sBt.get(i) + tfMs, sP.get(i), xloc = xloc.bar_time,
+                         extend = pivExtV, color = color.new(col, sExt.get(i) ? 30 : 55), width = pivWid, style = pivStyle))
 
-    if showBreaks and eLv.size() > 0
-        tfMs = timeframe.in_seconds() * 1000
-        show = math.min(eLv.size(), 30)
+    // Break lines — filtered by type (BOS/CHoCH/MSS) AND degree (internal/external)
+    if eLv.size() > 0
+        show = math.min(eLv.size(), 40)
         for j = eLv.size() - show to eLv.size() - 1
             k = eKind.get(j)
-            dir = eDir.get(j)
-            kcol = k == 2 ? color.yellow : dir > 0 ? colBull : colBear
-            ktxt = (k == 0 ? "BOS" : k == 1 ? "CHoCH" : "MSS")
-            // xloc.bar_time (not bar_index) so a break far from the current bar can't
-            // trip RE10026; a short ±3-bar tick marks the broken level.
-            ln = line.new(eBt.get(j) - 3 * tfMs, eLv.get(j), eBt.get(j) + 3 * tfMs, eLv.get(j),
-                 xloc = xloc.bar_time, color = kcol, width = 1, style = k == 0 ? line.style_solid : line.style_dashed)
-            drawnB.push(ln)
-            drawn.push(label.new(eBt.get(j), eLv.get(j), ktxt, xloc = xloc.bar_time, yloc = yloc.price,
-                 style = dir > 0 ? label.style_label_up : label.style_label_down,
-                 color = color.new(kcol, 20), textcolor = color.black, size = size.tiny))
+            ext = eExt.get(j)
+            if f_kindShow(k) and (ext ? showBrkExt : showBrkInt)
+                dir = eDir.get(j)
+                kcol = k == 2 ? color.yellow : dir > 0 ? colBull : colBear
+                ktxt = (k == 0 ? "BOS" : k == 1 ? "CHoCH" : "MSS") + (ext ? "" : "·")
+                x2 = brkExtV == extend.none ? eBt.get(j) + brkLineLen * tfMs : eBt.get(j) + tfMs
+                drawnB.push(line.new(eBt.get(j), eLv.get(j), x2, eLv.get(j), xloc = xloc.bar_time,
+                     extend = brkExtV, color = color.new(kcol, ext ? 0 : 40), width = ext ? 1 : 1,
+                     style = k == 0 ? line.style_solid : line.style_dashed))
+                drawn.push(label.new(eBt.get(j), eLv.get(j), ktxt, xloc = xloc.bar_time, yloc = yloc.price,
+                     style = dir > 0 ? label.style_label_up : label.style_label_down,
+                     color = color.new(kcol, ext ? 20 : 50), textcolor = color.black, size = size.tiny))
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 4 · DEBUG PANEL — hash · trend · counts · freeze test (band)
