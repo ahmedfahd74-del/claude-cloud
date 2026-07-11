@@ -47,7 +47,7 @@ preSel   = assetPre == "Auto" ? preAuto : assetPre
 // per-asset defaults: [sweepATR, dispBody, dispRange, volMult]
 pSweep   = preSel == "Forex" ? 0.20 : preSel == "Gold" ? 0.25 : preSel == "Indices" ? 0.25 : 0.30
 pBody    = preSel == "Forex" ? 0.50 : preSel == "Gold" ? 0.55 : preSel == "Indices" ? 0.55 : 0.60
-pRange   = preSel == "Forex" ? 0.90 : preSel == "Gold" ? 1.00 : preSel == "Indices" ? 1.00 : 1.10
+pDispR   = preSel == "Forex" ? 0.90 : preSel == "Gold" ? 1.00 : preSel == "Indices" ? 1.00 : 1.10
 pVol     = preSel == "Indices" ? 1.40 : 1.50
 
 // ─── Liquidity sweep (spec §2 sweep) ────────────────────────────────────────
@@ -68,7 +68,7 @@ gDsp     = "Displacement quality"
 dispBodyM= input.float(0.0, "Body (× ATR, 0 = preset)", minval = 0.0, maxval = 5.0, step = 0.05, inline = "d1", group = gDsp)
 dispRngM = input.float(0.0, "Range (× ATR, 0 = preset)", minval = 0.0, maxval = 6.0, step = 0.05, inline = "d1", group = gDsp)
 dBody    = dispBodyM > 0 ? dispBodyM : pBody
-dRange   = dispRngM  > 0 ? dispRngM  : pRange
+dRange   = dispRngM  > 0 ? dispRngM  : pDispR
 impSeq   = input.int(2, "Consecutive impulse candles", minval = 1, maxval = 5, group = gDsp)
 bodyDom  = input.float(0.60, "Body dominance (body/range ≥)", minval = 0.1, maxval = 1.0, step = 0.05, group = gDsp)
 closeFrac= input.float(0.66, "Close at extreme (fraction)", minval = 0.1, maxval = 1.0, step = 0.02, group = gDsp)
