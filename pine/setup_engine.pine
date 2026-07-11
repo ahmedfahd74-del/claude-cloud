@@ -64,21 +64,86 @@ showBrkInt = input.bool(false, "Internal (minor)", inline = "b2", group = gBrk)
 brkExt   = input.string("Right", "Break line extend", options = ["None", "Left", "Right", "Both"], group = gBrk)
 brkLineLen = input.int(3, "Break tick length (bars, when extend = None)", minval = 1, maxval = 50, group = gBrk)
 
-// ─── Liquidity Map (spec §2) — the actionable levels the Power Line snaps to ──
-gLiq     = "Liquidity Map"
-showLiq  = input.bool(true, "Show liquidity map", group = gLiq)
-showPDW  = input.bool(true, "Prev day / week H-L (PDH/PDL/PWH/PWL)", group = gLiq)
-showEQ   = input.bool(true, "Equal highs / lows (EQH/EQL)", group = gLiq)
-showSess = input.bool(true, "Session highs / lows (London / NY)", group = gLiq)
-showSwLiq= input.bool(false, "Swing-liquidity pools (BSL/SSL)", group = gLiq)
-eqTol    = input.float(0.10, "Equal H/L tolerance (× ATR)", minval = 0.0, maxval = 2.0, step = 0.02, group = gLiq,
-     tooltip = "Two same-side swings within this × ATR are treated as EQUAL (a stacked liquidity pool — EQH/EQL).")
-sessLon  = input.session("0700-1600", "London session (exchange tz)", group = gLiq)
-sessNY   = input.session("1200-2100", "New York session (exchange tz)", group = gLiq)
-powerTol = input.float(0.50, "Power-Line tolerance (× daily ATR)", minval = 0.1, maxval = 10.0, step = 0.1, group = gLiq,
-     tooltip = "The Power Line = the nearest liquidity level to price. It reads AT LEVEL when price is within this × daily-ATR of it (spec §5 confluence).")
-colBSL   = input.color(#ef5350, "Buy-side liquidity (above price)", group = gLiq)
-colSSL   = input.color(#26a69a, "Sell-side liquidity (below price)", group = gLiq)
+// ═══ LIQUIDITY MAP — visual customization is per-group and NEVER alters a level's
+//     calculated price (calc/visual separation). Each group has its own section. ══
+gLM      = "Liquidity Map · Global"
+showLiq  = input.bool(true, "Show liquidity map (master switch)", group = gLM)
+lblPosS  = input.string("Right", "Label position (all groups)", options = ["Left", "Right"], group = gLM)
+powerTol = input.float(0.50, "Power-Line tolerance (× daily ATR)", minval = 0.1, maxval = 10.0, step = 0.1, group = gLM,
+     tooltip = "The Power Line = the nearest liquidity level to price. AT LEVEL when price is within this × daily-ATR of it.")
+eqTol    = input.float(0.10, "Equal H/L tolerance (× ATR)", minval = 0.0, maxval = 2.0, step = 0.02, group = gLM,
+     tooltip = "Two same-side external swings within this × ATR are treated as EQUAL (stacked liquidity — EQH/EQL).")
+
+// Prior Day (PDH / PDL)
+gPD  = "LIQ · Previous Day"
+pdOn = input.bool(true,  "Show PDH / PDL", group = gPD)
+pdC  = input.color(#ffb300, "Color", inline = "pd", group = gPD)
+pdSt = input.string("Solid", "Style", options = ["Solid", "Dashed", "Dotted"], inline = "pd", group = gPD)
+pdW  = input.int(1, "Width", minval = 1, maxval = 4, inline = "pd", group = gPD)
+pdTr = input.int(0, "Transparency", minval = 0, maxval = 100, inline = "pd2", group = gPD)
+pdEx = input.string("Right", "Extend", options = ["None", "Left", "Right", "Both"], inline = "pd2", group = gPD)
+pdLb = input.bool(true, "Label", inline = "pd3", group = gPD)
+pdLz = input.string("Small", "Label size", options = ["Tiny", "Small", "Normal"], inline = "pd3", group = gPD)
+pdPr = input.int(8, "Draw priority (1 low → 10 top)", minval = 1, maxval = 10, group = gPD)
+
+// Prior Week (PWH / PWL)
+gPW  = "LIQ · Previous Week"
+pwOn = input.bool(true,  "Show PWH / PWL", group = gPW)
+pwC  = input.color(#ff6d00, "Color", inline = "pw", group = gPW)
+pwSt = input.string("Solid", "Style", options = ["Solid", "Dashed", "Dotted"], inline = "pw", group = gPW)
+pwW  = input.int(2, "Width", minval = 1, maxval = 4, inline = "pw", group = gPW)
+pwTr = input.int(0, "Transparency", minval = 0, maxval = 100, inline = "pw2", group = gPW)
+pwEx = input.string("Right", "Extend", options = ["None", "Left", "Right", "Both"], inline = "pw2", group = gPW)
+pwLb = input.bool(true, "Label", inline = "pw3", group = gPW)
+pwLz = input.string("Small", "Label size", options = ["Tiny", "Small", "Normal"], inline = "pw3", group = gPW)
+pwPr = input.int(9, "Draw priority (1 low → 10 top)", minval = 1, maxval = 10, group = gPW)
+
+// Sessions (London / New York / Asian / Sydney) — per-session enable+color+time, shared style
+gSe  = "LIQ · Sessions"
+loOn = input.bool(true,  "London",   inline = "s1", group = gSe)
+loTm = input.session("0800-1600", "", inline = "s1", group = gSe)
+loC  = input.color(#42a5f5, "", inline = "s1", group = gSe)
+nyOn = input.bool(true,  "New York", inline = "s2", group = gSe)
+nyTm = input.session("1300-2100", "", inline = "s2", group = gSe)
+nyC  = input.color(#ab47bc, "", inline = "s2", group = gSe)
+asOn = input.bool(false, "Asian",    inline = "s3", group = gSe)
+asTm = input.session("0000-0800", "", inline = "s3", group = gSe)
+asC  = input.color(#26c6da, "", inline = "s3", group = gSe)
+syOn = input.bool(false, "Sydney",   inline = "s4", group = gSe)
+syTm = input.session("2100-0600", "", inline = "s4", group = gSe)
+syC  = input.color(#9ccc65, "", inline = "s4", group = gSe)
+seSt = input.string("Dashed", "Style", options = ["Solid", "Dashed", "Dotted"], inline = "s5", group = gSe)
+seW  = input.int(1, "Width", minval = 1, maxval = 4, inline = "s5", group = gSe)
+seTr = input.int(10, "Transparency", minval = 0, maxval = 100, inline = "s6", group = gSe)
+seEx = input.string("Right", "Extend", options = ["None", "Left", "Right", "Both"], inline = "s6", group = gSe)
+seLb = input.bool(true, "Label", inline = "s7", group = gSe)
+seLz = input.string("Tiny", "Label size", options = ["Tiny", "Small", "Normal"], inline = "s7", group = gSe)
+sePr = input.int(5, "Draw priority (1 low → 10 top)", minval = 1, maxval = 10, group = gSe)
+
+// Equal Highs / Lows (EQH / EQL)
+gEQ  = "LIQ · Equal Highs / Lows"
+eqOn = input.bool(true,  "Show EQH / EQL", group = gEQ)
+eqC  = input.color(#ec407a, "Color", inline = "eq", group = gEQ)
+eqSt = input.string("Dotted", "Style", options = ["Solid", "Dashed", "Dotted"], inline = "eq", group = gEQ)
+eqW  = input.int(1, "Width", minval = 1, maxval = 4, inline = "eq", group = gEQ)
+eqTr = input.int(0, "Transparency", minval = 0, maxval = 100, inline = "eq2", group = gEQ)
+eqEx = input.string("Right", "Extend", options = ["None", "Left", "Right", "Both"], inline = "eq2", group = gEQ)
+eqLb = input.bool(true, "Label", inline = "eq3", group = gEQ)
+eqLz = input.string("Small", "Label size", options = ["Tiny", "Small", "Normal"], inline = "eq3", group = gEQ)
+eqPr = input.int(7, "Draw priority (1 low → 10 top)", minval = 1, maxval = 10, group = gEQ)
+
+// Swing liquidity (BSL above / SSL below)
+gSw  = "LIQ · Swing liquidity (BSL/SSL)"
+swOn = input.bool(false, "Show BSL / SSL", group = gSw)
+swCb = input.color(#ef5350, "BSL color", inline = "sw", group = gSw)
+swCs = input.color(#26a69a, "SSL color", inline = "sw", group = gSw)
+swSt = input.string("Dotted", "Style", options = ["Solid", "Dashed", "Dotted"], inline = "sw2", group = gSw)
+swW  = input.int(1, "Width", minval = 1, maxval = 4, inline = "sw2", group = gSw)
+swTr = input.int(30, "Transparency", minval = 0, maxval = 100, inline = "sw3", group = gSw)
+swEx = input.string("Right", "Extend", options = ["None", "Left", "Right", "Both"], inline = "sw3", group = gSw)
+swLb = input.bool(true, "Label", inline = "sw4", group = gSw)
+swLz = input.string("Tiny", "Label size", options = ["Tiny", "Small", "Normal"], inline = "sw4", group = gSw)
+swPr = input.int(4, "Draw priority (1 low → 10 top)", minval = 1, maxval = 10, group = gSw)
 
 // ─── Validation (proof instruments — affect only the debug panel) ───────────
 canonBars  = input.int(500, "Canonical hash window (bars)", minval = 50, group = "Validation",
@@ -88,6 +153,10 @@ bandBars   = input.int(300, "Freeze band width (bars)", minval = 50, maxval = 10
      tooltip = "The freeze test hashes points born in the fixed band [last−windowBars−bandBars, last−windowBars]. A bounded band is immune to book aging, so A=B=C holds on every timeframe (fixes the 3m/15m FAIL).")
 
 PRIME = 99999989
+
+// shared line helpers (used by the liquidity map and the structure renderer)
+f_ext(string s)    => s == "Both" ? extend.both : s == "Left" ? extend.left : s == "Right" ? extend.right : extend.none
+f_lstyle(string s) => s == "Dashed" ? line.style_dashed : s == "Dotted" ? line.style_dotted : line.style_solid
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 1 · STRUCTURE DETECTION — pivots detect, filters decide. Confirmed close only.
@@ -267,40 +336,62 @@ if sP.size() > 0
 //      far-off HTF pivot). Determinism: all levels are prior-bar / confirmed
 //      values via lookahead-off security or frozen swings — never the live bar.
 // ═══════════════════════════════════════════════════════════════════════════
-// Prior day / week high-low (scalar HTF request → cheap on any chart TF)
+// CALCULATION — every level's PRICE is a prior-bar / confirmed / frozen value
+// (never the live bar); ANCHOR TIME points to the originating candle/session.
+// Prior day / week: price and anchor (previous bar's high/low and open time) are
+// pulled with lookahead_off, so they are identical on every chart timeframe.
 pdh = request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_off)
 pdl = request.security(syminfo.tickerid, "D", low[1],  lookahead = barmerge.lookahead_off)
+pdA = request.security(syminfo.tickerid, "D", time[1], lookahead = barmerge.lookahead_off)   // prev-day start
 pwh = request.security(syminfo.tickerid, "W", high[1], lookahead = barmerge.lookahead_off)
 pwl = request.security(syminfo.tickerid, "W", low[1],  lookahead = barmerge.lookahead_off)
+pwA = request.security(syminfo.tickerid, "W", time[1], lookahead = barmerge.lookahead_off)   // prev-week start
 atrDaily = request.security(syminfo.tickerid, "D", ta.atr(14), lookahead = barmerge.lookahead_off)
 atrRef = na(atrDaily) or atrDaily <= 0 ? atr : atrDaily
 
-// Session highs/lows — current forms live; PREVIOUS is frozen when the session ends
+// Session highs/lows — the extreme and the TIME it printed are tracked live and
+// FROZEN when the session closes (previous session). Anchor = the extreme's candle.
 f_sess(simple string s) =>
     var float hi = na
     var float lo = na
-    var float phi = na    // previous (frozen) session high
+    var int   hiT = na
+    var int   loT = na
+    var float phi = na
     var float plo = na
+    var int   phiT = na
+    var int   ploT = na
     inS = not na(time(timeframe.period, s, syminfo.timezone))
     if inS and not inS[1]
         hi := high
         lo := low
+        hiT := time
+        loT := time
     else if inS
-        hi := math.max(hi, high)
-        lo := math.min(lo, low)
+        if high > hi
+            hi := high
+            hiT := time
+        if low < lo
+            lo := low
+            loT := time
     if not inS and inS[1]
         phi := hi
         plo := lo
-    [phi, plo]
-[lonH, lonL] = f_sess(sessLon)
-[nyH,  nyL]  = f_sess(sessNY)
+        phiT := hiT
+        ploT := loT
+    [phi, plo, phiT, ploT]
+[lonH, lonL, lonHT, lonLT] = f_sess(loTm)
+[nyH,  nyL,  nyHT,  nyLT ] = f_sess(nyTm)
+[asH,  asL,  asHT,  asLT ] = f_sess(asTm)
+[syH,  syL,  syHT,  syLT ] = f_sess(syTm)
 
-// Equal highs / lows — scan external swings for same-side levels within eqTol×ATR
+// Equal highs / lows — two same-side external swings within eqTol×ATR; anchor = the
+// EARLIER swing's candle (where the pool originated).
 f_hasEqual(int side) =>       // side 1 = highs, 0 = lows
     found = false
     price = 0.0
+    anchor = 0
     if sP.size() > 1
-        for i = sP.size() - 1 to math.max(1, sP.size() - 20)   // recent swings only
+        for i = sP.size() - 1 to math.max(1, sP.size() - 20)
             hi = sTy.get(i) == 0 or sTy.get(i) == 2
             match = side == 1 ? hi : not hi
             if match and sExt.get(i) and not found
@@ -311,13 +402,17 @@ f_hasEqual(int side) =>       // side 1 = highs, 0 = lows
                     if mj and sExt.get(j) and not found and math.abs(sP.get(i) - sP.get(j)) <= eqTol * atr
                         found := true
                         price := side == 1 ? math.max(sP.get(i), sP.get(j)) : math.min(sP.get(i), sP.get(j))
-    [found, price]
-[hasEQH, eqhP] = f_hasEqual(1)
-[hasEQL, eqlP] = f_hasEqual(0)
+                        anchor := math.min(sBt.get(i), sBt.get(j))
+    [found, price, anchor]
+[hasEQH, eqhP, eqhA] = f_hasEqual(1)
+[hasEQL, eqlP, eqlA] = f_hasEqual(0)
 
-// Nearest swing-liquidity above / below (unbroken external swings)
-swBSL = float(na)      // nearest unbroken external high above price
+// Nearest unbroken external swing above / below price = swing liquidity; anchor =
+// that swing's own candle.
+swBSL = float(na)
 swSSL = float(na)
+swBSLa = 0
+swSSLa = 0
 if sP.size() > 0
     for i = 0 to sP.size() - 1
         if sExt.get(i) and not sBroken.get(i)
@@ -325,30 +420,41 @@ if sP.size() > 0
             hi = sTy.get(i) == 0 or sTy.get(i) == 2
             if hi and p > close and (na(swBSL) or p < swBSL)
                 swBSL := p
+                swBSLa := sBt.get(i)
             if not hi and p < close and (na(swSSL) or p > swSSL)
                 swSSL := p
+                swSSLa := sBt.get(i)
 
-// Assemble candidate levels into arrays (price, tag, enabled) and find the nearest
-// above (resistance liquidity) and below (support liquidity) = the Power Line pair.
+// Assemble levels: price, tag, anchor-time, group-id (drives per-group visuals).
+// Group ids: 0 PrevDay · 1 PrevWeek · 2 London · 3 NY · 4 Asian · 5 Sydney ·
+//            6 Equal · 7 Swing.
 var array<float>  Lp = array.new<float>()
 var array<string> Lt = array.new<string>()
-f_add(bool on, float p, string t) =>
+var array<int>    LaT= array.new<int>()
+var array<int>    Lg = array.new<int>()
+f_add(bool on, float p, string t, int at, int g) =>
     if on and not na(p)
-        Lp.push(p), Lt.push(t)
+        Lp.push(p), Lt.push(t), LaT.push(at), Lg.push(g)
 Lp.clear()
 Lt.clear()
-f_add(showPDW, pdh, "PDH")
-f_add(showPDW, pdl, "PDL")
-f_add(showPDW, pwh, "PWH")
-f_add(showPDW, pwl, "PWL")
-f_add(showSess, lonH, "LonH")
-f_add(showSess, lonL, "LonL")
-f_add(showSess, nyH, "NYH")
-f_add(showSess, nyL, "NYL")
-f_add(showEQ and hasEQH, eqhP, "EQH")
-f_add(showEQ and hasEQL, eqlP, "EQL")
-f_add(showSwLiq, swBSL, "BSL")
-f_add(showSwLiq, swSSL, "SSL")
+LaT.clear()
+Lg.clear()
+f_add(pdOn, pdh, "PDH", pdA, 0)
+f_add(pdOn, pdl, "PDL", pdA, 0)
+f_add(pwOn, pwh, "PWH", pwA, 1)
+f_add(pwOn, pwl, "PWL", pwA, 1)
+f_add(loOn, lonH, "London H", lonHT, 2)
+f_add(loOn, lonL, "London L", lonLT, 2)
+f_add(nyOn, nyH, "NY H", nyHT, 3)
+f_add(nyOn, nyL, "NY L", nyLT, 3)
+f_add(asOn, asH, "Asia H", asHT, 4)
+f_add(asOn, asL, "Asia L", asLT, 4)
+f_add(syOn, syH, "Sydney H", syHT, 5)
+f_add(syOn, syL, "Sydney L", syLT, 5)
+f_add(eqOn and hasEQH, eqhP, "EQH", eqhA, 6)
+f_add(eqOn and hasEQL, eqlP, "EQL", eqlA, 6)
+f_add(swOn, swBSL, "BSL", swBSLa, 7)
+f_add(swOn, swSSL, "SSL", swSSLa, 7)
 
 // Power Line = nearest level above and below price; PL1 = the closer of the two.
 plAbove = float(na)
@@ -372,7 +478,19 @@ pl1Dist = na(pl1) ? na : math.abs(close - pl1) / atrRef
 atLevel = not na(pl1Dist) and pl1Dist <= powerTol
 alertcondition(atLevel, "Price at Power Line", "Price is at the nearest liquidity level (Power Line)")
 
-// ── Liquidity renderer (read-only) ──────────────────────────────────────────
+// ── Per-group VISUAL settings (display only — never touches Lp price) ────────
+f_gCol(int g, bool above) => g == 0 ? pdC : g == 1 ? pwC : g == 2 ? loC : g == 3 ? nyC : g == 4 ? asC : g == 5 ? syC : g == 6 ? eqC : (above ? swCb : swCs)
+f_gStyS(int g) => g == 0 ? pdSt : g == 1 ? pwSt : (g >= 2 and g <= 5) ? seSt : g == 6 ? eqSt : swSt
+f_gW(int g)    => g == 0 ? pdW : g == 1 ? pwW : (g >= 2 and g <= 5) ? seW : g == 6 ? eqW : swW
+f_gTr(int g)   => g == 0 ? pdTr : g == 1 ? pwTr : (g >= 2 and g <= 5) ? seTr : g == 6 ? eqTr : swTr
+f_gExtS(int g) => g == 0 ? pdEx : g == 1 ? pwEx : (g >= 2 and g <= 5) ? seEx : g == 6 ? eqEx : swEx
+f_gLbl(int g)  => g == 0 ? pdLb : g == 1 ? pwLb : (g >= 2 and g <= 5) ? seLb : g == 6 ? eqLb : swLb
+f_gLzS(int g)  => g == 0 ? pdLz : g == 1 ? pwLz : (g >= 2 and g <= 5) ? seLz : g == 6 ? eqLz : swLz
+f_gPri(int g)  => g == 0 ? pdPr : g == 1 ? pwPr : (g >= 2 and g <= 5) ? sePr : g == 6 ? eqPr : swPr
+f_size(string s) => s == "Normal" ? size.normal : s == "Small" ? size.small : size.tiny
+
+// ── Liquidity renderer (read-only). Draws by ascending priority so higher-priority
+//    groups paint on top; each line anchored to its originating candle time. ──────
 var array<line>  liqLn = array.new<line>()
 var array<label> liqLb = array.new<label>()
 if barstate.islast and showLiq
@@ -382,19 +500,30 @@ if barstate.islast and showLiq
     if liqLb.size() > 0
         for i = 0 to liqLb.size() - 1
             label.delete(liqLb.get(i))
-    liqLn.clear(), liqLb.clear()
-    if Lp.size() > 0
-        for i = 0 to Lp.size() - 1
-            p = Lp.get(i)
-            above = p >= close
-            isPL = not na(pl1) and math.abs(p - pl1) < syminfo.mintick / 2
-            c = above ? colBSL : colSSL
-            liqLn.push(line.new(bar_index - 1, p, bar_index, p, extend = extend.right,
-                 color = color.new(c, isPL ? 0 : 55), width = isPL ? 2 : 1,
-                 style = isPL ? line.style_solid : line.style_dotted))
-            liqLb.push(label.new(bar_index + 3, p, Lt.get(i) + (isPL ? " ◄ PL" : ""), xloc = xloc.bar_index,
-                 style = label.style_label_left, color = color.new(c, isPL ? 0 : 35),
-                 textcolor = color.white, size = isPL ? size.small : size.tiny))
+    liqLn.clear()
+    liqLb.clear()
+    tfMs2 = timeframe.in_seconds() * 1000
+    for pr = 1 to 10
+        if Lp.size() > 0
+            for i = 0 to Lp.size() - 1
+                g = Lg.get(i)
+                if f_gPri(g) == pr
+                    p = Lp.get(i)
+                    above = p >= close
+                    isPL = not na(pl1) and math.abs(p - pl1) < syminfo.mintick / 2
+                    baseC = f_gCol(g, above)
+                    extV = f_ext(f_gExtS(g))
+                    x1 = na(LaT.get(i)) or LaT.get(i) <= 0 ? time : LaT.get(i)
+                    x2 = extV == extend.none ? time : x1 + tfMs2
+                    liqLn.push(line.new(x1, p, x2, p, xloc = xloc.bar_time, extend = extV,
+                         color = color.new(baseC, isPL ? 0 : f_gTr(g)), width = isPL ? math.max(2, f_gW(g)) : f_gW(g),
+                         style = f_lstyle(f_gStyS(g))))
+                    if f_gLbl(g) or isPL
+                        lx = lblPosS == "Left" ? x1 : time + tfMs2 * 3
+                        lsty = lblPosS == "Left" ? label.style_label_right : label.style_label_left
+                        liqLb.push(label.new(lx, p, Lt.get(i) + (isPL ? " ◄ PL" : ""), xloc = xloc.bar_time, yloc = yloc.price,
+                             style = lsty, color = color.new(baseC, isPL ? 0 : math.max(0, f_gTr(g) - 20)),
+                             textcolor = color.white, size = isPL ? size.small : f_size(f_gLzS(g))))
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 3 · RENDERER — READ-ONLY. Structure labels + BOS/CHoCH/MSS markers.
@@ -403,8 +532,6 @@ f_tyname(int t) => t == 0 ? "HH" : t == 1 ? "HL" : t == 2 ? "LH" : "LL"
 f_tyshow(int t) => t == 0 ? showHH : t == 1 ? showHL : t == 2 ? showLH : showLL
 f_tycol(int t)  => (t == 0 or t == 1) ? colBull : colBear
 lblSize = lblSizeS == "Normal" ? size.normal : lblSizeS == "Tiny" ? size.tiny : size.small
-f_ext(string s)    => s == "Both" ? extend.both : s == "Left" ? extend.left : s == "Right" ? extend.right : extend.none
-f_lstyle(string s) => s == "Dashed" ? line.style_dashed : s == "Dotted" ? line.style_dotted : line.style_solid
 pivStyle = f_lstyle(pivStyleS)
 pivExtV  = f_ext(pivExt)
 brkExtV  = f_ext(brkExt)
