@@ -19,8 +19,11 @@ indicator("IA-Setup · Structure Core [P1]", "IA-Setup", overlay = true,
      max_lines_count = 300, max_labels_count = 300, max_bars_back = 80, calc_bars_count = 1600)
 
 // ─── Detection inputs (change the DATABASE → change the hash) ────────────────
-pivotLen    = input.int(5, "Pivot length (swing bars each side)", minval = 2, maxval = 30, group = "Structure",
+autoPiv     = input.bool(true, "Auto pivot length (3 on Daily/Weekly, 5 below)", group = "Structure",
+     tooltip = "Higher timeframes print far fewer bars, so a shorter pivot leg keeps structure responsive there. When on: Daily & Weekly use 3, every lower timeframe uses 5. Turn off to use the manual value below.")
+pivotLenIn  = input.int(5, "Pivot length (manual, when Auto is off)", minval = 2, maxval = 30, group = "Structure",
      tooltip = "Detection layer only: a candidate swing is the highest/lowest CLOSE across this many bars each side. Filters below decide if it becomes structure. Non-repaint: confirmed pivotLen bars later.")
+pivotLen    = autoPiv ? (timeframe.in_seconds() >= 86400 ? 3 : 5) : pivotLenIn
 atrLen      = input.int(14, "ATR length", minval = 5, maxval = 50, group = "Structure")
 minSwingATR = input.float(0.50, "Min swing distance (× ATR)", minval = 0.0, maxval = 5.0, step = 0.05, group = "Structure",
      tooltip = "A candidate must sit at least this far (in ATR) from the last same-side swing, else it is noise and discarded.")
@@ -69,8 +72,8 @@ brkLineLen = input.int(3, "Break tick length (bars, when extend = None)", minval
 gLM      = "Liquidity Map · Global"
 showLiq  = input.bool(true, "Show liquidity map (master switch)", group = gLM)
 lblPosS  = input.string("Right", "Label position (all groups)", options = ["Left", "Right"], group = gLM)
-powerTol = input.float(0.50, "Power-Line tolerance (× daily ATR)", minval = 0.1, maxval = 10.0, step = 0.1, group = gLM,
-     tooltip = "The Power Line = the nearest liquidity level to price. AT LEVEL when price is within this × daily-ATR of it.")
+powerTol = input.float(0.50, "AT-LEVEL tolerance (× daily ATR)", minval = 0.1, maxval = 10.0, step = 0.1, group = gLM,
+     tooltip = "Reads AT LEVEL when price is within this × daily-ATR of the nearest liquidity level — where price tends to make an outstanding reaction. (The Power Line proper lives in the S/R engine.)")
 eqTol    = input.float(0.10, "Equal H/L tolerance (× ATR)", minval = 0.0, maxval = 2.0, step = 0.02, group = gLM,
      tooltip = "Two same-side external swings within this × ATR are treated as EQUAL (stacked liquidity — EQH/EQL).")
 
@@ -202,9 +205,11 @@ bearBreak = false
 if barstate.isconfirmed
     // 1a · register a new swing HIGH. A HIGHER HIGH (ty == HH) is a bullish structural
     //      break (BOS with trend, CHoCH/MSS against); an LH is just a pullback high.
-    //      The DOMINANT trend follows the EXTERNAL HH/LL sequence, so it always agrees
-    //      with the HH/HL/LH/LL labels on every timeframe (weekly LH/LL → bearish,
-    //      daily HH → bullish). protHigh/protLow are still tracked for the entry engine.
+    //      The trend flips on ANY HH/LL (same classification as the labels), so it
+    //      ALWAYS agrees with the visible HH/HL/LH/LL on every timeframe — including
+    //      the weekly, whose recent down-swings are too small vs the huge weekly ATR
+    //      to be "external". The internal/external flag still only tags the events.
+    //      protHigh/protLow are still tracked for the entry engine.
     if not na(ph) and pRange >= noiseATR * atr
         okDist = na(prevSwingHigh) or math.abs(ph - prevSwingHigh) >= minSwingATR * atr
         if okDist
@@ -225,9 +230,8 @@ if barstate.isconfirmed
                 disp = legMove >= dispRngATR * atr
                 kind = againstT ? (disp ? 2 : 1) : 0                  // MSS/CHoCH vs BOS
                 eLv.push(brokeLvl), eBar.push(bar_index), eBt.push(pBt), eKind.push(kind), eDir.push(1), eExt.push(isExt)
-                if isExt
-                    trend := 1
-                    bullBreak := true
+                trend := 1
+                bullBreak := true
     // 1b · register a new swing LOW. A LOWER LOW (LL) is a bearish structural break.
     if not na(pl) and pRange >= noiseATR * atr
         okDist = na(prevSwingLow) or math.abs(pl - prevSwingLow) >= minSwingATR * atr
@@ -249,9 +253,8 @@ if barstate.isconfirmed
                 disp = legMove >= dispRngATR * atr
                 kind = againstT ? (disp ? 2 : 1) : 0
                 eLv.push(brokeLvl), eBar.push(bar_index), eBt.push(pBt), eKind.push(kind), eDir.push(-1), eExt.push(isExt)
-                if isExt
-                    trend := -1
-                    bearBreak := true
+                trend := -1
+                bearBreak := true
 
     // 1d · strong/weak maintenance (LIVE): a high taken by a close → weak; unbroken
     //      highs at a bearish break → strong (mirror for lows). Identity never changes.
@@ -456,7 +459,7 @@ f_add(eqOn and hasEQL, eqlP, "EQL", eqlA, 6)
 f_add(swOn, swBSL, "BSL", swBSLa, 7)
 f_add(swOn, swSSL, "SSL", swSSLa, 7)
 
-// Power Line = nearest level above and below price; PL1 = the closer of the two.
+// Key level (AT LEVEL) = nearest liquidity level above and below price; pl1 = closer.
 plAbove = float(na)
 plAboveT = ""
 plBelow = float(na)
@@ -476,7 +479,7 @@ pl1 = na(plAbove) ? plBelow : na(plBelow) ? plAbove : (dAbove <= dBelow ? plAbov
 pl1T = na(plAbove) ? plBelowT : na(plBelow) ? plAboveT : (dAbove <= dBelow ? plAboveT : plBelowT)
 pl1Dist = na(pl1) ? na : math.abs(close - pl1) / atrRef
 atLevel = not na(pl1Dist) and pl1Dist <= powerTol
-alertcondition(atLevel, "Price at Power Line", "Price is at the nearest liquidity level (Power Line)")
+alertcondition(atLevel, "Price AT LEVEL", "Price is at the nearest liquidity level (outstanding-reaction zone)")
 
 // ── Per-group VISUAL settings (display only — never touches Lp price) ────────
 f_gCol(int g, bool above) => g == 0 ? pdC : g == 1 ? pwC : g == 2 ? loC : g == 3 ? nyC : g == 4 ? asC : g == 5 ? syC : g == 6 ? eqC : (above ? swCb : swCs)
@@ -521,7 +524,7 @@ if barstate.islast and showLiq
                     if f_gLbl(g) or isPL
                         lx = lblPosS == "Left" ? x1 : time + tfMs2 * 3
                         lsty = lblPosS == "Left" ? label.style_label_right : label.style_label_left
-                        liqLb.push(label.new(lx, p, Lt.get(i) + (isPL ? " ◄ PL" : ""), xloc = xloc.bar_time, yloc = yloc.price,
+                        liqLb.push(label.new(lx, p, Lt.get(i) + (isPL ? " ◄ AT LEVEL" : ""), xloc = xloc.bar_time, yloc = yloc.price,
                              style = lsty, color = color.new(baseC, isPL ? 0 : math.max(0, f_gTr(g) - 20)),
                              textcolor = color.white, size = isPL ? size.small : f_size(f_gLzS(g))))
 
@@ -619,9 +622,9 @@ if barstate.islast
     table.cell(hud, 1, 0, str.tostring(dbHash), text_color = #00e676, text_size = size.normal)
     table.cell(hud, 0, 1, "Structure trend", text_color = color.gray, text_size = size.small)
     table.cell(hud, 1, 1, trendStr, text_color = trendCol, text_size = size.normal)
-    table.cell(hud, 0, 2, "Power Line", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 0, 2, "Key level", text_color = color.gray, text_size = size.small)
     table.cell(hud, 1, 2, plStr, text_color = plCol, text_size = size.normal)
-    table.cell(hud, 0, 3, "At level?", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 0, 3, "AT LEVEL", text_color = color.gray, text_size = size.small)
     table.cell(hud, 1, 3, na(pl1) ? "—" : atLevel ? "YES ✓" : "approaching", text_color = atLevel ? #ffb300 : color.silver, text_size = size.small)
     table.cell(hud, 0, 4, "HH/HL/LH/LL", text_color = color.gray, text_size = size.small)
     table.cell(hud, 1, 4, str.tostring(cHH) + "/" + str.tostring(cHL) + "/" + str.tostring(cLH) + "/" + str.tostring(cLL), text_color = color.silver, text_size = size.small)
