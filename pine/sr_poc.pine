@@ -50,6 +50,8 @@ lineTr   = input.int(0, "Line transparency", minval = 0, maxval = 90, group = "D
 styleS   = input.string("Solid", "Line style", options = ["Solid", "Dashed", "Dotted"], group = "Display")
 showLbl  = input.bool(true, "Labels", group = "Display")
 showPwr  = input.bool(true, "Power Line", group = "Display")
+nearATR  = input.float(1.0, "Approaching S/R alert (× daily ATR)", minval = 0.1, maxval = 10.0, step = 0.1, group = "Display",
+     tooltip = "Flags APPROACHING in the panel (and fires an alert) when price is within this many daily-ATR of the nearest Weekly/Daily level (the Power Line). This is the S/R-confluence check for the top-down workflow.")
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 1 · PER-TIMEFRAME BOOK BUILDER — runs INSIDE request.security on its own TF.
@@ -223,6 +225,15 @@ f_nearWD(bool below) =>
 plLo = f_nearWD(true)
 plHi = f_nearWD(false)
 pl1 = na(plLo) ? plHi : na(plHi) ? plLo : (math.abs(close - plLo) <= math.abs(close - plHi) ? plLo : plHi)
+
+// APPROACHING S/R — is price near the nearest unbroken Weekly/Daily level (pl1)?
+// Distance measured in daily-ATR so it is comparable across symbols. Direction
+// tells you whether that level sits ABOVE (resistance) or BELOW (support).
+pl1Dist  = na(pl1) ? na : math.abs(close - pl1)
+pl1ATR   = na(pl1Dist) or atrRef <= 0 ? na : pl1Dist / atrRef
+nearWD   = not na(pl1ATR) and pl1ATR <= nearATR
+nearSide = na(pl1) ? "" : pl1 > close ? "resistance ↑" : "support ↓"
+alertcondition(nearWD, "Approaching W/D S/R", "Price approaching a Weekly/Daily S/R level")
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 4b · CANONICAL DATABASE HASH — resolution-independent cross-TF proof.
@@ -421,7 +432,7 @@ if barstate.islast
 //     "Levels win/all" — the WINDOW count matches across TFs; the TOTAL may
 //     differ because higher-TF charts load more HTF history (expected, benign).
 // ═══════════════════════════════════════════════════════════════════════════
-var table hud = table.new(position.top_right, 2, 5, bgcolor = color.new(#0a1a3a, 10), border_width = 1, border_color = color.new(color.gray, 60))
+var table hud = table.new(position.top_right, 2, 6, bgcolor = color.new(#0a1a3a, 10), border_width = 1, border_color = color.new(color.gray, 60))
 if barstate.islast
     table.cell(hud, 0, 0, "DB HASH", text_color = color.white, text_size = size.normal)
     table.cell(hud, 1, 0, str.tostring(dbHash), text_color = #00e676, text_size = size.normal)
@@ -433,3 +444,5 @@ if barstate.islast
     table.cell(hud, 1, 3, str.tostring(rA) + "/" + (na(rB) ? "—" : str.tostring(rB)) + "/" + (na(rC) ? "—" : str.tostring(rC)), text_color = color.silver, text_size = size.small)
     table.cell(hud, 0, 4, "Freeze test", text_color = color.gray, text_size = size.small)
     table.cell(hud, 1, 4, na(rC) ? "need 1000+ bars" : replayPass ? "PASS ✓" : "FAIL ✗", text_color = na(rC) ? color.gray : replayPass ? #00e676 : #ff1744, text_size = size.normal)
+    table.cell(hud, 0, 5, "Approaching S/R", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 5, na(pl1ATR) ? "—" : nearWD ? "YES · " + nearSide + " " + str.tostring(pl1ATR, "#.##") + "×ATR" : "no · " + str.tostring(pl1ATR, "#.##") + "×ATR", text_color = nearWD ? #ffb300 : color.silver, text_size = size.small)

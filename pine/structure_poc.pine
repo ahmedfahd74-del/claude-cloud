@@ -113,6 +113,28 @@ f_struct() =>
 
     [sP, sTy, sT, sPar, sCf, trend]
 
+// ── Lightweight TREND-ONLY engine (returns a single int, no arrays) so the bias
+//    vote can read the TRUE Weekly / Daily / 4H trend on ANY chart. Because it
+//    returns a scalar (not a collection), requesting a timeframe below the chart
+//    is cheap — it does not trigger the array-memory blow-up that gates the books
+//    above. Trend = last confirmed CLOSE BOS/CHoCH: +1 bull, -1 bear, 0 unset.
+f_trend() =>
+    var float lastH = na
+    var float lastL = na
+    var int tr = 0
+    ph = ta.pivothigh(close, pivLen, pivLen)
+    pl = ta.pivotlow(close,  pivLen, pivLen)
+    if barstate.isconfirmed
+        if not na(lastH) and close > lastH
+            tr := 1
+        if not na(lastL) and close < lastL
+            tr := -1
+        if not na(ph)
+            lastH := ph
+        if not na(pl)
+            lastL := pl
+    tr
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 2 · FETCH FROZEN STRUCTURE BOOKS (one security call per TF) + chart anchors
 //
@@ -132,6 +154,11 @@ use4  = timeframe.in_seconds("240") >= timeframe.in_seconds()
 [dP,  dTy,  dT,  dPar,  dCf,  dTr]  = request.security(syminfo.tickerid, f_reqtf("D"),   f_struct(), lookahead = barmerge.lookahead_off)
 [h4P, h4Ty, h4T, h4Par, h4Cf, h4Tr] = request.security(syminfo.tickerid, f_reqtf("240"), f_struct(), lookahead = barmerge.lookahead_off)
 dayOpen = request.security(syminfo.tickerid, f_reqtf("D"), time, lookahead = barmerge.lookahead_off)
+// TRUE-timeframe trends for the bias vote (scalars → always requested natively,
+// even when the TF is below the chart; cheap, no array-memory cost).
+wTrend  = request.security(syminfo.tickerid, "W",   f_trend(), lookahead = barmerge.lookahead_off)
+dTrend  = request.security(syminfo.tickerid, "D",   f_trend(), lookahead = barmerge.lookahead_off)
+h4Trend = request.security(syminfo.tickerid, "240", f_trend(), lookahead = barmerge.lookahead_off)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 3 · MARKET STRUCTURE DATABASE — REBUILT each bar from the (bounded) per-TF
@@ -187,14 +214,22 @@ if SP.size() > 0
         cLL += ty == 3 ? 1 : 0
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 4b · MARKET BIAS — from CONFIRMED close BOS/CHoCH only (each timeframe's engine
-//      reports its trend; the highest timeframe with a confirmed break wins).
-//      Not by counting HH/HL/LH/LL labels.
+// 4b · MARKET BIAS — MAJORITY VOTE of the three timeframes (2-of-3 must agree).
+//      Each timeframe's trend is its last CONFIRMED close BOS/CHoCH (+1/-1/0),
+//      read from the TRUE-timeframe trend engine so the vote is correct on any
+//      chart. Bias is BULLISH only if ≥2 timeframes are bullish, BEARISH only if
+//      ≥2 are bearish; anything else (1-1-1, splits, mostly-flat) is NEUTRAL.
+//      This is confirmed-BOS/CHoCH consensus — never a HH/HL/LH/LL label count.
 // ═══════════════════════════════════════════════════════════════════════════
-biasScore = wTr != 0 ? wTr : dTr != 0 ? dTr : h4Tr
+nBull = (wTrend > 0 ? 1 : 0) + (dTrend > 0 ? 1 : 0) + (h4Trend > 0 ? 1 : 0)
+nBear = (wTrend < 0 ? 1 : 0) + (dTrend < 0 ? 1 : 0) + (h4Trend < 0 ? 1 : 0)
+biasScore = nBull >= 2 ? 1 : nBear >= 2 ? -1 : 0
 bias  = biasScore > 0 ? "BULLISH" : biasScore < 0 ? "BEARISH" : "NEUTRAL / RANGE"
 phase = biasScore > 0 ? "Markup ▲" : biasScore < 0 ? "Markdown ▼" : "Range / Transition"
 biasCol = biasScore > 0 ? colBull : biasScore < 0 ? colBear : color.gray
+f_arrow(int tr) => tr > 0 ? "▲" : tr < 0 ? "▼" : "•"
+f_acol(int tr)  => tr > 0 ? colBull : tr < 0 ? colBear : color.gray
+tfTrendStr = "W " + f_arrow(wTrend) + "  D " + f_arrow(dTrend) + "  4H " + f_arrow(h4Trend)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 4c · TIME-BASED REPLAY / FREEZE TEST — hashes points whose frozen birth time is
@@ -289,7 +324,7 @@ var table hud = table.new(position.top_right, 2, 8, bgcolor = color.new(#0a1a3a,
 if barstate.islast
     table.cell(hud, 0, 0, "STRUCT HASH", text_color = color.white, text_size = size.normal)
     table.cell(hud, 1, 0, str.tostring(dbHash), text_color = #00e676, text_size = size.normal)
-    table.cell(hud, 0, 1, "Bias", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 0, 1, "Bias (2 of 3)", text_color = color.gray, text_size = size.small)
     table.cell(hud, 1, 1, bias, text_color = biasCol, text_size = size.normal)
     table.cell(hud, 0, 2, "Phase", text_color = color.gray, text_size = size.small)
     table.cell(hud, 1, 2, phase, text_color = biasCol, text_size = size.small)
@@ -301,5 +336,5 @@ if barstate.islast
     table.cell(hud, 1, 5, str.tostring(rA) + "/" + (na(rB) ? "—" : str.tostring(rB)) + "/" + (na(rC) ? "—" : str.tostring(rC)), text_color = color.silver, text_size = size.small)
     table.cell(hud, 0, 6, "Freeze test", text_color = color.gray, text_size = size.small)
     table.cell(hud, 1, 6, na(rC) ? "need 1000+ bars" : replayPass ? "PASS ✓" : "FAIL ✗", text_color = na(rC) ? color.gray : replayPass ? #00e676 : #ff1744, text_size = size.normal)
-    table.cell(hud, 0, 7, "Timeframes", text_color = color.gray, text_size = size.small)
-    table.cell(hud, 1, 7, "W · D · 4H", text_color = color.silver, text_size = size.small)
+    table.cell(hud, 0, 7, "1W / 1D / 4H", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 7, tfTrendStr, text_color = color.silver, text_size = size.small)
