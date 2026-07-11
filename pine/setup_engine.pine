@@ -70,11 +70,11 @@ var array<bool>  sBroken= array.new<bool>()    // taken by a close beyond it (LI
 
 var float prevSwingHigh = na    // last structural swing high (any class)
 var float prevSwingLow  = na
-var float lastExtHigh   = na    // last EXTERNAL swing high (drives BOS/CHoCH/MSS)
-var float lastExtLow    = na
-var int   trend         = 0     // +1 bull · -1 bear · 0 unset (from external breaks)
-var bool  extHiBroken   = false
-var bool  extLoBroken   = false
+var float extHi         = na    // last EXTERNAL swing high
+var float extLo         = na    // last EXTERNAL swing low
+var float protHigh      = na    // PROTECTED high: a close above it = bullish BOS/CHoCH
+var float protLow       = na    // PROTECTED low:  a close below it = bearish BOS/CHoCH
+var int   trend         = 0     // +1 bull · -1 bear · 0 unset (from protected-level breaks)
 
 // break-event registry (for rendering / later phases)
 var array<float> eLv  = array.new<float>()     // level broken
@@ -99,52 +99,64 @@ if barstate.isconfirmed
     if not na(ph) and pRange >= noiseATR * atr
         okDist = na(prevSwingHigh) or math.abs(ph - prevSwingHigh) >= minSwingATR * atr
         if okDist
-            isExt = na(lastExtLow) or math.abs(ph - lastExtLow) >= extSwingATR * atr
+            isExt = na(extLo) or math.abs(ph - extLo) >= extSwingATR * atr
             ty = na(prevSwingHigh) or ph > prevSwingHigh ? 0 : 2      // HH or LH
-            legMove = na(lastExtLow) ? extSwingATR * atr : math.abs(ph - lastExtLow)
+            legMove = na(extLo) ? extSwingATR * atr : math.abs(ph - extLo)
             sP.push(ph), sTy.push(ty), sBt.push(pBt), sBar.push(pBr), sExt.push(isExt)
             sStr.push(f_strength(legMove)), sState.push(0), sBroken.push(false)
             prevSwingHigh := ph
             if isExt
-                lastExtHigh := ph
-                extHiBroken := false
+                // a new external high arms the PROTECTED LOW (the low it left behind)
+                // and becomes the running external high. protHigh only moves on a new
+                // external LOW (§1b) — so bounce highs never lower the bull trigger.
+                if not na(extLo)
+                    protLow := extLo
+                extHi := ph
     // 1b · register a new swing LOW
     if not na(pl) and pRange >= noiseATR * atr
         okDist = na(prevSwingLow) or math.abs(pl - prevSwingLow) >= minSwingATR * atr
         if okDist
-            isExt = na(lastExtHigh) or math.abs(pl - lastExtHigh) >= extSwingATR * atr
+            isExt = na(extHi) or math.abs(pl - extHi) >= extSwingATR * atr
             ty = na(prevSwingLow) or pl < prevSwingLow ? 3 : 1        // LL or HL
-            legMove = na(lastExtHigh) ? extSwingATR * atr : math.abs(pl - lastExtHigh)
+            legMove = na(extHi) ? extSwingATR * atr : math.abs(pl - extHi)
             sP.push(pl), sTy.push(ty), sBt.push(pBt), sBar.push(pBr), sExt.push(isExt)
             sStr.push(f_strength(legMove)), sState.push(0), sBroken.push(false)
             prevSwingLow := pl
             if isExt
-                lastExtLow := pl
-                extLoBroken := false
+                // a new external low arms the PROTECTED HIGH (the high it left behind)
+                // and becomes the running external low. protLow only moves on a new
+                // external HIGH — so pullback lows never raise the bear trigger.
+                if not na(extHi)
+                    protHigh := extHi
+                extLo := pl
 
-    // 1c · BOS / CHoCH / MSS on the confirmed close vs external levels (fire once each).
-    //      DOMINANT-TREND rule: a same-direction break (BOS) or the first break from
-    //      unset continues/sets the trend. A break AGAINST the trend is a CHoCH and
-    //      flips the dominant trend ONLY if it carries displacement (an MSS) — a weak
-    //      counter-grind (plain CHoCH) does NOT flip it. This keeps a downtrend
-    //      BEARISH through shallow bounces until a real impulsive reversal prints.
-    bull = not na(lastExtHigh) and not extHiBroken and close > lastExtHigh
-    bear = not na(lastExtLow)  and not extLoBroken and close < lastExtLow
+    // 1c · BOS / CHoCH / MSS on the confirmed close vs the PROTECTED levels. Because
+    //      protHigh only steps down on a new external LOW (not on bounce highs) and
+    //      protLow only steps up on a new external HIGH, a downtrend keeps making lower
+    //      lows (bearish BOS) and a shallow bounce cannot flip it — the bull trigger
+    //      stays pinned at the protected high. A countertrend break flips the dominant
+    //      trend only with displacement (MSS); a plain CHoCH is labelled but does not
+    //      flip. Each protected level is consumed on break and re-armed by the next
+    //      opposite external swing, so the trend can never get "stuck".
     dispOK = math.abs(close - open) >= dispBodyATR * atr or (high - low) >= dispRngATR * atr
-    if bull
+    bullBreak = false
+    bearBreak = false
+    if not na(protHigh) and close > protHigh
         against = trend < 0
-        kind = against ? (dispOK ? 2 : 1) : 0                         // CHoCH/MSS vs BOS
-        eLv.push(lastExtHigh), eBar.push(bar_index), eBt.push(time), eKind.push(kind), eDir.push(1)
-        if not against or dispOK                                       // BOS/first-break, or MSS reversal
-            trend := 1
-        extHiBroken := true
-    if bear
-        against = trend > 0
-        kind = against ? (dispOK ? 2 : 1) : 0
-        eLv.push(lastExtLow), eBar.push(bar_index), eBt.push(time), eKind.push(kind), eDir.push(-1)
         if not against or dispOK
+            kind = against ? (dispOK ? 2 : 1) : 0                      // CHoCH/MSS vs BOS
+            eLv.push(protHigh), eBar.push(bar_index), eBt.push(time), eKind.push(kind), eDir.push(1)
+            trend := 1
+            protHigh := na
+            bullBreak := true
+    if not na(protLow) and close < protLow
+        against = trend > 0
+        if not against or dispOK
+            kind = against ? (dispOK ? 2 : 1) : 0
+            eLv.push(protLow), eBar.push(bar_index), eBt.push(time), eKind.push(kind), eDir.push(-1)
             trend := -1
-        extLoBroken := true
+            protLow := na
+            bearBreak := true
 
     // 1d · strong/weak maintenance (LIVE): a high taken by a close → weak; unbroken
     //      highs at a bearish break → strong (mirror for lows). Identity never changes.
@@ -155,9 +167,9 @@ if barstate.isconfirmed
                 if (isHi and close > sP.get(i)) or (not isHi and close < sP.get(i))
                     sBroken.set(i, true)
                     sState.set(i, 2)
-                else if bear and isHi
+                else if bearBreak and isHi
                     sState.set(i, 1)
-                else if bull and not isHi
+                else if bullBreak and not isHi
                     sState.set(i, 1)
 
     // 1e · bound memory (safety; calc_bars_count keeps the real count under MAXPT)
