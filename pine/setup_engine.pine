@@ -1,0 +1,307 @@
+// © Institutional Setup Engine — Phase 1 · Deterministic Micro-Structure Core
+//
+// Builds the chart-timeframe market-structure spine that the full Setup Engine
+// (see docs/architecture/setup-engine-spec.md) is assembled on. This phase covers
+// spec §1 (structure) + §12 (determinism / band-based freeze test) ONLY:
+//   · pivots as the DETECTION layer (close-based), then ATR / min-distance / close
+//     / strength filters promote a candidate to a structural swing
+//   · internal vs external structure · strong vs weak highs/lows
+//   · HH / HL / LH / LL · BOS / CHoCH / MSS (MSS = CHoCH + displacement)
+//   · noise filtering · non-repaint (confirmed close only)
+//   · order-independent identity hash + BAND-based replay/freeze test (A=B=C on
+//     every timeframe, incl. 3m/15m where the old "everything-older-than-cut"
+//     definition failed)
+// No sweeps, bias vote, scoring, sessions, or trade management yet — those are
+// Phases 2-9. Nothing here changes the S/R, Event, or Structure POC engines.
+
+//@version=6
+indicator("IA-Setup · Structure Core [P1]", "IA-Setup", overlay = true,
+     max_lines_count = 300, max_labels_count = 300, max_bars_back = 80, calc_bars_count = 1600)
+
+// ─── Detection inputs (change the DATABASE → change the hash) ────────────────
+pivotLen    = input.int(5, "Pivot length (swing bars each side)", minval = 2, maxval = 30, group = "Structure",
+     tooltip = "Detection layer only: a candidate swing is the highest/lowest CLOSE across this many bars each side. Filters below decide if it becomes structure. Non-repaint: confirmed pivotLen bars later.")
+atrLen      = input.int(14, "ATR length", minval = 5, maxval = 50, group = "Structure")
+minSwingATR = input.float(0.50, "Min swing distance (× ATR)", minval = 0.0, maxval = 5.0, step = 0.05, group = "Structure",
+     tooltip = "A candidate must sit at least this far (in ATR) from the last same-side swing, else it is noise and discarded.")
+extSwingATR = input.float(1.50, "External swing threshold (× ATR)", minval = 0.3, maxval = 10.0, step = 0.1, group = "Structure",
+     tooltip = "A swing whose leg from the last opposite EXTERNAL swing is ≥ this × ATR is EXTERNAL (major); smaller = INTERNAL (minor). BOS/CHoCH/MSS use external swings.")
+noiseATR    = input.float(0.15, "Noise floor (× ATR)", minval = 0.0, maxval = 2.0, step = 0.05, group = "Structure",
+     tooltip = "A pivot bar whose range is below this × ATR (a doji) cannot create a swing.")
+dispBodyATR = input.float(0.55, "MSS displacement body (× ATR)", minval = 0.1, maxval = 5.0, step = 0.05, group = "Structure",
+     tooltip = "A CHoCH whose breaking candle body ≥ this × ATR (or range ≥ 1×ATR) is upgraded to an MSS. Full displacement-quality model arrives in Phase 3.")
+dispRngATR  = input.float(1.00, "MSS displacement range (× ATR)", minval = 0.1, maxval = 6.0, step = 0.1, group = "Structure")
+MAXPT       = 600   // per-side safety cap; calc_bars_count keeps the real count well under it
+
+// ─── Display (read-only — never changes the database or the hash) ───────────
+showHH   = input.bool(true, "HH", inline = "t", group = "Display")
+showHL   = input.bool(true, "HL", inline = "t", group = "Display")
+showLH   = input.bool(true, "LH", inline = "t", group = "Display")
+showLL   = input.bool(true, "LL", inline = "t", group = "Display")
+extOnly  = input.bool(false, "External swings only", group = "Display",
+     tooltip = "Hide internal (minor) structure; show only major external swings.")
+markSW   = input.bool(true, "Mark strong/weak (● strong · ○ weak)", group = "Display")
+showBreaks = input.bool(true, "Show BOS / CHoCH / MSS", group = "Display")
+maxPts   = input.int(8, "Max labels per side", minval = 1, maxval = 60, group = "Display")
+lblSizeS = input.string("Small", "Label size", options = ["Tiny", "Small", "Normal"], group = "Display")
+colBull  = input.color(#26a69a, "Bullish structure (HH/HL)", group = "Display")
+colBear  = input.color(#ef5350, "Bearish structure (LH/LL)", group = "Display")
+
+// ─── Validation (proof instruments — affect only the debug panel) ───────────
+canonBars  = input.int(500, "Canonical hash window (bars)", minval = 50, group = "Validation",
+     tooltip = "Identity hash covers structural points born in the last N chart bars.")
+windowBars = input.int(1200, "Replay window (bars, must exceed 1000)", minval = 1050, group = "Validation")
+bandBars   = input.int(300, "Freeze band width (bars)", minval = 50, maxval = 1000, group = "Validation",
+     tooltip = "The freeze test hashes points born in the fixed band [last−windowBars−bandBars, last−windowBars]. A bounded band is immune to book aging, so A=B=C holds on every timeframe (fixes the 3m/15m FAIL).")
+
+PRIME = 99999989
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 1 · STRUCTURE DETECTION — pivots detect, filters decide. Confirmed close only.
+// ═══════════════════════════════════════════════════════════════════════════
+var array<float> sP     = array.new<float>()   // structure price (a CLOSE extreme — identity)
+var array<int>   sTy    = array.new<int>()     // 0 HH · 1 HL · 2 LH · 3 LL (frozen)
+var array<int>   sBt    = array.new<int>()     // birth time (frozen)
+var array<int>   sBar   = array.new<int>()     // birth bar_index (frozen — freeze band)
+var array<bool>  sExt   = array.new<bool>()    // external? (frozen)
+var array<int>   sStr   = array.new<int>()     // strength 0-100 (frozen)
+var array<int>   sState = array.new<int>()     // 0 unknown · 1 strong · 2 weak (LIVE overlay)
+var array<bool>  sBroken= array.new<bool>()    // taken by a close beyond it (LIVE)
+
+var float prevSwingHigh = na    // last structural swing high (any class)
+var float prevSwingLow  = na
+var float lastExtHigh   = na    // last EXTERNAL swing high (drives BOS/CHoCH/MSS)
+var float lastExtLow    = na
+var int   trend         = 0     // +1 bull · -1 bear · 0 unset (from external breaks)
+var bool  extHiBroken   = false
+var bool  extLoBroken   = false
+
+// break-event registry (for rendering / later phases)
+var array<float> eLv  = array.new<float>()     // level broken
+var array<int>   eBar = array.new<int>()
+var array<int>   eBt  = array.new<int>()
+var array<int>   eKind= array.new<int>()       // 0 BOS · 1 CHoCH · 2 MSS
+var array<int>   eDir = array.new<int>()       // +1 bull · -1 bear
+MAXEVT = 300
+
+atr = ta.atr(atrLen)
+// ta.* every bar (never conditional). Close-based pivots → wicks never make structure.
+ph = ta.pivothigh(close, pivotLen, pivotLen)
+pl = ta.pivotlow(close,  pivotLen, pivotLen)
+pRange = high[pivotLen] - low[pivotLen]        // the pivot bar's range (noise filter)
+pBt = time[pivotLen]
+pBr = bar_index[pivotLen]
+
+f_strength(float legMove) => int(math.round(50.0 + 50.0 * math.min(1.0, legMove / (extSwingATR * atr * 2.0))))
+
+if barstate.isconfirmed
+    // 1a · register a new swing HIGH
+    if not na(ph) and pRange >= noiseATR * atr
+        okDist = na(prevSwingHigh) or math.abs(ph - prevSwingHigh) >= minSwingATR * atr
+        if okDist
+            isExt = na(lastExtLow) or math.abs(ph - lastExtLow) >= extSwingATR * atr
+            ty = na(prevSwingHigh) or ph > prevSwingHigh ? 0 : 2      // HH or LH
+            legMove = na(lastExtLow) ? extSwingATR * atr : math.abs(ph - lastExtLow)
+            sP.push(ph), sTy.push(ty), sBt.push(pBt), sBar.push(pBr), sExt.push(isExt)
+            sStr.push(f_strength(legMove)), sState.push(0), sBroken.push(false)
+            prevSwingHigh := ph
+            if isExt
+                lastExtHigh := ph
+                extHiBroken := false
+    // 1b · register a new swing LOW
+    if not na(pl) and pRange >= noiseATR * atr
+        okDist = na(prevSwingLow) or math.abs(pl - prevSwingLow) >= minSwingATR * atr
+        if okDist
+            isExt = na(lastExtHigh) or math.abs(pl - lastExtHigh) >= extSwingATR * atr
+            ty = na(prevSwingLow) or pl < prevSwingLow ? 3 : 1        // LL or HL
+            legMove = na(lastExtHigh) ? extSwingATR * atr : math.abs(pl - lastExtHigh)
+            sP.push(pl), sTy.push(ty), sBt.push(pBt), sBar.push(pBr), sExt.push(isExt)
+            sStr.push(f_strength(legMove)), sState.push(0), sBroken.push(false)
+            prevSwingLow := pl
+            if isExt
+                lastExtLow := pl
+                extLoBroken := false
+
+    // 1c · BOS / CHoCH / MSS on the confirmed close vs external levels (fire once each)
+    bull = not na(lastExtHigh) and not extHiBroken and close > lastExtHigh
+    bear = not na(lastExtLow)  and not extLoBroken and close < lastExtLow
+    dispOK = math.abs(close - open) >= dispBodyATR * atr or (high - low) >= dispRngATR * atr
+    if bull
+        kind = trend < 0 ? (dispOK ? 2 : 1) : 0                       // CHoCH/MSS vs BOS
+        eLv.push(lastExtHigh), eBar.push(bar_index), eBt.push(time), eKind.push(kind), eDir.push(1)
+        trend := 1
+        extHiBroken := true
+    if bear
+        kind = trend > 0 ? (dispOK ? 2 : 1) : 0
+        eLv.push(lastExtLow), eBar.push(bar_index), eBt.push(time), eKind.push(kind), eDir.push(-1)
+        trend := -1
+        extLoBroken := true
+
+    // 1d · strong/weak maintenance (LIVE): a high taken by a close → weak; unbroken
+    //      highs at a bearish break → strong (mirror for lows). Identity never changes.
+    if sP.size() > 0
+        for i = 0 to sP.size() - 1
+            if not sBroken.get(i)
+                isHi = sTy.get(i) == 0 or sTy.get(i) == 2
+                if (isHi and close > sP.get(i)) or (not isHi and close < sP.get(i))
+                    sBroken.set(i, true)
+                    sState.set(i, 2)
+                else if bear and isHi
+                    sState.set(i, 1)
+                else if bull and not isHi
+                    sState.set(i, 1)
+
+    // 1e · bound memory (safety; calc_bars_count keeps the real count under MAXPT)
+    if sP.size() > MAXPT
+        sP.remove(0), sTy.remove(0), sBt.remove(0), sBar.remove(0), sExt.remove(0)
+        sStr.remove(0), sState.remove(0), sBroken.remove(0)
+    if eLv.size() > MAXEVT
+        eLv.remove(0), eBar.remove(0), eBt.remove(0), eKind.remove(0), eDir.remove(0)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 2 · IDENTITY HASH (canonical window) + BAND-BASED FREEZE / REPLAY TEST
+// ═══════════════════════════════════════════════════════════════════════════
+f_id(int i) => int(math.round(sP.get(i) / syminfo.mintick)) * 131 + sTy.get(i) * 17 + (sExt.get(i) ? 1 : 0) * 7
+
+f_hash() =>
+    h = 0
+    cut = last_bar_index - canonBars
+    if sP.size() > 0
+        for i = 0 to sP.size() - 1
+            if sBar.get(i) >= cut
+                h := int(math.abs((h + f_id(i)) % PRIME))
+    h
+dbHash = f_hash()
+
+// Freeze band: points born in the FIXED range [last−windowBars−bandBars, last−windowBars].
+// The band is bounded and old-but-not-ancient, so book aging (which trims the very
+// oldest records) never touches it → its hash is identical whenever sampled ⇒ A=B=C.
+f_whash() =>
+    h = 0
+    hi = last_bar_index - windowBars
+    lo = hi - bandBars
+    if sP.size() > 0
+        for i = 0 to sP.size() - 1
+            b = sBar.get(i)
+            if b >= lo and b <= hi
+                h := int(math.abs((h + f_id(i)) % PRIME))
+    h
+wHash = f_whash()
+var int rA = na
+var int rB = na
+var int rC = na
+if bar_index == last_bar_index
+    rA := wHash
+if bar_index == last_bar_index - 500
+    rB := wHash
+if bar_index == last_bar_index - 1000
+    rC := wHash
+replayPass = not na(rC) and rA == rB and rB == rC
+
+// per-type counts (display only)
+cHH = 0
+cHL = 0
+cLH = 0
+cLL = 0
+cExt = 0
+if sP.size() > 0
+    for i = 0 to sP.size() - 1
+        t = sTy.get(i)
+        cHH += t == 0 ? 1 : 0
+        cHL += t == 1 ? 1 : 0
+        cLH += t == 2 ? 1 : 0
+        cLL += t == 3 ? 1 : 0
+        cExt += sExt.get(i) ? 1 : 0
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 3 · RENDERER — READ-ONLY. Structure labels + BOS/CHoCH/MSS markers.
+// ═══════════════════════════════════════════════════════════════════════════
+f_tyname(int t) => t == 0 ? "HH" : t == 1 ? "HL" : t == 2 ? "LH" : "LL"
+f_tyshow(int t) => t == 0 ? showHH : t == 1 ? showHL : t == 2 ? showLH : showLL
+f_tycol(int t)  => (t == 0 or t == 1) ? colBull : colBear
+lblSize = lblSizeS == "Normal" ? size.normal : lblSizeS == "Tiny" ? size.tiny : size.small
+
+var array<label> drawn = array.new<label>()
+var array<line>  drawnB = array.new<line>()
+
+if barstate.islast
+    if drawn.size() > 0
+        for i = 0 to drawn.size() - 1
+            label.delete(drawn.get(i))
+    if drawnB.size() > 0
+        for i = 0 to drawnB.size() - 1
+            line.delete(drawnB.get(i))
+    drawn.clear(), drawnB.clear()
+
+    n = sP.size()
+    // per-side recency budget: keep the most recent maxPts eligible highs and lows
+    cutHi = 0
+    cutLo = 0
+    tmpHi = array.new<int>()
+    tmpLo = array.new<int>()
+    if n > 0
+        for i = 0 to n - 1
+            elig = f_tyshow(sTy.get(i)) and (not extOnly or sExt.get(i))
+            if elig
+                if sTy.get(i) == 0 or sTy.get(i) == 2
+                    tmpHi.push(sBar.get(i))
+                else
+                    tmpLo.push(sBar.get(i))
+    if tmpHi.size() > maxPts
+        tmpHi.sort(order.descending)
+        cutHi := tmpHi.get(maxPts - 1)
+    if tmpLo.size() > maxPts
+        tmpLo.sort(order.descending)
+        cutLo := tmpLo.get(maxPts - 1)
+
+    if n > 0
+        for i = 0 to n - 1
+            ty = sTy.get(i)
+            isHi = ty == 0 or ty == 2
+            elig = f_tyshow(ty) and (not extOnly or sExt.get(i)) and sBar.get(i) >= (isHi ? cutHi : cutLo)
+            if elig
+                col = f_tycol(ty)
+                mark = markSW ? (sState.get(i) == 1 ? " ●" : sState.get(i) == 2 ? " ○" : "") : ""
+                txt = f_tyname(ty) + (sExt.get(i) ? "" : "·") + mark
+                drawn.push(label.new(sBt.get(i), sP.get(i), txt, xloc = xloc.bar_time, yloc = yloc.price,
+                     style = isHi ? label.style_label_down : label.style_label_up,
+                     color = color.new(col, sExt.get(i) ? 0 : 45), textcolor = color.white, size = lblSize))
+
+    if showBreaks and eLv.size() > 0
+        tfMs = timeframe.in_seconds() * 1000
+        show = math.min(eLv.size(), 30)
+        for j = eLv.size() - show to eLv.size() - 1
+            k = eKind.get(j)
+            dir = eDir.get(j)
+            kcol = k == 2 ? color.yellow : dir > 0 ? colBull : colBear
+            ktxt = (k == 0 ? "BOS" : k == 1 ? "CHoCH" : "MSS")
+            // xloc.bar_time (not bar_index) so a break far from the current bar can't
+            // trip RE10026; a short ±3-bar tick marks the broken level.
+            ln = line.new(eBt.get(j) - 3 * tfMs, eLv.get(j), eBt.get(j) + 3 * tfMs, eLv.get(j),
+                 xloc = xloc.bar_time, color = kcol, width = 1, style = k == 0 ? line.style_solid : line.style_dashed)
+            drawnB.push(ln)
+            drawn.push(label.new(eBt.get(j), eLv.get(j), ktxt, xloc = xloc.bar_time, yloc = yloc.price,
+                 style = dir > 0 ? label.style_label_up : label.style_label_down,
+                 color = color.new(kcol, 20), textcolor = color.black, size = size.tiny))
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 4 · DEBUG PANEL — hash · trend · counts · freeze test (band)
+// ═══════════════════════════════════════════════════════════════════════════
+trendStr = trend > 0 ? "BULLISH" : trend < 0 ? "BEARISH" : "RANGE / UNSET"
+trendCol = trend > 0 ? colBull : trend < 0 ? colBear : color.gray
+var table hud = table.new(position.top_right, 2, 7, bgcolor = color.new(#0a1a3a, 10), border_width = 1, border_color = color.new(color.gray, 60))
+if barstate.islast
+    table.cell(hud, 0, 0, "STRUCT HASH", text_color = color.white, text_size = size.normal)
+    table.cell(hud, 1, 0, str.tostring(dbHash), text_color = #00e676, text_size = size.normal)
+    table.cell(hud, 0, 1, "Structure trend", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 1, trendStr, text_color = trendCol, text_size = size.normal)
+    table.cell(hud, 0, 2, "HH/HL/LH/LL", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 2, str.tostring(cHH) + "/" + str.tostring(cHL) + "/" + str.tostring(cLH) + "/" + str.tostring(cLL), text_color = color.silver, text_size = size.small)
+    table.cell(hud, 0, 3, "External / total", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 3, str.tostring(cExt) + " / " + str.tostring(sP.size()), text_color = color.silver, text_size = size.small)
+    table.cell(hud, 0, 4, "Breaks (BOS/CH/MSS)", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 4, str.tostring(eLv.size()), text_color = color.silver, text_size = size.small)
+    table.cell(hud, 0, 5, "Replay A/B/C", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 5, str.tostring(rA) + "/" + (na(rB) ? "—" : str.tostring(rB)) + "/" + (na(rC) ? "—" : str.tostring(rC)), text_color = color.silver, text_size = size.small)
+    table.cell(hud, 0, 6, "Freeze test", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 6, na(rC) ? "need 1000+ bars" : replayPass ? "PASS ✓" : "FAIL ✗", text_color = na(rC) ? color.gray : replayPass ? #00e676 : #ff1744, text_size = size.normal)
