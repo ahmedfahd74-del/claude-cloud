@@ -47,6 +47,22 @@ lblSizeS = input.string("Small", "Label size", options = ["Tiny", "Small", "Norm
 colBull  = input.color(#26a69a, "Bullish structure (HH/HL)", group = "Display")
 colBear  = input.color(#ef5350, "Bearish structure (LH/LL)", group = "Display")
 
+// ─── Liquidity Map (spec §2) — the actionable levels the Power Line snaps to ──
+gLiq     = "Liquidity Map"
+showLiq  = input.bool(true, "Show liquidity map", group = gLiq)
+showPDW  = input.bool(true, "Prev day / week H-L (PDH/PDL/PWH/PWL)", group = gLiq)
+showEQ   = input.bool(true, "Equal highs / lows (EQH/EQL)", group = gLiq)
+showSess = input.bool(true, "Session highs / lows (London / NY)", group = gLiq)
+showSwLiq= input.bool(false, "Swing-liquidity pools (BSL/SSL)", group = gLiq)
+eqTol    = input.float(0.10, "Equal H/L tolerance (× ATR)", minval = 0.0, maxval = 2.0, step = 0.02, group = gLiq,
+     tooltip = "Two same-side swings within this × ATR are treated as EQUAL (a stacked liquidity pool — EQH/EQL).")
+sessLon  = input.session("0700-1600", "London session (exchange tz)", group = gLiq)
+sessNY   = input.session("1200-2100", "New York session (exchange tz)", group = gLiq)
+powerTol = input.float(0.50, "Power-Line tolerance (× daily ATR)", minval = 0.1, maxval = 10.0, step = 0.1, group = gLiq,
+     tooltip = "The Power Line = the nearest liquidity level to price. It reads AT LEVEL when price is within this × daily-ATR of it (spec §5 confluence).")
+colBSL   = input.color(#ef5350, "Buy-side liquidity (above price)", group = gLiq)
+colSSL   = input.color(#26a69a, "Sell-side liquidity (below price)", group = gLiq)
+
 // ─── Validation (proof instruments — affect only the debug panel) ───────────
 canonBars  = input.int(500, "Canonical hash window (bars)", minval = 50, group = "Validation",
      tooltip = "Identity hash covers structural points born in the last N chart bars.")
@@ -235,6 +251,142 @@ if sP.size() > 0
         cExt += sExt.get(i) ? 1 : 0
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 2b · LIQUIDITY MAP (spec §2) — prior day/week H-L, session H-L, equal H/L,
+//      swing pools. The POWER LINE is derived here as the nearest liquidity
+//      level to price, so it snaps to the level you are actually trading (not a
+//      far-off HTF pivot). Determinism: all levels are prior-bar / confirmed
+//      values via lookahead-off security or frozen swings — never the live bar.
+// ═══════════════════════════════════════════════════════════════════════════
+// Prior day / week high-low (scalar HTF request → cheap on any chart TF)
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_off)
+pdl = request.security(syminfo.tickerid, "D", low[1],  lookahead = barmerge.lookahead_off)
+pwh = request.security(syminfo.tickerid, "W", high[1], lookahead = barmerge.lookahead_off)
+pwl = request.security(syminfo.tickerid, "W", low[1],  lookahead = barmerge.lookahead_off)
+atrDaily = request.security(syminfo.tickerid, "D", ta.atr(14), lookahead = barmerge.lookahead_off)
+atrRef = na(atrDaily) or atrDaily <= 0 ? atr : atrDaily
+
+// Session highs/lows — current forms live; PREVIOUS is frozen when the session ends
+f_sess(simple string s) =>
+    var float hi = na
+    var float lo = na
+    var float phi = na    // previous (frozen) session high
+    var float plo = na
+    inS = not na(time(timeframe.period, s, syminfo.timezone))
+    if inS and not inS[1]
+        hi := high
+        lo := low
+    else if inS
+        hi := math.max(hi, high)
+        lo := math.min(lo, low)
+    if not inS and inS[1]
+        phi := hi
+        plo := lo
+    [phi, plo]
+[lonH, lonL] = f_sess(sessLon)
+[nyH,  nyL]  = f_sess(sessNY)
+
+// Equal highs / lows — scan external swings for same-side levels within eqTol×ATR
+f_hasEqual(int side) =>       // side 1 = highs, 0 = lows
+    found = false
+    price = 0.0
+    if sP.size() > 1
+        for i = sP.size() - 1 to math.max(1, sP.size() - 20)   // recent swings only
+            hi = sTy.get(i) == 0 or sTy.get(i) == 2
+            match = side == 1 ? hi : not hi
+            if match and sExt.get(i) and not found
+                lo = math.max(0, i - 12)
+                for j = i - 1 to lo
+                    hj = sTy.get(j) == 0 or sTy.get(j) == 2
+                    mj = side == 1 ? hj : not hj
+                    if mj and sExt.get(j) and not found and math.abs(sP.get(i) - sP.get(j)) <= eqTol * atr
+                        found := true
+                        price := side == 1 ? math.max(sP.get(i), sP.get(j)) : math.min(sP.get(i), sP.get(j))
+    [found, price]
+[hasEQH, eqhP] = f_hasEqual(1)
+[hasEQL, eqlP] = f_hasEqual(0)
+
+// Nearest swing-liquidity above / below (unbroken external swings)
+swBSL = float(na)      // nearest unbroken external high above price
+swSSL = float(na)
+if sP.size() > 0
+    for i = 0 to sP.size() - 1
+        if sExt.get(i) and not sBroken.get(i)
+            p = sP.get(i)
+            hi = sTy.get(i) == 0 or sTy.get(i) == 2
+            if hi and p > close and (na(swBSL) or p < swBSL)
+                swBSL := p
+            if not hi and p < close and (na(swSSL) or p > swSSL)
+                swSSL := p
+
+// Assemble candidate levels into arrays (price, tag, enabled) and find the nearest
+// above (resistance liquidity) and below (support liquidity) = the Power Line pair.
+var array<float>  Lp = array.new<float>()
+var array<string> Lt = array.new<string>()
+f_add(bool on, float p, string t) =>
+    if on and not na(p)
+        Lp.push(p), Lt.push(t)
+Lp.clear()
+Lt.clear()
+f_add(showPDW, pdh, "PDH")
+f_add(showPDW, pdl, "PDL")
+f_add(showPDW, pwh, "PWH")
+f_add(showPDW, pwl, "PWL")
+f_add(showSess, lonH, "LonH")
+f_add(showSess, lonL, "LonL")
+f_add(showSess, nyH, "NYH")
+f_add(showSess, nyL, "NYL")
+f_add(showEQ and hasEQH, eqhP, "EQH")
+f_add(showEQ and hasEQL, eqlP, "EQL")
+f_add(showSwLiq, swBSL, "BSL")
+f_add(showSwLiq, swSSL, "SSL")
+
+// Power Line = nearest level above and below price; PL1 = the closer of the two.
+plAbove = float(na)
+plAboveT = ""
+plBelow = float(na)
+plBelowT = ""
+if Lp.size() > 0
+    for i = 0 to Lp.size() - 1
+        p = Lp.get(i)
+        if p >= close and (na(plAbove) or p < plAbove)
+            plAbove := p
+            plAboveT := Lt.get(i)
+        if p < close and (na(plBelow) or p > plBelow)
+            plBelow := p
+            plBelowT := Lt.get(i)
+dAbove = na(plAbove) ? na : plAbove - close
+dBelow = na(plBelow) ? na : close - plBelow
+pl1 = na(plAbove) ? plBelow : na(plBelow) ? plAbove : (dAbove <= dBelow ? plAbove : plBelow)
+pl1T = na(plAbove) ? plBelowT : na(plBelow) ? plAboveT : (dAbove <= dBelow ? plAboveT : plBelowT)
+pl1Dist = na(pl1) ? na : math.abs(close - pl1) / atrRef
+atLevel = not na(pl1Dist) and pl1Dist <= powerTol
+alertcondition(atLevel, "Price at Power Line", "Price is at the nearest liquidity level (Power Line)")
+
+// ── Liquidity renderer (read-only) ──────────────────────────────────────────
+var array<line>  liqLn = array.new<line>()
+var array<label> liqLb = array.new<label>()
+if barstate.islast and showLiq
+    if liqLn.size() > 0
+        for i = 0 to liqLn.size() - 1
+            line.delete(liqLn.get(i))
+    if liqLb.size() > 0
+        for i = 0 to liqLb.size() - 1
+            label.delete(liqLb.get(i))
+    liqLn.clear(), liqLb.clear()
+    if Lp.size() > 0
+        for i = 0 to Lp.size() - 1
+            p = Lp.get(i)
+            above = p >= close
+            isPL = not na(pl1) and math.abs(p - pl1) < syminfo.mintick / 2
+            c = above ? colBSL : colSSL
+            liqLn.push(line.new(bar_index - 1, p, bar_index, p, extend = extend.right,
+                 color = color.new(c, isPL ? 0 : 55), width = isPL ? 2 : 1,
+                 style = isPL ? line.style_solid : line.style_dotted))
+            liqLb.push(label.new(bar_index + 3, p, Lt.get(i) + (isPL ? " ◄ PL" : ""), xloc = xloc.bar_index,
+                 style = label.style_label_left, color = color.new(c, isPL ? 0 : 35),
+                 textcolor = color.white, size = isPL ? size.small : size.tiny))
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 3 · RENDERER — READ-ONLY. Structure labels + BOS/CHoCH/MSS markers.
 // ═══════════════════════════════════════════════════════════════════════════
 f_tyname(int t) => t == 0 ? "HH" : t == 1 ? "HL" : t == 2 ? "LH" : "LL"
@@ -310,19 +462,25 @@ if barstate.islast
 // ═══════════════════════════════════════════════════════════════════════════
 trendStr = trend > 0 ? "BULLISH" : trend < 0 ? "BEARISH" : "RANGE / UNSET"
 trendCol = trend > 0 ? colBull : trend < 0 ? colBear : color.gray
-var table hud = table.new(position.top_right, 2, 7, bgcolor = color.new(#0a1a3a, 10), border_width = 1, border_color = color.new(color.gray, 60))
+plStr = na(pl1) ? "—" : pl1T + " " + str.tostring(pl1, format.mintick) + (na(pl1Dist) ? "" : "  " + str.tostring(pl1Dist, "#.##") + "×ATR")
+plCol = atLevel ? #ffb300 : color.silver
+var table hud = table.new(position.top_right, 2, 9, bgcolor = color.new(#0a1a3a, 10), border_width = 1, border_color = color.new(color.gray, 60))
 if barstate.islast
     table.cell(hud, 0, 0, "STRUCT HASH", text_color = color.white, text_size = size.normal)
     table.cell(hud, 1, 0, str.tostring(dbHash), text_color = #00e676, text_size = size.normal)
     table.cell(hud, 0, 1, "Structure trend", text_color = color.gray, text_size = size.small)
     table.cell(hud, 1, 1, trendStr, text_color = trendCol, text_size = size.normal)
-    table.cell(hud, 0, 2, "HH/HL/LH/LL", text_color = color.gray, text_size = size.small)
-    table.cell(hud, 1, 2, str.tostring(cHH) + "/" + str.tostring(cHL) + "/" + str.tostring(cLH) + "/" + str.tostring(cLL), text_color = color.silver, text_size = size.small)
-    table.cell(hud, 0, 3, "External / total", text_color = color.gray, text_size = size.small)
-    table.cell(hud, 1, 3, str.tostring(cExt) + " / " + str.tostring(sP.size()), text_color = color.silver, text_size = size.small)
-    table.cell(hud, 0, 4, "Breaks (BOS/CH/MSS)", text_color = color.gray, text_size = size.small)
-    table.cell(hud, 1, 4, str.tostring(eLv.size()), text_color = color.silver, text_size = size.small)
-    table.cell(hud, 0, 5, "Replay A/B/C", text_color = color.gray, text_size = size.small)
-    table.cell(hud, 1, 5, str.tostring(rA) + "/" + (na(rB) ? "—" : str.tostring(rB)) + "/" + (na(rC) ? "—" : str.tostring(rC)), text_color = color.silver, text_size = size.small)
-    table.cell(hud, 0, 6, "Freeze test", text_color = color.gray, text_size = size.small)
-    table.cell(hud, 1, 6, na(rC) ? "need 1000+ bars" : replayPass ? "PASS ✓" : "FAIL ✗", text_color = na(rC) ? color.gray : replayPass ? #00e676 : #ff1744, text_size = size.normal)
+    table.cell(hud, 0, 2, "Power Line", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 2, plStr, text_color = plCol, text_size = size.normal)
+    table.cell(hud, 0, 3, "At level?", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 3, na(pl1) ? "—" : atLevel ? "YES ✓" : "approaching", text_color = atLevel ? #ffb300 : color.silver, text_size = size.small)
+    table.cell(hud, 0, 4, "HH/HL/LH/LL", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 4, str.tostring(cHH) + "/" + str.tostring(cHL) + "/" + str.tostring(cLH) + "/" + str.tostring(cLL), text_color = color.silver, text_size = size.small)
+    table.cell(hud, 0, 5, "External / total", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 5, str.tostring(cExt) + " / " + str.tostring(sP.size()), text_color = color.silver, text_size = size.small)
+    table.cell(hud, 0, 6, "Breaks (BOS/CH/MSS)", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 6, str.tostring(eLv.size()), text_color = color.silver, text_size = size.small)
+    table.cell(hud, 0, 7, "Replay A/B/C", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 7, str.tostring(rA) + "/" + (na(rB) ? "—" : str.tostring(rB)) + "/" + (na(rC) ? "—" : str.tostring(rC)), text_color = color.silver, text_size = size.small)
+    table.cell(hud, 0, 8, "Freeze test", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 8, na(rC) ? "need 1000+ bars" : replayPass ? "PASS ✓" : "FAIL ✗", text_color = na(rC) ? color.gray : replayPass ? #00e676 : #ff1744, text_size = size.normal)
