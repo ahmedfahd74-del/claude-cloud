@@ -36,6 +36,48 @@ dispBodyATR = input.float(0.55, "MSS displacement body (× ATR)", minval = 0.1, 
 dispRngATR  = input.float(1.00, "MSS displacement range (× ATR)", minval = 0.1, maxval = 6.0, step = 0.1, group = "Structure")
 MAXPT       = 600   // per-side safety cap; calc_bars_count keeps the real count well under it
 
+// ─── ATR asset preset (spec §16) — one switch loads intelligent per-asset defaults
+//     for the sweep + displacement thresholds; "Manual" uses the fields below. ────
+gPre     = "Sweep · ATR preset"
+assetPre = input.string("Auto", "Asset preset", options = ["Auto", "Crypto", "Forex", "Gold", "Indices", "Manual"], group = gPre,
+     tooltip = "Auto picks by syminfo.type (crypto/forex/index → its column; anything else → Crypto). Gold isn't auto-detectable — pick it manually for XAUUSD. Manual uses the sliders below.")
+// Auto → concrete asset column
+preAuto  = syminfo.type == "crypto" ? "Crypto" : syminfo.type == "forex" ? "Forex" : syminfo.type == "index" ? "Indices" : "Crypto"
+preSel   = assetPre == "Auto" ? preAuto : assetPre
+// per-asset defaults: [sweepATR, dispBody, dispRange, volMult]
+pSweep   = preSel == "Forex" ? 0.20 : preSel == "Gold" ? 0.25 : preSel == "Indices" ? 0.25 : 0.30
+pBody    = preSel == "Forex" ? 0.50 : preSel == "Gold" ? 0.55 : preSel == "Indices" ? 0.55 : 0.60
+pRange   = preSel == "Forex" ? 0.90 : preSel == "Gold" ? 1.00 : preSel == "Indices" ? 1.00 : 1.10
+pVol     = preSel == "Indices" ? 1.40 : 1.50
+
+// ─── Liquidity sweep (spec §2 sweep) ────────────────────────────────────────
+gSwp     = "Sweep detection"
+sweepATRm= input.float(0.0, "Sweep pierce (× ATR, 0 = use preset)", minval = 0.0, maxval = 3.0, step = 0.05, group = gSwp,
+     tooltip = "A wick must pierce the level by at least this × ATR to count as a sweep. 0 = use the asset preset value.")
+sweepATR = sweepATRm > 0 ? sweepATRm : pSweep
+rejFrac  = input.float(0.55, "Rejection — close in far X of candle", minval = 0.1, maxval = 1.0, step = 0.05, group = gSwp,
+     tooltip = "After the wick pierces, the CLOSE must finish this fraction of the candle back on the origin side (0.55 = close in the far 55%). Confirms the level rejected price.")
+sweepLook= input.int(6, "Only sweep levels within (× ATR) of price", minval = 1, maxval = 40, group = gSwp,
+     tooltip = "Ignore far-away levels: only levels within this × ATR of the current close can register a sweep. Keeps sweeps local and cheap.")
+showSwp  = input.bool(true, "Show sweep markers", group = gSwp)
+colSwpB  = input.color(#26a69a, "Bullish sweep (took a low)", inline = "sw", group = gSwp)
+colSwpS  = input.color(#ef5350, "Bearish sweep (took a high)", inline = "sw", group = gSwp)
+
+// ─── Displacement quality (spec §3) ─────────────────────────────────────────
+gDsp     = "Displacement quality"
+dispBodyM= input.float(0.0, "Body (× ATR, 0 = preset)", minval = 0.0, maxval = 5.0, step = 0.05, inline = "d1", group = gDsp)
+dispRngM = input.float(0.0, "Range (× ATR, 0 = preset)", minval = 0.0, maxval = 6.0, step = 0.05, inline = "d1", group = gDsp)
+dBody    = dispBodyM > 0 ? dispBodyM : pBody
+dRange   = dispRngM  > 0 ? dispRngM  : pRange
+impSeq   = input.int(2, "Consecutive impulse candles", minval = 1, maxval = 5, group = gDsp)
+bodyDom  = input.float(0.60, "Body dominance (body/range ≥)", minval = 0.1, maxval = 1.0, step = 0.05, group = gDsp)
+closeFrac= input.float(0.66, "Close at extreme (fraction)", minval = 0.1, maxval = 1.0, step = 0.02, group = gDsp)
+expMult  = input.float(1.20, "ATR expansion (range ≥ × ATR)", minval = 0.5, maxval = 5.0, step = 0.1, group = gDsp)
+volMultM = input.float(0.0, "Rel-volume (≥ × avg, 0 = preset)", minval = 0.0, maxval = 10.0, step = 0.1, group = gDsp)
+volMult  = volMultM > 0 ? volMultM : pVol
+dispQualMin = input.float(0.60, "Min displacement quality (0-1) to confirm", minval = 0.0, maxval = 1.0, step = 0.05, group = gDsp,
+     tooltip = "The reclaim after a sweep must reach this displacement-quality score to be a valid impulsive move.")
+
 // ─── Display (read-only — never changes the database or the hash) ───────────
 showHH   = input.bool(true, "HH", inline = "t", group = "Display")
 showHL   = input.bool(true, "HL", inline = "t", group = "Display")
@@ -435,29 +477,31 @@ var array<float>  Lp = array.new<float>()
 var array<string> Lt = array.new<string>()
 var array<int>    LaT= array.new<int>()
 var array<int>    Lg = array.new<int>()
-f_add(bool on, float p, string t, int at, int g) =>
+var array<bool>   Ls = array.new<bool>()      // true = buy-side (a HIGH) · false = sell-side (a LOW)
+f_add(bool on, float p, string t, int at, int g, bool hiSide) =>
     if on and not na(p)
-        Lp.push(p), Lt.push(t), LaT.push(at), Lg.push(g)
+        Lp.push(p), Lt.push(t), LaT.push(at), Lg.push(g), Ls.push(hiSide)
 Lp.clear()
 Lt.clear()
 LaT.clear()
 Lg.clear()
-f_add(pdOn, pdh, "PDH", pdA, 0)
-f_add(pdOn, pdl, "PDL", pdA, 0)
-f_add(pwOn, pwh, "PWH", pwA, 1)
-f_add(pwOn, pwl, "PWL", pwA, 1)
-f_add(loOn, lonH, "London H", lonHT, 2)
-f_add(loOn, lonL, "London L", lonLT, 2)
-f_add(nyOn, nyH, "NY H", nyHT, 3)
-f_add(nyOn, nyL, "NY L", nyLT, 3)
-f_add(asOn, asH, "Asia H", asHT, 4)
-f_add(asOn, asL, "Asia L", asLT, 4)
-f_add(syOn, syH, "Sydney H", syHT, 5)
-f_add(syOn, syL, "Sydney L", syLT, 5)
-f_add(eqOn and hasEQH, eqhP, "EQH", eqhA, 6)
-f_add(eqOn and hasEQL, eqlP, "EQL", eqlA, 6)
-f_add(swOn, swBSL, "BSL", swBSLa, 7)
-f_add(swOn, swSSL, "SSL", swSSLa, 7)
+Ls.clear()
+f_add(pdOn, pdh, "PDH", pdA, 0, true)
+f_add(pdOn, pdl, "PDL", pdA, 0, false)
+f_add(pwOn, pwh, "PWH", pwA, 1, true)
+f_add(pwOn, pwl, "PWL", pwA, 1, false)
+f_add(loOn, lonH, "London H", lonHT, 2, true)
+f_add(loOn, lonL, "London L", lonLT, 2, false)
+f_add(nyOn, nyH, "NY H", nyHT, 3, true)
+f_add(nyOn, nyL, "NY L", nyLT, 3, false)
+f_add(asOn, asH, "Asia H", asHT, 4, true)
+f_add(asOn, asL, "Asia L", asLT, 4, false)
+f_add(syOn, syH, "Sydney H", syHT, 5, true)
+f_add(syOn, syL, "Sydney L", syLT, 5, false)
+f_add(eqOn and hasEQH, eqhP, "EQH", eqhA, 6, true)
+f_add(eqOn and hasEQL, eqlP, "EQL", eqlA, 6, false)
+f_add(swOn, swBSL, "BSL", swBSLa, 7, true)
+f_add(swOn, swSSL, "SSL", swSSLa, 7, false)
 
 // Key level (AT LEVEL) = nearest liquidity level above and below price; pl1 = closer.
 plAbove = float(na)
@@ -480,6 +524,59 @@ pl1T = na(plAbove) ? plBelowT : na(plBelow) ? plAboveT : (dAbove <= dBelow ? plA
 pl1Dist = na(pl1) ? na : math.abs(close - pl1) / atrRef
 atLevel = not na(pl1Dist) and pl1Dist <= powerTol
 alertcondition(atLevel, "Price AT LEVEL", "Price is at the nearest liquidity level (outstanding-reaction zone)")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 2c · LIQUIDITY SWEEP + DISPLACEMENT QUALITY (spec §2 sweep, §3). A sweep = a
+//      wick that pierces a mapped level by ≥ sweepATR×ATR and CLOSES back inside
+//      with a rejection; the reclaim is scored 0-1 for displacement quality.
+//      Confirmed-bar only (non-repaint). This feeds the Phase-5 entry engine.
+// ═══════════════════════════════════════════════════════════════════════════
+// SMAs computed EVERY bar (ta.* must never be conditional); read inside f_dispQual.
+volSma = ta.sma(volume, 20)
+rngSma = ta.sma(high - low, 20)
+f_dispQual(int dir) =>       // dir +1 bullish reclaim · -1 bearish reclaim → 0..1
+    rng  = high - low
+    body = math.abs(close - open)
+    b_ok = body >= dBody * atr
+    r_ok = rng  >= dRange * atr
+    dom  = rng > 0 and body / rng >= bodyDom
+    ce   = rng > 0 and (dir > 0 ? (close - low) / rng >= closeFrac : (high - close) / rng >= closeFrac)
+    exp  = rng >= expMult * atr
+    imp = true
+    for k = 0 to impSeq - 1
+        bk = math.abs(close[k] - open[k])
+        dk = dir > 0 ? close[k] > open[k] : close[k] < open[k]
+        if not (bk >= dBody * atr and dk)
+            imp := false
+    vok = na(volume) or na(volSma) ? (not na(rngSma) and rng >= volMult * rngSma) : (volume >= volMult * volSma)
+    ((b_ok ? 1 : 0) + (r_ok ? 1 : 0) + (dom ? 1 : 0) + (ce ? 1 : 0) + (exp ? 1 : 0) + (imp ? 1 : 0) + (vok ? 1 : 0)) / 7.0
+
+var array<float>  swpP   = array.new<float>()   // swept level price
+var array<int>    swpT   = array.new<int>()     // sweep bar time
+var array<int>    swpDir = array.new<int>()     // +1 bullish · -1 bearish
+var array<string> swpTag = array.new<string>()  // which level
+var array<float>  swpQ   = array.new<float>()   // displacement quality 0-1 (frozen)
+bullSweep = false
+bearSweep = false
+if barstate.isconfirmed and Lp.size() > 0
+    rng = high - low
+    for i = 0 to Lp.size() - 1
+        p = Lp.get(i)
+        if rng > 0 and math.abs(close - p) <= sweepLook * atr
+            if Ls.get(i)
+                // buy-side liquidity (a high) taken: wick above, close back below → BEARISH sweep
+                if not bearSweep and high > p + sweepATR * atr and close < p and (high - close) / rng >= rejFrac
+                    swpP.push(p), swpT.push(time), swpDir.push(-1), swpTag.push(Lt.get(i)), swpQ.push(f_dispQual(-1))
+                    bearSweep := true
+            else
+                // sell-side liquidity (a low) taken: wick below, close back above → BULLISH sweep
+                if not bullSweep and low < p - sweepATR * atr and close > p and (close - low) / rng >= rejFrac
+                    swpP.push(p), swpT.push(time), swpDir.push(1), swpTag.push(Lt.get(i)), swpQ.push(f_dispQual(1))
+                    bullSweep := true
+    if swpP.size() > 200
+        swpP.remove(0), swpT.remove(0), swpDir.remove(0), swpTag.remove(0), swpQ.remove(0)
+alertcondition(bullSweep, "Bullish liquidity sweep", "A sell-side liquidity level was swept and reclaimed (bullish)")
+alertcondition(bearSweep, "Bearish liquidity sweep", "A buy-side liquidity level was swept and reclaimed (bearish)")
 
 // ── Per-group VISUAL settings (display only — never touches Lp price) ────────
 f_gCol(int g, bool above) => g == 0 ? pdC : g == 1 ? pwC : g == 2 ? loC : g == 3 ? nyC : g == 4 ? asC : g == 5 ? syC : g == 6 ? eqC : (above ? swCb : swCs)
@@ -527,6 +624,27 @@ if barstate.islast and showLiq
                         liqLb.push(label.new(lx, p, Lt.get(i) + (isPL ? " ◄ AT LEVEL" : ""), xloc = xloc.bar_time, yloc = yloc.price,
                              style = lsty, color = color.new(baseC, isPL ? 0 : math.max(0, f_gTr(g) - 20)),
                              textcolor = color.white, size = isPL ? size.small : f_size(f_gLzS(g))))
+
+// ── Sweep markers (read-only): ⚡ at each recent sweep, coloured by direction; a
+//    hollow mark when displacement quality is below the confirm threshold. ────────
+var array<label> swpLbl = array.new<label>()
+if barstate.islast and showSwp
+    if swpLbl.size() > 0
+        for i = 0 to swpLbl.size() - 1
+            label.delete(swpLbl.get(i))
+    swpLbl.clear()
+    if swpP.size() > 0
+        showN = math.min(swpP.size(), 40)
+        for j = swpP.size() - showN to swpP.size() - 1
+            up = swpDir.get(j) > 0
+            q  = swpQ.get(j)
+            conf = q >= dispQualMin
+            c  = up ? colSwpB : colSwpS
+            txt = "⚡ " + swpTag.get(j) + " " + str.tostring(math.round(q * 100)) + "%"
+            swpLbl.push(label.new(swpT.get(j), swpP.get(j), txt, xloc = xloc.bar_time, yloc = yloc.price,
+                 style = up ? label.style_label_up : label.style_label_down,
+                 color = color.new(c, conf ? 0 : 65), textcolor = conf ? color.white : color.new(c, 0),
+                 size = size.tiny))
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 3 · RENDERER — READ-ONLY. Structure labels + BOS/CHoCH/MSS markers.
@@ -616,7 +734,10 @@ trendStr = trend > 0 ? "BULLISH" : trend < 0 ? "BEARISH" : "RANGE / UNSET"
 trendCol = trend > 0 ? colBull : trend < 0 ? colBear : color.gray
 plStr = na(pl1) ? "—" : pl1T + " " + str.tostring(pl1, format.mintick) + (na(pl1Dist) ? "" : "  " + str.tostring(pl1Dist, "#.##") + "×ATR")
 plCol = atLevel ? #ffb300 : color.silver
-var table hud = table.new(position.top_right, 2, 9, bgcolor = color.new(#0a1a3a, 10), border_width = 1, border_color = color.new(color.gray, 60))
+nSw = swpP.size()
+swLast = nSw == 0 ? "—" : (swpDir.get(nSw - 1) > 0 ? "▲ " : "▼ ") + swpTag.get(nSw - 1) + "  " + str.tostring(math.round(swpQ.get(nSw - 1) * 100)) + "% disp" + (swpQ.get(nSw - 1) >= dispQualMin ? " ✓" : "")
+swCol = nSw == 0 ? color.gray : swpQ.get(nSw - 1) < dispQualMin ? color.gray : (swpDir.get(nSw - 1) > 0 ? colBull : colBear)
+var table hud = table.new(position.top_right, 2, 10, bgcolor = color.new(#0a1a3a, 10), border_width = 1, border_color = color.new(color.gray, 60))
 if barstate.islast
     table.cell(hud, 0, 0, "STRUCT HASH", text_color = color.white, text_size = size.normal)
     table.cell(hud, 1, 0, str.tostring(dbHash), text_color = #00e676, text_size = size.normal)
@@ -626,13 +747,15 @@ if barstate.islast
     table.cell(hud, 1, 2, plStr, text_color = plCol, text_size = size.normal)
     table.cell(hud, 0, 3, "AT LEVEL", text_color = color.gray, text_size = size.small)
     table.cell(hud, 1, 3, na(pl1) ? "—" : atLevel ? "YES ✓" : "approaching", text_color = atLevel ? #ffb300 : color.silver, text_size = size.small)
-    table.cell(hud, 0, 4, "HH/HL/LH/LL", text_color = color.gray, text_size = size.small)
-    table.cell(hud, 1, 4, str.tostring(cHH) + "/" + str.tostring(cHL) + "/" + str.tostring(cLH) + "/" + str.tostring(cLL), text_color = color.silver, text_size = size.small)
-    table.cell(hud, 0, 5, "External / total", text_color = color.gray, text_size = size.small)
-    table.cell(hud, 1, 5, str.tostring(cExt) + " / " + str.tostring(sP.size()), text_color = color.silver, text_size = size.small)
-    table.cell(hud, 0, 6, "Breaks (BOS/CH/MSS)", text_color = color.gray, text_size = size.small)
-    table.cell(hud, 1, 6, str.tostring(eLv.size()), text_color = color.silver, text_size = size.small)
-    table.cell(hud, 0, 7, "Replay A/B/C", text_color = color.gray, text_size = size.small)
-    table.cell(hud, 1, 7, str.tostring(rA) + "/" + (na(rB) ? "—" : str.tostring(rB)) + "/" + (na(rC) ? "—" : str.tostring(rC)), text_color = color.silver, text_size = size.small)
-    table.cell(hud, 0, 8, "Freeze test", text_color = color.gray, text_size = size.small)
-    table.cell(hud, 1, 8, na(rC) ? "need 1000+ bars" : replayPass ? "PASS ✓" : "FAIL ✗", text_color = na(rC) ? color.gray : replayPass ? #00e676 : #ff1744, text_size = size.normal)
+    table.cell(hud, 0, 4, "Last sweep", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 4, swLast, text_color = swCol, text_size = size.small)
+    table.cell(hud, 0, 5, "HH/HL/LH/LL", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 5, str.tostring(cHH) + "/" + str.tostring(cHL) + "/" + str.tostring(cLH) + "/" + str.tostring(cLL), text_color = color.silver, text_size = size.small)
+    table.cell(hud, 0, 6, "External / total", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 6, str.tostring(cExt) + " / " + str.tostring(sP.size()), text_color = color.silver, text_size = size.small)
+    table.cell(hud, 0, 7, "Breaks (BOS/CH/MSS)", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 7, str.tostring(eLv.size()), text_color = color.silver, text_size = size.small)
+    table.cell(hud, 0, 8, "Replay A/B/C", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 8, str.tostring(rA) + "/" + (na(rB) ? "—" : str.tostring(rB)) + "/" + (na(rC) ? "—" : str.tostring(rC)), text_color = color.silver, text_size = size.small)
+    table.cell(hud, 0, 9, "Freeze test", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 9, na(rC) ? "need 1000+ bars" : replayPass ? "PASS ✓" : "FAIL ✗", text_color = na(rC) ? color.gray : replayPass ? #00e676 : #ff1744, text_size = size.normal)
