@@ -63,10 +63,16 @@ deterministic rules validated in the three POC engines.
 ### 1.5 BOS / CHoCH / MSS (close, external swings)
 - **BOS:** `close > lastExtHigh` in bull trend (or unset) → bull BOS; `close < lastExtLow`
   in bear trend → bear BOS.
-- **CHoCH:** first opposing break — bull trend & `close < lastExtLow` → bear CHoCH
-  (flips trend); mirror for bull.
-- **MSS:** a CHoCH whose breaking candle passes §3 displacement (stronger; validates
-  entries). Plain CHoCH scores lower and cannot alone confirm an entry.
+- **CHoCH:** first opposing break — bull trend & `close < lastExtLow` → bear CHoCH;
+  mirror for bull. A CHoCH is *labelled* on the opposing break, but the **dominant
+  trend flips only when that opposing break carries displacement (an MSS)**. A plain
+  CHoCH (no displacement) is flagged as a *potential* shift and does **not** flip the
+  dominant trend — this keeps an HTF downtrend BEARISH through shallow bounces until a
+  real impulsive reversal prints. A same-direction break (BOS) always continues the
+  trend.
+- **MSS:** a CHoCH whose breaking candle passes §3 displacement (stronger; **the only
+  thing that flips the dominant trend against itself**, and validates entries). Plain
+  CHoCH scores lower and cannot alone confirm an entry.
 - **Micro BOS/MSS:** same rules on **internal** swings on the chart TF, in bias
   direction, after sweep+reclaim.
 

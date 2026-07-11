@@ -122,19 +122,28 @@ if barstate.isconfirmed
                 lastExtLow := pl
                 extLoBroken := false
 
-    // 1c · BOS / CHoCH / MSS on the confirmed close vs external levels (fire once each)
+    // 1c · BOS / CHoCH / MSS on the confirmed close vs external levels (fire once each).
+    //      DOMINANT-TREND rule: a same-direction break (BOS) or the first break from
+    //      unset continues/sets the trend. A break AGAINST the trend is a CHoCH and
+    //      flips the dominant trend ONLY if it carries displacement (an MSS) — a weak
+    //      counter-grind (plain CHoCH) does NOT flip it. This keeps a downtrend
+    //      BEARISH through shallow bounces until a real impulsive reversal prints.
     bull = not na(lastExtHigh) and not extHiBroken and close > lastExtHigh
     bear = not na(lastExtLow)  and not extLoBroken and close < lastExtLow
     dispOK = math.abs(close - open) >= dispBodyATR * atr or (high - low) >= dispRngATR * atr
     if bull
-        kind = trend < 0 ? (dispOK ? 2 : 1) : 0                       // CHoCH/MSS vs BOS
+        against = trend < 0
+        kind = against ? (dispOK ? 2 : 1) : 0                         // CHoCH/MSS vs BOS
         eLv.push(lastExtHigh), eBar.push(bar_index), eBt.push(time), eKind.push(kind), eDir.push(1)
-        trend := 1
+        if not against or dispOK                                       // BOS/first-break, or MSS reversal
+            trend := 1
         extHiBroken := true
     if bear
-        kind = trend > 0 ? (dispOK ? 2 : 1) : 0
+        against = trend > 0
+        kind = against ? (dispOK ? 2 : 1) : 0
         eLv.push(lastExtLow), eBar.push(bar_index), eBt.push(time), eKind.push(kind), eDir.push(-1)
-        trend := -1
+        if not against or dispOK
+            trend := -1
         extLoBroken := true
 
     // 1d · strong/weak maintenance (LIVE): a high taken by a close → weak; unbroken
