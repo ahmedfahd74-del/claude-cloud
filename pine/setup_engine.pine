@@ -59,7 +59,19 @@ rejFrac  = input.float(0.55, "Rejection — close in far X of candle", minval = 
      tooltip = "After the wick pierces, the CLOSE must finish this fraction of the candle back on the origin side (0.55 = close in the far 55%). Confirms the level rejected price.")
 sweepLook= input.int(6, "Only sweep levels within (× ATR) of price", minval = 1, maxval = 40, group = gSwp,
      tooltip = "Ignore far-away levels: only levels within this × ATR of the current close can register a sweep. Keeps sweeps local and cheap.")
+// which liquidity pools COUNT as institutional sweep targets (detection — also
+// gates the entry engine, so unchecking a group removes its setups too)
+swpPDok  = input.bool(true,  "Prev Day",  inline = "sg1", group = gSwp)
+swpPWok  = input.bool(true,  "Prev Week", inline = "sg1", group = gSwp)
+swpEQok  = input.bool(true,  "EQH/EQL",   inline = "sg1", group = gSwp)
+swpSEok  = input.bool(true,  "Sessions",  inline = "sg2", group = gSwp)
+swpSWok  = input.bool(false, "Swing BSL/SSL", inline = "sg2", group = gSwp)
+swpCool  = input.int(20, "One sweep per level per (bars)", minval = 0, maxval = 200, group = gSwp,
+     tooltip = "Cooldown/dedupe: after a level is swept, the SAME level+direction cannot register again for this many bars — chop re-sweeping one line no longer stacks marks. 0 = off.")
 showSwp  = input.bool(true, "Show sweep markers", group = gSwp)
+swpShowQ = input.float(0.40, "Hide marks below quality (0-1)", minval = 0.0, maxval = 1.0, step = 0.05, group = gSwp,
+     tooltip = "Display filter: only draw ⚡ marks whose displacement quality is at least this. Low-quality pokes stay in the database (HUD/entries use their own threshold) but stop cluttering the chart.")
+swpMaxAge= input.int(300, "Hide marks older than (bars)", minval = 10, maxval = 5000, group = gSwp)
 colSwpB  = input.color(#26a69a, "Bullish sweep (took a low)", inline = "sw", group = gSwp)
 colSwpS  = input.color(#ef5350, "Bearish sweep (took a high)", inline = "sw", group = gSwp)
 
@@ -588,28 +600,39 @@ f_dispQual(int dir) =>       // dir +1 bullish reclaim · -1 bearish reclaim →
 
 var array<float>  swpP   = array.new<float>()   // swept level price
 var array<int>    swpT   = array.new<int>()     // sweep bar time
+var array<int>    swpB   = array.new<int>()     // sweep bar index (age / cooldown)
 var array<int>    swpDir = array.new<int>()     // +1 bullish · -1 bearish
 var array<string> swpTag = array.new<string>()  // which level
 var array<float>  swpQ   = array.new<float>()   // displacement quality 0-1 (frozen)
+// which liquidity groups count as institutional sweep targets (group ids in §2b)
+f_swpAllowed(int g) => g == 0 ? swpPDok : g == 1 ? swpPWok : (g >= 2 and g <= 5) ? swpSEok : g == 6 ? swpEQok : swpSWok
+// cooldown/dedupe: has this same level+direction already swept within swpCool bars?
+f_dupSweep(string tag, int dir) =>
+    dup = false
+    if swpCool > 0 and swpP.size() > 0
+        for k = swpP.size() - 1 to math.max(0, swpP.size() - 12)
+            if not dup and swpTag.get(k) == tag and swpDir.get(k) == dir and bar_index - swpB.get(k) <= swpCool
+                dup := true
+    dup
 bullSweep = false
 bearSweep = false
 if barstate.isconfirmed and Lp.size() > 0
     rng = high - low
     for i = 0 to Lp.size() - 1
         p = Lp.get(i)
-        if rng > 0 and math.abs(close - p) <= sweepLook * atr
+        if rng > 0 and math.abs(close - p) <= sweepLook * atr and f_swpAllowed(Lg.get(i))
             if Ls.get(i)
                 // buy-side liquidity (a high) taken: wick above, close back below → BEARISH sweep
-                if not bearSweep and high > p + sweepATR * atr and close < p and (high - close) / rng >= rejFrac
-                    swpP.push(p), swpT.push(time), swpDir.push(-1), swpTag.push(Lt.get(i)), swpQ.push(f_dispQual(-1))
+                if not bearSweep and high > p + sweepATR * atr and close < p and (high - close) / rng >= rejFrac and not f_dupSweep(Lt.get(i), -1)
+                    swpP.push(p), swpT.push(time), swpB.push(bar_index), swpDir.push(-1), swpTag.push(Lt.get(i)), swpQ.push(f_dispQual(-1))
                     bearSweep := true
             else
                 // sell-side liquidity (a low) taken: wick below, close back above → BULLISH sweep
-                if not bullSweep and low < p - sweepATR * atr and close > p and (close - low) / rng >= rejFrac
-                    swpP.push(p), swpT.push(time), swpDir.push(1), swpTag.push(Lt.get(i)), swpQ.push(f_dispQual(1))
+                if not bullSweep and low < p - sweepATR * atr and close > p and (close - low) / rng >= rejFrac and not f_dupSweep(Lt.get(i), 1)
+                    swpP.push(p), swpT.push(time), swpB.push(bar_index), swpDir.push(1), swpTag.push(Lt.get(i)), swpQ.push(f_dispQual(1))
                     bullSweep := true
     if swpP.size() > 200
-        swpP.remove(0), swpT.remove(0), swpDir.remove(0), swpTag.remove(0), swpQ.remove(0)
+        swpP.remove(0), swpT.remove(0), swpB.remove(0), swpDir.remove(0), swpTag.remove(0), swpQ.remove(0)
 alertcondition(bullSweep, "Bullish liquidity sweep", "A sell-side liquidity level was swept and reclaimed (bullish)")
 alertcondition(bearSweep, "Bearish liquidity sweep", "A buy-side liquidity level was swept and reclaimed (bearish)")
 
@@ -834,15 +857,17 @@ if barstate.islast and showSwp
     if swpP.size() > 0
         showN = math.min(swpP.size(), 40)
         for j = swpP.size() - showN to swpP.size() - 1
-            up = swpDir.get(j) > 0
-            q  = swpQ.get(j)
-            conf = q >= dispQualMin
-            c  = up ? colSwpB : colSwpS
-            txt = "⚡ " + swpTag.get(j) + " " + str.tostring(math.round(q * 100)) + "%"
-            swpLbl.push(label.new(swpT.get(j), swpP.get(j), txt, xloc = xloc.bar_time, yloc = yloc.price,
-                 style = up ? label.style_label_up : label.style_label_down,
-                 color = color.new(c, conf ? 0 : 65), textcolor = conf ? color.white : color.new(c, 0),
-                 size = size.tiny))
+            q = swpQ.get(j)
+            // display filters: quality floor + age limit (institutional marks only)
+            if q >= swpShowQ and bar_index - swpB.get(j) <= swpMaxAge
+                up = swpDir.get(j) > 0
+                conf = q >= dispQualMin
+                c  = up ? colSwpB : colSwpS
+                txt = "⚡ " + swpTag.get(j) + " " + str.tostring(math.round(q * 100)) + "%"
+                swpLbl.push(label.new(swpT.get(j), swpP.get(j), txt, xloc = xloc.bar_time, yloc = yloc.price,
+                     style = up ? label.style_label_up : label.style_label_down,
+                     color = color.new(c, conf ? 0 : 65), textcolor = conf ? color.white : color.new(c, 0),
+                     size = size.tiny))
 
 // ── Trade map (read-only): entry / SL / TP1 / final-target lines while a setup
 //    is TRIGGERED; pending setups show the trigger + invalidation guide. ─────────
