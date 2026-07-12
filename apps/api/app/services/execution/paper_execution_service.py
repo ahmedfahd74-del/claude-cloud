@@ -4,34 +4,42 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Callable
 
+from app.services.governance_service import governance_service
+from app.services.risk.risk_engine import risk_engine
+
 
 class PaperExecutionService:
-    def __init__(self, allocation_lookup: Callable[[str], dict | None] | None = None) -> None:
+    def __init__(
+        self,
+        allocation_lookup: Callable[[str], dict | None] | None = None,
+        governance=governance_service,
+        engine=risk_engine,
+    ) -> None:
         self.orders: list[dict] = []
         self.positions: list[dict] = []
         self.events: list[dict] = []
         self._order_seq = 1
         self._position_seq = 1
         self._allocation_lookup = allocation_lookup or (lambda _candidate_id: None)
+        self.governance = governance
+        self.engine = engine
 
     def place_paper_order(self, payload: dict) -> dict:
+        base = {"paperTradingOnly": True, "liveExecutionEnabled": False}
+
+        # GOVERNANCE KILL SWITCH — final enforcement at the execution layer, even if
+        # an allocation slipped through (defense in depth; audit C1).
+        gov = self.governance.get_state()
+        if not gov.get("new_trade_allowed", False):
+            return {"ok": False, "error": f"governance_blocked:{gov.get('state')}", **base}
+
         candidate_id = payload.get("candidateId")
         allocation = self._allocation_lookup(candidate_id)
         if not allocation:
-            return {
-                "ok": False,
-                "error": "allocation_required",
-                "paperTradingOnly": True,
-                "liveExecutionEnabled": False,
-            }
+            return {"ok": False, "error": "allocation_required", **base}
 
         if allocation.get("decision") != "ALLOCATE" or float(allocation.get("approved_size_usd", allocation.get("approvedSizeUsd", 0))) <= 0:
-            return {
-                "ok": False,
-                "error": "allocation_not_approved",
-                "paperTradingOnly": True,
-                "liveExecutionEnabled": False,
-            }
+            return {"ok": False, "error": "allocation_not_approved", **base}
 
         order = {
             "orderId": self._order_seq,
@@ -65,6 +73,12 @@ class PaperExecutionService:
         self._position_seq += 1
         self.positions.append(position)
         self._log_event(positionId=position["positionId"], eventType="POSITION_ACTIVE", details="Position opened from paper fill")
+
+        # keep the risk engine's live exposure / open-count in sync with fills
+        try:
+            self.engine.register_fill(position["symbol"], Decimal(str(position["marketValue"])))
+        except Exception:
+            pass
 
         return {"ok": True, "order": filled, "position": position, "paperTradingOnly": True, "liveExecutionEnabled": False}
 
