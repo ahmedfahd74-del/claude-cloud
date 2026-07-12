@@ -24,7 +24,7 @@
 //    VISUAL    : Sections 13, 14 (render), 15 — Pine-only, never ported
 // =============================================================================
 
-indicator("Institutional Adaptive S/R Engine  [v2.1.1 · 2026-07-06]", "IA-SR v2.1.1", overlay = true,
+indicator("Institutional Adaptive S/R Engine  [v2.1.1 · 2026-07-06]", "IA-SR", overlay = true,
      max_lines_count = 200, max_labels_count = 200, max_boxes_count = 250)
 
 // BUILD TAG — bumped every release. Shows in the indicator title on the chart
@@ -2071,7 +2071,7 @@ var int detC = na
 // legitimately differ — that is a log-capacity limit, NOT a repaint. We detect it
 // (oldest birth <= cut, checked at the latest/most-loaded anchor) and report it
 // distinctly, so a FAIL only ever means a genuine determinism break.
-var bool detRetained = na
+var bool detRetained = false          // false until computed at the last anchor (read only at barstate.islast)
 var int  detOldC     = na             // oldest surviving birth captured at anchor C
 if bar_index == last_bar_index - 1001
     detC    := detFrz
