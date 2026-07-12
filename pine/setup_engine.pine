@@ -146,15 +146,20 @@ pivExt   = input.string("Right", "Pivot line extend", options = ["None", "Left",
 pivStyleS= input.string("Dotted", "Pivot line style", options = ["Solid", "Dashed", "Dotted"], group = gPiv)
 pivWid   = input.int(1, "Pivot line width", minval = 1, maxval = 4, group = gPiv)
 
-// ─── Break lines (BOS / CHoCH / MSS) — internal vs external, own extend ──────
+// ─── Break lines (BOS / CHoCH / MSS) — anchored broken-swing → breaking candle ─
 gBrk     = "Break lines (BOS / CHoCH / MSS)"
 showBOS   = input.bool(true, "BOS",   inline = "b1", group = gBrk)
 showChoCH = input.bool(true, "CHoCH", inline = "b1", group = gBrk)
 showMSS   = input.bool(true, "MSS",   inline = "b1", group = gBrk)
 showBrkExt = input.bool(true, "External (major)", inline = "b2", group = gBrk)
 showBrkInt = input.bool(false, "Internal (minor)", inline = "b2", group = gBrk)
-brkExt   = input.string("Right", "Break line extend", options = ["None", "Left", "Right", "Both"], group = gBrk)
-brkLineLen = input.int(3, "Break tick length (bars, when extend = None)", minval = 1, maxval = 50, group = gBrk)
+brkExt   = input.string("None", "Extend past the break", options = ["None", "Left", "Right", "Both"], group = gBrk,
+     tooltip = "Institutional anchoring: each line runs FROM the broken swing's candle TO the candle that closed through it. None = exactly that segment; Right extends beyond the break.")
+brkWid   = input.int(1, "Line width", minval = 1, maxval = 4, inline = "b3", group = gBrk)
+colMSS   = input.color(#ffd54f, "MSS color", inline = "b3", group = gBrk)
+showBrkLbl = input.bool(true, "Labels", inline = "b4", group = gBrk)
+brkLblSz = input.string("Tiny", "Label size", options = ["Tiny", "Small", "Normal"], inline = "b4", group = gBrk)
+maxBrk   = input.int(12, "Max break lines shown", minval = 1, maxval = 40, group = gBrk)
 
 // ═══ LIQUIDITY MAP — visual customization is per-group and NEVER alters a level's
 //     calculated price (calc/visual separation). Each group has its own section. ══
@@ -264,19 +269,28 @@ var array<bool>  sBroken= array.new<bool>()    // taken by a close beyond it (LI
 
 var float prevSwingHigh = na    // last structural swing high (any class)
 var float prevSwingLow  = na
+var int   prevHiT       = na    // its birth time (break-line origin anchor)
+var int   prevLoT       = na
+var bool  prevHiExt     = false // was it external? (tags the break internal/external)
+var bool  prevLoExt     = false
+var bool  prevHiBroken  = false // already close-broken? (each swing breaks ONCE)
+var bool  prevLoBroken  = false
 var float extHi         = na    // last EXTERNAL swing high
 var float extLo         = na    // last EXTERNAL swing low
 var float protHigh      = na    // PROTECTED high: a close above it = bullish BOS/CHoCH
 var float protLow       = na    // PROTECTED low:  a close below it = bearish BOS/CHoCH
-var int   trend         = 0     // +1 bull · -1 bear · 0 unset (from protected-level breaks)
+var int   trend         = 0     // +1 bull · -1 bear · 0 unset (from HH/LL sequence)
 
-// break-event registry (for rendering / later phases)
-var array<float> eLv  = array.new<float>()     // level broken
-var array<int>   eBar = array.new<int>()
-var array<int>   eBt  = array.new<int>()
+// break-event registry — each event = a horizontal ray FROM the broken swing
+// (origin eOt) TO the candle that closed through it (eBt): true institutional
+// BOS/CHoCH/MSS anchoring, detected in REAL TIME on the breaking close.
+var array<float> eLv  = array.new<float>()     // broken swing price
+var array<int>   eOt  = array.new<int>()       // ORIGIN time (the broken swing's candle)
+var array<int>   eBar = array.new<int>()       // break bar_index
+var array<int>   eBt  = array.new<int>()       // break time (the breaking candle)
 var array<int>   eKind= array.new<int>()       // 0 BOS · 1 CHoCH · 2 MSS
 var array<int>   eDir = array.new<int>()       // +1 bull · -1 bear
-var array<bool>  eExt = array.new<bool>()      // true = external (major) · false = internal
+var array<bool>  eExt = array.new<bool>()      // broken swing was external (major)?
 MAXEVT = 300
 
 atr = ta.atr(atrLen)
@@ -309,18 +323,16 @@ if barstate.isconfirmed
             sP.push(ph), sTy.push(ty), sBt.push(pBt), sBar.push(pBr), sExt.push(isExt)
             sStr.push(f_strength(legMove)), sState.push(0), sBroken.push(false)
             prevSwingHigh := ph
+            prevHiT := pBt
+            prevHiExt := isExt
+            prevHiBroken := false
             if isExt
                 if not na(extLo)
                     protLow := extLo
                 extHi := ph
-            // structural break on a HIGHER HIGH
+            // trend follows the HH/LL label sequence (user-validated on all TFs)
             if ty == 0 and not na(brokeLvl)
-                againstT = trend < 0
-                disp = legMove >= dispRngATR * atr
-                kind = againstT ? (disp ? 2 : 1) : 0                  // MSS/CHoCH vs BOS
-                eLv.push(brokeLvl), eBar.push(bar_index), eBt.push(pBt), eKind.push(kind), eDir.push(1), eExt.push(isExt)
                 trend := 1
-                bullBreak := true
     // 1b · register a new swing LOW. A LOWER LOW (LL) is a bearish structural break.
     if not na(pl) and pRange >= noiseATR * atr
         okDist = na(prevSwingLow) or math.abs(pl - prevSwingLow) >= minSwingATR * atr
@@ -332,18 +344,34 @@ if barstate.isconfirmed
             sP.push(pl), sTy.push(ty), sBt.push(pBt), sBar.push(pBr), sExt.push(isExt)
             sStr.push(f_strength(legMove)), sState.push(0), sBroken.push(false)
             prevSwingLow := pl
+            prevLoT := pBt
+            prevLoExt := isExt
+            prevLoBroken := false
             if isExt
                 if not na(extHi)
                     protHigh := extHi
                 extLo := pl
-            // structural break on a LOWER LOW
+            // trend follows the HH/LL label sequence (user-validated on all TFs)
             if ty == 3 and not na(brokeLvl)
-                againstT = trend > 0
-                disp = legMove >= dispRngATR * atr
-                kind = againstT ? (disp ? 2 : 1) : 0
-                eLv.push(brokeLvl), eBar.push(bar_index), eBt.push(pBt), eKind.push(kind), eDir.push(-1), eExt.push(isExt)
                 trend := -1
-                bearBreak := true
+
+    // 1c · BOS / CHoCH / MSS — REAL-TIME on the breaking CLOSE (institutional
+    //      anchoring). The moment a confirmed close crosses the last swing high/low,
+    //      the event prints, anchored FROM that swing's candle (origin) TO this
+    //      breaking candle. Each swing breaks once. BOS = with trend; CHoCH =
+    //      against; MSS = against + displacement on the breaking candle. Internal/
+    //      external is inherited from the BROKEN swing's degree.
+    dispB = math.abs(close - open) >= dispBodyATR * atr or (high - low) >= dispRngATR * atr
+    if not na(prevSwingHigh) and not prevHiBroken and close > prevSwingHigh
+        kind = trend < 0 ? (dispB ? 2 : 1) : 0                    // MSS/CHoCH vs BOS
+        eLv.push(prevSwingHigh), eOt.push(prevHiT), eBar.push(bar_index), eBt.push(time), eKind.push(kind), eDir.push(1), eExt.push(prevHiExt)
+        prevHiBroken := true
+        bullBreak := true
+    if not na(prevSwingLow) and not prevLoBroken and close < prevSwingLow
+        kind = trend > 0 ? (dispB ? 2 : 1) : 0
+        eLv.push(prevSwingLow), eOt.push(prevLoT), eBar.push(bar_index), eBt.push(time), eKind.push(kind), eDir.push(-1), eExt.push(prevLoExt)
+        prevLoBroken := true
+        bearBreak := true
 
     // 1d · strong/weak maintenance (LIVE): a high taken by a close → weak; unbroken
     //      highs at a bearish break → strong (mirror for lows). Identity never changes.
@@ -364,7 +392,7 @@ if barstate.isconfirmed
         sP.remove(0), sTy.remove(0), sBt.remove(0), sBar.remove(0), sExt.remove(0)
         sStr.remove(0), sState.remove(0), sBroken.remove(0)
     if eLv.size() > MAXEVT
-        eLv.remove(0), eBar.remove(0), eBt.remove(0), eKind.remove(0), eDir.remove(0), eExt.remove(0)
+        eLv.remove(0), eOt.remove(0), eBar.remove(0), eBt.remove(0), eKind.remove(0), eDir.remove(0), eExt.remove(0)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 2 · IDENTITY HASH (canonical window) + BAND-BASED FREEZE / REPLAY TEST
@@ -923,61 +951,86 @@ if barstate.islast
     drawn.clear(), drawnB.clear()
 
     n = sP.size()
-    // per-side recency budget: keep the most recent maxPts eligible highs and lows
+    // LABEL budget: most recent maxPts per side among label-eligible (type toggles apply)
     cutHi = 0
     cutLo = 0
     tmpHi = array.new<int>()
     tmpLo = array.new<int>()
+    // PIVOT-LINE budget: independent of the HH/HL/LH/LL label toggles, so the lines
+    // survive with all labels unchecked (only extOnly filters them)
+    cutHiL = 0
+    cutLoL = 0
+    tmpHiL = array.new<int>()
+    tmpLoL = array.new<int>()
     if n > 0
         for i = 0 to n - 1
-            elig = f_tyshow(sTy.get(i)) and (not extOnly or sExt.get(i))
-            if elig
-                if sTy.get(i) == 0 or sTy.get(i) == 2
+            isHi0 = sTy.get(i) == 0 or sTy.get(i) == 2
+            degOK = not extOnly or sExt.get(i)
+            if f_tyshow(sTy.get(i)) and degOK
+                if isHi0
                     tmpHi.push(sBar.get(i))
                 else
                     tmpLo.push(sBar.get(i))
+            if degOK
+                if isHi0
+                    tmpHiL.push(sBar.get(i))
+                else
+                    tmpLoL.push(sBar.get(i))
     if tmpHi.size() > maxPts
         tmpHi.sort(order.descending)
         cutHi := tmpHi.get(maxPts - 1)
     if tmpLo.size() > maxPts
         tmpLo.sort(order.descending)
         cutLo := tmpLo.get(maxPts - 1)
+    if tmpHiL.size() > maxPts
+        tmpHiL.sort(order.descending)
+        cutHiL := tmpHiL.get(maxPts - 1)
+    if tmpLoL.size() > maxPts
+        tmpLoL.sort(order.descending)
+        cutLoL := tmpLoL.get(maxPts - 1)
 
     tfMs = timeframe.in_seconds() * 1000
     if n > 0
         for i = 0 to n - 1
             ty = sTy.get(i)
             isHi = ty == 0 or ty == 2
-            elig = f_tyshow(ty) and (not extOnly or sExt.get(i)) and sBar.get(i) >= (isHi ? cutHi : cutLo)
-            if elig
-                col = f_tycol(ty)
+            degOK = not extOnly or sExt.get(i)
+            col = f_tycol(ty)
+            // structure LABEL (type toggles + label budget)
+            if f_tyshow(ty) and degOK and sBar.get(i) >= (isHi ? cutHi : cutLo)
                 mark = markSW ? (sState.get(i) == 1 ? " ●" : sState.get(i) == 2 ? " ○" : "") : ""
                 txt = f_tyname(ty) + (sExt.get(i) ? "" : "·") + mark
                 drawn.push(label.new(sBt.get(i), sP.get(i), txt, xloc = xloc.bar_time, yloc = yloc.price,
                      style = isHi ? label.style_label_down : label.style_label_up,
                      color = color.new(col, sExt.get(i) ? 0 : 45), textcolor = color.white, size = lblSize))
-                // optional pivot-point line at the swing price (own extend / style)
-                if showPivLines
-                    drawnB.push(line.new(sBt.get(i), sP.get(i), sBt.get(i) + tfMs, sP.get(i), xloc = xloc.bar_time,
-                         extend = pivExtV, color = color.new(col, sExt.get(i) ? 30 : 55), width = pivWid, style = pivStyle))
+            // PIVOT LINE — independent of label toggles (own budget)
+            if showPivLines and degOK and sBar.get(i) >= (isHi ? cutHiL : cutLoL)
+                drawnB.push(line.new(sBt.get(i), sP.get(i), sBt.get(i) + tfMs, sP.get(i), xloc = xloc.bar_time,
+                     extend = pivExtV, color = color.new(col, sExt.get(i) ? 30 : 55), width = pivWid, style = pivStyle))
 
-    // Break lines — filtered by type (BOS/CHoCH/MSS) AND degree (internal/external)
+    // Break lines — TRUE institutional anchoring: each ray runs FROM the broken
+    // swing's candle (origin) TO the candle that closed through it, at the broken
+    // price. Filtered by type (BOS/CHoCH/MSS) and degree (internal/external).
+    brkSize = f_size(brkLblSz)
     if eLv.size() > 0
-        show = math.min(eLv.size(), 40)
-        for j = eLv.size() - show to eLv.size() - 1
-            k = eKind.get(j)
-            ext = eExt.get(j)
-            if f_kindShow(k) and (ext ? showBrkExt : showBrkInt)
-                dir = eDir.get(j)
-                kcol = k == 2 ? color.yellow : dir > 0 ? colBull : colBear
-                ktxt = (k == 0 ? "BOS" : k == 1 ? "CHoCH" : "MSS") + (ext ? "" : "·")
-                x2 = brkExtV == extend.none ? eBt.get(j) + brkLineLen * tfMs : eBt.get(j) + tfMs
-                drawnB.push(line.new(eBt.get(j), eLv.get(j), x2, eLv.get(j), xloc = xloc.bar_time,
-                     extend = brkExtV, color = color.new(kcol, ext ? 0 : 40), width = ext ? 1 : 1,
-                     style = k == 0 ? line.style_solid : line.style_dashed))
-                drawn.push(label.new(eBt.get(j), eLv.get(j), ktxt, xloc = xloc.bar_time, yloc = yloc.price,
-                     style = dir > 0 ? label.style_label_up : label.style_label_down,
-                     color = color.new(kcol, ext ? 20 : 50), textcolor = color.black, size = size.tiny))
+        show = math.min(eLv.size(), maxBrk)
+        shown = 0
+        for j = eLv.size() - 1 to 0
+            if shown < show
+                k = eKind.get(j)
+                ext = eExt.get(j)
+                if f_kindShow(k) and (ext ? showBrkExt : showBrkInt)
+                    dir = eDir.get(j)
+                    kcol = k == 2 ? colMSS : dir > 0 ? colBull : colBear
+                    ktxt = (k == 0 ? "BOS" : k == 1 ? "CHoCH" : "MSS") + (ext ? "" : "·")
+                    drawnB.push(line.new(eOt.get(j), eLv.get(j), eBt.get(j), eLv.get(j), xloc = xloc.bar_time,
+                         extend = brkExtV, color = color.new(kcol, ext ? 0 : 40), width = brkWid,
+                         style = k == 0 ? line.style_solid : line.style_dashed))
+                    if showBrkLbl
+                        drawn.push(label.new(eBt.get(j), eLv.get(j), ktxt, xloc = xloc.bar_time, yloc = yloc.price,
+                             style = dir > 0 ? label.style_label_up : label.style_label_down,
+                             color = color.new(kcol, ext ? 20 : 50), textcolor = color.black, size = brkSize))
+                    shown += 1
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 4 · DEBUG PANEL — hash · trend · counts · freeze test (band)
