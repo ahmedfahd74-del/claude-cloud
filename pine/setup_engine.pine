@@ -94,6 +94,25 @@ atrLo    = input.float(0.70, "Compression (ATR ≤ × ATR SMA)", minval = 0.2, m
 rangeLen = input.int(50, "Premium/Discount range (bars)", minval = 10, maxval = 500, group = gFlt,
      tooltip = "The dealing range = highest high / lowest low over N bars; equilibrium = its midpoint. Longs favoured in discount, shorts in premium.")
 
+// ─── Entry engine (spec §7 state machine, §8 invalidation/expiration) ────────
+gEnt     = "Entry engine"
+entOn    = input.bool(true, "Enable setup engine", group = gEnt)
+reqBias  = input.bool(true, "Require MTF bias alignment", group = gEnt,
+     tooltip = "Only take setups in the weighted W/D/4H bias direction. Off = the chart-TF structure trend gates direction instead.")
+reqPD    = input.bool(true, "Require premium/discount alignment", group = gEnt,
+     tooltip = "Hard gate (spec D9): longs only in DISCOUNT, shorts only in PREMIUM. A long at premium is chasing.")
+confirmBars = input.int(10, "Confirm window after sweep (bars)", minval = 2, maxval = 60, group = gEnt,
+     tooltip = "After a valid sweep, a micro structural confirmation (a close breaking the trigger swing in the trade direction, with displacement quality ≥ threshold) must print within this many bars, else the setup expires.")
+slBufATR = input.float(0.10, "SL buffer beyond sweep extreme (× ATR)", minval = 0.0, maxval = 2.0, step = 0.05, group = gEnt)
+partialR = input.float(1.0, "Partial target (R)", minval = 0.5, maxval = 5.0, step = 0.25, group = gEnt,
+     tooltip = "TP1 = entry + this many R in the trade direction (spec: take 50% and move SL to break-even — management is manual in this phase).")
+maxTgtR  = input.float(3.0, "Max final target (R)", minval = 1.0, maxval = 10.0, step = 0.5, group = gEnt,
+     tooltip = "Final target = the next opposing liquidity level, capped at this many R; if none exists within the cap, the cap itself is the target.")
+showSetup= input.bool(true, "Draw entry / SL / TP lines", group = gEnt)
+colEntry = input.color(#42a5f5, "Entry", inline = "e", group = gEnt)
+colSL    = input.color(#ef5350, "SL", inline = "e", group = gEnt)
+colTP    = input.color(#26a69a, "TP", inline = "e", group = gEnt)
+
 // ─── Display (read-only — never changes the database or the hash) ───────────
 showHH   = input.bool(true, "HH", inline = "t", group = "Display")
 showHL   = input.bool(true, "HL", inline = "t", group = "Display")
@@ -662,6 +681,101 @@ f_phaseName(int c) => c == 6 ? "Expansion" : c == 1 ? "Trending" : c == 2 ? "Pul
 // phase favours trend-continuation setups (Trending/Pullback/Expansion)
 phaseFav = phaseCode == 1 or phaseCode == 2 or phaseCode == 6
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 2e · ENTRY STATE MACHINE (spec §7) — IDLE → SWEPT → TRIGGERED, with hard
+//      gates, invalidation and expiration (spec §8). Deterministic: every
+//      transition happens on a confirmed bar from already-confirmed inputs.
+//      ARMED is implicit (bias + AT LEVEL + gates all live on the HUD); a state
+//      RECORD is created at the SWEEP because that is the first frozen event.
+//
+//      Confirmation = micro structural break: after a bullish sweep, a CLOSE
+//      above the sweep candle's high (the trigger level) with displacement
+//      quality ≥ dispQualMin, within confirmBars. Mirror for bearish.
+//      Invalidation (spec §8): close beyond the sweep extreme · opposite sweep ·
+//      MTF bias flip. Expiration: no confirm within confirmBars.
+// ═══════════════════════════════════════════════════════════════════════════
+// setup state: 0 IDLE · 1 SWEPT (awaiting confirm) · 2 TRIGGERED (levels valid)
+var int   stState   = 0
+var int   stDir     = 0        // +1 long · -1 short
+var float stLevel   = na       // swept liquidity level
+var float stExtreme = na       // sweep wick extreme (SL anchor)
+var string stTag    = ""       // which level was swept
+var int   stBarSw   = na       // bar of the sweep
+var int   stBias0   = 0        // MTF bias captured at the sweep (sync check)
+var float stEntry   = na
+var float stSL      = na
+var float stTP1     = na
+var float stTP2     = na
+var float stTrig    = na       // micro trigger level (sweep candle's far side)
+justTriggered = false
+justInvalid   = false
+
+// direction gates (recomputed every bar; hard gates per spec §9.1)
+biasDir = reqBias ? mtfBias : trend
+longOK  = biasDir > 0 and volOK and (not reqPD or inDiscount)
+shortOK = biasDir < 0 and volOK and (not reqPD or not inDiscount)
+
+if entOn and barstate.isconfirmed
+    // ── state 1 → confirm / invalidate / expire ─────────────────────────────
+    if stState == 1
+        expired = bar_index - stBarSw > confirmBars
+        // invalidation: close back beyond the sweep extreme = the level truly broke
+        broke = stDir > 0 ? close < stExtreme : close > stExtreme
+        biasFlip = reqBias and mtfBias != stBias0
+        if expired or broke or biasFlip
+            stState := 0
+            justInvalid := true
+        else
+            confd = stDir > 0 ? close > stTrig : close < stTrig
+            if confd and f_dispQual(stDir) >= dispQualMin
+                // TRIGGERED — freeze the trade map
+                stEntry := close
+                stSL := stDir > 0 ? stExtreme - slBufATR * atr : stExtreme + slBufATR * atr
+                risk = math.abs(stEntry - stSL)
+                stTP1 := stDir > 0 ? stEntry + partialR * risk : stEntry - partialR * risk
+                // final target: next opposing liquidity level within maxTgtR, else cap
+                cap = stDir > 0 ? stEntry + maxTgtR * risk : stEntry - maxTgtR * risk
+                best = cap
+                if Lp.size() > 0
+                    for i = 0 to Lp.size() - 1
+                        p = Lp.get(i)
+                        if stDir > 0 and p > stEntry + risk and p < best
+                            best := p
+                        if stDir < 0 and p < stEntry - risk and p > best
+                            best := p
+                stTP2 := best
+                stState := 2
+                justTriggered := true
+    // ── state 2 → keep until SL or TP2 is crossed (map completes) ───────────
+    else if stState == 2
+        done = stDir > 0 ? (close < stSL or close > stTP2) : (close > stSL or close < stTP2)
+        if done
+            stState := 0
+    // ── state 0 → a fresh valid sweep arms a setup record ────────────────────
+    if stState == 0
+        if bullSweep and longOK
+            n1 = swpP.size() - 1
+            stDir := 1
+            stLevel := swpP.get(n1)
+            stTag := swpTag.get(n1)
+            stExtreme := low
+            stTrig := high
+            stBarSw := bar_index
+            stBias0 := mtfBias
+            stState := 1
+        else if bearSweep and shortOK
+            n1 = swpP.size() - 1
+            stDir := -1
+            stLevel := swpP.get(n1)
+            stTag := swpTag.get(n1)
+            stExtreme := high
+            stTrig := low
+            stBarSw := bar_index
+            stBias0 := mtfBias
+            stState := 1
+alertcondition(justTriggered, "Setup TRIGGERED", "Sweep + reclaim confirmed with displacement — entry map frozen (entry/SL/TP on chart)")
+alertcondition(justInvalid, "Setup invalidated", "Pending setup expired or was invalidated (level broke / bias flip / timeout)")
+
 // ── Per-group VISUAL settings (display only — never touches Lp price) ────────
 f_gCol(int g, bool above) => g == 0 ? pdC : g == 1 ? pwC : g == 2 ? loC : g == 3 ? nyC : g == 4 ? asC : g == 5 ? syC : g == 6 ? eqC : (above ? swCb : swCs)
 f_gStyS(int g) => g == 0 ? pdSt : g == 1 ? pwSt : (g >= 2 and g <= 5) ? seSt : g == 6 ? eqSt : swSt
@@ -729,6 +843,35 @@ if barstate.islast and showSwp
                  style = up ? label.style_label_up : label.style_label_down,
                  color = color.new(c, conf ? 0 : 65), textcolor = conf ? color.white : color.new(c, 0),
                  size = size.tiny))
+
+// ── Trade map (read-only): entry / SL / TP1 / final-target lines while a setup
+//    is TRIGGERED; pending setups show the trigger + invalidation guide. ─────────
+var array<line>  stLn = array.new<line>()
+var array<label> stLb = array.new<label>()
+f_tradeLine(float y, color c, string t, bool dash) =>     // global scope (Pine bans local fns)
+    stLn.push(line.new(bar_index - 8, y, bar_index, y, extend = extend.right, color = c, width = 2,
+         style = dash ? line.style_dashed : line.style_solid))
+    stLb.push(label.new(bar_index + 2, y, t, xloc = xloc.bar_index, style = label.style_label_left,
+         color = color.new(c, 15), textcolor = color.white, size = size.small))
+if barstate.islast
+    if stLn.size() > 0
+        for i = 0 to stLn.size() - 1
+            line.delete(stLn.get(i))
+    if stLb.size() > 0
+        for i = 0 to stLb.size() - 1
+            label.delete(stLb.get(i))
+    stLn.clear()
+    stLb.clear()
+    if showSetup and stState > 0
+        if stState == 2
+            rr = math.abs(stEntry - stSL) > 0 ? math.abs(stTP2 - stEntry) / math.abs(stEntry - stSL) : 0.0
+            f_tradeLine(stEntry, colEntry, (stDir > 0 ? "LONG " : "SHORT ") + "ENTRY " + str.tostring(stEntry, format.mintick), false)
+            f_tradeLine(stSL, colSL, "SL " + str.tostring(stSL, format.mintick), false)
+            f_tradeLine(stTP1, colTP, "TP1 (" + str.tostring(partialR, "#.##") + "R) " + str.tostring(stTP1, format.mintick), true)
+            f_tradeLine(stTP2, colTP, "TARGET " + str.tostring(stTP2, format.mintick) + "  (" + str.tostring(rr, "#.#") + "R)", false)
+        else
+            f_tradeLine(stTrig, colEntry, (stDir > 0 ? "▲" : "▼") + " confirm @ " + str.tostring(stTrig, format.mintick), true)
+            f_tradeLine(stExtreme, colSL, "invalid beyond " + str.tostring(stExtreme, format.mintick), true)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 3 · RENDERER — READ-ONLY. Structure labels + BOS/CHoCH/MSS markers.
@@ -826,12 +969,16 @@ mtfStr = "W" + f_ar(wTr) + " D" + f_ar(dTr) + " 4H" + f_ar(h4Tr) + " → " + (mt
 mtfCol = mtfBias > 0 ? colBull : mtfBias < 0 ? colBear : color.gray
 pdStr  = (inDiscount ? "Discount" : "Premium") + " " + str.tostring(math.round(pdPct * 100)) + "%"
 pdCol  = inDiscount ? colBull : colBear
-var table hud = table.new(position.top_right, 2, 15, bgcolor = color.new(#0a1a3a, 10), border_width = 1, border_color = color.new(color.gray, 60))
+setupStr = not entOn ? "off" : stState == 0 ? "IDLE — waiting for sweep" : stState == 1 ? (stDir > 0 ? "▲ SWEPT " : "▼ SWEPT ") + stTag + " — awaiting confirm" : (stDir > 0 ? "▲ LONG ACTIVE @ " : "▼ SHORT ACTIVE @ ") + str.tostring(stEntry, format.mintick)
+setupCol = stState == 0 ? color.gray : stState == 1 ? #ffb300 : (stDir > 0 ? colBull : colBear)
+var table hud = table.new(position.top_right, 2, 16, bgcolor = color.new(#0a1a3a, 10), border_width = 1, border_color = color.new(color.gray, 60))
 if barstate.islast
     table.cell(hud, 0, 0, "STRUCT HASH", text_color = color.white, text_size = size.normal)
     table.cell(hud, 1, 0, str.tostring(dbHash), text_color = #00e676, text_size = size.normal)
     table.cell(hud, 0, 1, "Structure trend", text_color = color.gray, text_size = size.small)
     table.cell(hud, 1, 1, trendStr, text_color = trendCol, text_size = size.normal)
+    table.cell(hud, 0, 15, "SETUP", text_color = color.white, text_size = size.small)
+    table.cell(hud, 1, 15, setupStr, text_color = setupCol, text_size = size.normal)
     table.cell(hud, 0, 2, "MTF bias (3·2·1)", text_color = color.gray, text_size = size.small)
     table.cell(hud, 1, 2, mtfStr, text_color = mtfCol, text_size = size.small)
     table.cell(hud, 0, 3, "Market phase", text_color = color.gray, text_size = size.small)
