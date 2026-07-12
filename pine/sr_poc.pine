@@ -118,7 +118,12 @@ f_book() =>
                 wv := sc
                 w := i
         p.remove(w), b.remove(w), s.remove(w), t.remove(w), k.remove(w), bt.remove(w)
-    [p, b, s, t, k, bt]
+    // `time` = this HTF bar's open time. It advances ONLY when the timeframe
+    // closes a new bar, so the caller can detect (via ta.change) exactly when
+    // this book could have changed — and skip the union rebuild otherwise. The
+    // book itself is byte-identical between HTF closes, so gating the rebuild on
+    // this signal changes nothing in the union, only how often it is recomputed.
+    [p, b, s, t, k, bt, time]
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 2 · FETCH FROZEN BOOKS (one security call per TF) + chart-independent ATR
@@ -137,9 +142,9 @@ f_reqtf(string tf) => timeframe.in_seconds(tf) < timeframe.in_seconds() ? timefr
 useW  = timeframe.in_seconds("W")   >= timeframe.in_seconds()
 useD  = timeframe.in_seconds("D")   >= timeframe.in_seconds()
 use4  = timeframe.in_seconds("240") >= timeframe.in_seconds()
-[wP,  wB,  wS,  wT,  wK,  wBT]  = request.security(syminfo.tickerid, f_reqtf("W"),   f_book(), lookahead = barmerge.lookahead_off)
-[dP,  dB,  dS,  dT,  dK,  dBT]  = request.security(syminfo.tickerid, f_reqtf("D"),   f_book(), lookahead = barmerge.lookahead_off)
-[h4P, h4B, h4S, h4T, h4K, h4BT] = request.security(syminfo.tickerid, f_reqtf("240"), f_book(), lookahead = barmerge.lookahead_off)
+[wP,  wB,  wS,  wT,  wK,  wBT,  wTM]  = request.security(syminfo.tickerid, f_reqtf("W"),   f_book(), lookahead = barmerge.lookahead_off)
+[dP,  dB,  dS,  dT,  dK,  dBT,  dTM]  = request.security(syminfo.tickerid, f_reqtf("D"),   f_book(), lookahead = barmerge.lookahead_off)
+[h4P, h4B, h4S, h4T, h4K, h4BT, h4TM] = request.security(syminfo.tickerid, f_reqtf("240"), f_book(), lookahead = barmerge.lookahead_off)
 atrD = request.security(syminfo.tickerid, f_reqtf("D"), ta.atr(14), lookahead = barmerge.lookahead_off)
 atrRef = na(atrD) or atrD <= 0 ? close * 0.005 : atrD
 // Chart-INDEPENDENT "today 00:00" anchor: the current daily bar's open time is
@@ -191,10 +196,25 @@ f_ingest(bool use, array<float> p, array<float> b, array<int> s, array<float> t,
             Dp.push(px), Db.push(b.get(i)), Ds.push(s.get(i)), Dr.push(rk), Dt.push(t.get(i))
             Dtf.push(tf), Dbk.push(k.get(i)), Dkey.push(key), Dbt.push(bt.get(i))
 
-Dp.clear(), Db.clear(), Ds.clear(), Dr.clear(), Dt.clear(), Dtf.clear(), Dbk.clear(), Dkey.clear(), Dbt.clear()
-f_ingest(useW, wP,  wB,  wS,  wT,  wK,  wBT,  1.00, 3)
-f_ingest(useD, dP,  dB,  dS,  dT,  dK,  dBT,  0.80, 2)
-f_ingest(use4, h4P, h4B, h4S, h4T, h4K, h4BT, 0.60, 1)
+// REBUILD-ON-CHANGE (RE10110 fix). The union is a pure function of the three
+// frozen books, which are byte-identical between HTF closes. So instead of
+// clearing and re-pushing every level on EVERY chart bar (O(union) per bar —
+// the quadratic that timed out on 15m, where thousands of chart bars each
+// rebuilt a book that only changes weekly/daily/4-hourly), rebuild ONLY when a
+// used source advanced. On no-change bars the var arrays keep last bar's union,
+// which is exactly what an unconditional rebuild would have produced — identical
+// membership, identical hash, zero determinism change. The three hash-sampling
+// bars (last, last-500, last-1000) force a rebuild so the freeze test still
+// samples a fresh, correct union. On a chart whose TF equals a source (e.g. 1D),
+// that source's time changes every bar → rebuild every bar → old behaviour,
+// which was already fast there; the win is precisely on sub-source chart TFs.
+srcChanged = (useW and ta.change(wTM) != 0) or (useD and ta.change(dTM) != 0) or (use4 and ta.change(h4TM) != 0)
+sampleBar  = bar_index == last_bar_index or bar_index == last_bar_index - 500 or bar_index == last_bar_index - 1000
+if barstate.isfirst or srcChanged or sampleBar
+    Dp.clear(), Db.clear(), Ds.clear(), Dr.clear(), Dt.clear(), Dtf.clear(), Dbk.clear(), Dkey.clear(), Dbt.clear()
+    f_ingest(useW, wP,  wB,  wS,  wT,  wK,  wBT,  1.00, 3)
+    f_ingest(useD, dP,  dB,  dS,  dT,  dK,  dBT,  0.80, 2)
+    f_ingest(use4, h4P, h4B, h4S, h4T, h4K, h4BT, 0.60, 1)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 4 · POWER LINE — one controlling level, chosen ONLY from the database
@@ -266,8 +286,11 @@ f_wincount() =>
             if not Dbk.get(i) and f_inWin(i)
                 c += 1
     c
-dbHash    = f_hash()
-winLevels = f_wincount()
+// Both are read ONLY in the HUD at barstate.islast, so the O(union) scans run
+// once at the end instead of on every one of thousands of chart bars. Same
+// values where they matter; the timeout budget stops paying for invisible work.
+dbHash    = barstate.islast ? f_hash() : 0
+winLevels = barstate.islast ? f_wincount() : 0
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 4c · REPLAY / FREEZE-INTEGRITY TEST — the "solid enough to build on" proof.
@@ -293,7 +316,9 @@ f_whash(int cutT) =>
             if Dbt.get(i) <= cutT
                 h := int(math.abs((h + Dkey.get(i) * 131 + Ds.get(i) * 17 + Dtf.get(i) * 7) % 99999989))
     h
-wHash = f_whash(freezeCutT)
+// wHash is captured into rA/rB/rC only at the three sample bars, so it only
+// needs computing there — another O(union) scan removed from every other bar.
+wHash = sampleBar ? f_whash(freezeCutT) : 0
 // Sample the frozen-window hash at three fixed anchor bars and CAPTURE each into a
 // var scalar — no series-history indexing (wHash[500]/[1000]) that would force Pine
 // to buffer 1000 bars of every series (incl. the request.security arrays) and blow

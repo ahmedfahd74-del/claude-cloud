@@ -180,6 +180,17 @@ MAXBOOK = 20
 // Level anchor blend: 0 = wick extreme, 0.5 = wick/body midpoint, 1 = body edge.
 anchorA = anchorMode == "Body" ? 1.0 : anchorMode == "Wick/Body Mid" ? 0.5 : 0.0
 
+// CROSS-TF CONFLUENCE RADIUS (frozen, × the level's OWN-TF ATR). The confluence
+// score factor — the heaviest weight (W_CONF) — must be identical on every chart
+// timeframe, exactly like the merge/break radii already are. So its band is
+// driven ONLY by the scored level's timeframe-native ATR (chart-independent) and
+// this frozen constant — never the chart-bar ATR or the per-bar regime
+// multiplier, both of which change with the chart TF and made the same level
+// score differently on 5m vs 1h (the drift the Power Line had to tolerate). A
+// touch wider than the 0.5 merge radius so confluence still catches near-but-
+// distinct HTF levels without merging them.
+CONF_BAND_K = 0.75
+
 // Safe division — never returns na/inf on zero denominator.
 f_div(float a, float b) => b == 0 or na(b) ? 0.0 : a / b
 
@@ -890,8 +901,12 @@ f_rankThresh(Store s, int n) =>
 // frozen position and reappears unchanged when shown again.
 f_scoreAndRender(Store s, color baseCol, Store o1, Store o2, Store o3, Store o4, Store o5, Store o6, bool drawOK) =>
     if s.price.size() > 0
-        atrRef = math.max(atrSafe, s.atrTF * 0.5)
-        band   = atrRef * adMergeMult * 1.5
+        // TF-NATIVE confluence scale — own-TF ATR only (chart-independent), so the
+        // confluence count and the equal-level tolerance below are identical on
+        // every chart TF. Was math.max(atrSafe, atrTF·0.5)·adMergeMult·1.5, which
+        // mixed chart-bar ATR and the per-bar regime multiplier into the score.
+        atrRef = s.atrTF > 0 ? s.atrTF : atrSafe
+        band   = atrRef * CONF_BAND_K
         // --- PASS 1: score every live level (no rendering, no mutation of price)
         for i = 0 to s.price.size() - 1
             if not s.broken.get(i)
