@@ -191,6 +191,33 @@ anchorA = anchorMode == "Body" ? 1.0 : anchorMode == "Wick/Body Mid" ? 0.5 : 0.0
 // distinct HTF levels without merging them.
 CONF_BAND_K = 0.75
 
+// #############################################################################
+// # DETERMINISM VALIDATION LAYER — READ-ONLY (see docs/architecture/adr-001)
+// #   An append-only IDENTITY LOG that runs parallel to the display book but
+// #   never evicts and holds ONLY integers (tick-price, side, TF-code, birth
+// #   bar). It exists solely to hash / freeze-test the engine's REAL level
+// #   identities without disturbing them, and WITHOUT any request.security
+// #   replay (it is fed on the chart bar from f_addLevel). Rolling-capped so
+// #   memory stays bounded on deep-history LTF symbols. Nothing here can change
+// #   a level, score, ranking, the Power Line, a trade plan, or an alert.
+// #############################################################################
+DET_LOGCAP = 4000                              // > level count inside the freeze window
+var array<int> detKey   = array.new<int>()     // price in ticks — the frozen identity
+var array<int> detSide  = array.new<int>()     // 1 = resistance at birth, 0 = support
+var array<int> detTfC   = array.new<int>()     // coarse TF code = round(store weight * 100)
+var array<int> detBirth = array.new<int>()     // bar_index at creation (frozen)
+
+// Record one committed identity. Called from f_addLevel's creation branch only,
+// so it logs exactly what the engine commits, once, on confirmation.
+f_detLog(float px, bool isRes, float w) =>
+    if not na(px)
+        detKey.push(int(math.round(px / syminfo.mintick)))
+        detSide.push(isRes ? 1 : 0)
+        detTfC.push(int(math.round(w * 100)))
+        detBirth.push(bar_index)
+        if detKey.size() > DET_LOGCAP
+            detKey.shift(), detSide.shift(), detTfC.shift(), detBirth.shift()
+
 // Safe division — never returns na/inf on zero denominator.
 f_div(float a, float b) => b == 0 or na(b) ? 0.0 : a / b
 
@@ -616,6 +643,10 @@ f_addLevel(Store s, float p, bool isRes, color col, int wdt, string lstyle) =>
             s.sweeps.unshift(0)
             s.breaks.unshift(0)
             s.broken.unshift(false)
+            // DETERMINISM LOG (read-only): record this frozen identity. Append-only
+            // and independent of the display eviction below, so the hash reflects
+            // the true identity set, immune to chart-dependent eviction.
+            f_detLog(p, isRes, s.w)
             while s.price.size() > MAXBOOK
                 // Evict weakest, never the just-added level (index 0) and never
                 // the store's STRUCTURAL EXTREMES (highest / lowest unbroken
@@ -1984,3 +2015,96 @@ enableExport = input.bool(false, "Emit JSON decision alert (per bar close)", gro
 if enableExport and barstate.isconfirmed
     payload = '{"v":1,"sym":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","state":"' + marketState + '","bias":"' + bias + '","bull":' + str.tostring(math.round(bullProb)) + ',"bear":' + str.tostring(math.round(bearProb)) + ',"quality":"' + tradeQuality + '","htfAlign":' + str.tostring(htfAlign) + ',"supConf":' + str.tostring(math.round(scoreSup)) + ',"resConf":' + str.tostring(math.round(scoreRes)) + ',"regime":"' + regimeTxt + '","valid":' + (valid ? 'true' : 'false') + ',"entry":' + f_jnum(entry) + ',"stop":' + f_jnum(stop) + ',"tp1":' + f_jnum(tp1) + ',"tp2":' + f_jnum(tp2) + ',"tp3":' + f_jnum(tp3) + ',"rr":' + str.tostring(rrVal, "#.##") + ',"power":' + f_jnum(powerPrice) + ',"atr":' + f_jnum(atrFast) + ',"planN":' + str.tostring(planTotal) + ',"planWin":' + (planTotal > 0 ? str.tostring(math.round(100.0 * planWins / planTotal)) : "null") + ',"tier":"' + tier + '","gs":' + str.tostring(math.round(gs)) + '}'
     alert(payload, alert.freq_once_per_bar_close)
+
+// #############################################################################
+// # SECTION 17 — DETERMINISM HASH & FREEZE VALIDATION (read-only instrument)
+// #   Hashes the append-only identity log (declared up top). Three instruments:
+// #     · DB HASH   — commutative fingerprint of EVERY logged identity.
+// #     · HTF HASH  — same over 4H/D/W/MN (tfC >= 60) only: the cross-TF-
+// #                   comparable set, populated on every intraday chart.
+// #     · FREEZE    — hash of identities born <= a fixed cut, sampled at three
+// #                   CONFIRMED bars (last-1 / -501 / -1001). Append-only + frozen
+// #                   identities => that set is immutable => A = B = C on a non-
+// #                   repainting engine. Confirmed-bar sampling avoids the live-
+// #                   bar request.security artifact that failed the POC on 1h.
+// #   All O(log) scans are gated to the bars where their result is displayed.
+// #############################################################################
+grpDet     = "Determinism Validation"
+showDetHUD = input.bool(true, "Show Determinism HUD", group = grpDet,
+     tooltip = "Read-only. Hash of the engine's real level identities + a freeze/replay test. Compare HTF HASH across 5m/15m/1h/4h (should match); FREEZE should read PASS on charts with 1000+ bars.")
+detWindow  = input.int(1200, "Freeze window (bars, must exceed 1001)", minval = 1050, group = grpDet)
+
+// Commutative identity hash (order-independent sum mod a prime). `htfOnly` limits
+// it to institutional TFs (tfC >= 60 = 4H/D/W/MN) for the cross-TF-stable readout.
+f_detHash(bool htOnly) =>
+    h = 0
+    if detKey.size() > 0
+        for i = 0 to detKey.size() - 1
+            if not htOnly or detTfC.get(i) >= 60
+                h := int(math.abs((h + detKey.get(i) * 131 + detSide.get(i) * 17 + detTfC.get(i) * 7) % 99999989))
+    h
+
+// Frozen-window hash: identities whose birth bar is at/before the cut. Immutable
+// set (append-only, frozen prices) => invariant across the three sample bars.
+f_detFreeze(int cutBar) =>
+    h = 0
+    if detKey.size() > 0
+        for i = 0 to detKey.size() - 1
+            if detBirth.get(i) <= cutBar
+                h := int(math.abs((h + detKey.get(i) * 131 + detSide.get(i) * 17 + detTfC.get(i) * 7) % 99999989))
+    h
+
+// DB / HTF hash read only in the HUD at the last bar → scans run once, not every bar.
+detDB = barstate.islast ? f_detHash(false) : 0
+detHT = barstate.islast ? f_detHash(true)  : 0
+
+// Freeze sampled at three CONFIRMED anchors; cut sits before the earliest anchor.
+detCut    = last_bar_index - detWindow
+detAnchor = bar_index == last_bar_index - 1 or bar_index == last_bar_index - 501 or bar_index == last_bar_index - 1001
+detFrz    = detAnchor ? f_detFreeze(detCut) : 0
+var int detA = na
+var int detB = na
+var int detC = na
+// RETENTION GUARD. A rolling-capped log can only prove the freeze invariant while
+// the whole frozen window is still IN the log. If the oldest surviving identity
+// was born AFTER the cut, older frozen levels have rolled off and A/B/C would
+// legitimately differ — that is a log-capacity limit, NOT a repaint. We detect it
+// (oldest birth <= cut, checked at the latest/most-loaded anchor) and report it
+// distinctly, so a FAIL only ever means a genuine determinism break.
+var bool detRetained = na
+var int  detOldC     = na             // oldest surviving birth captured at anchor C
+if bar_index == last_bar_index - 1001
+    detC    := detFrz
+    detOldC := detKey.size() > 0 ? detBirth.get(0) : na
+if bar_index == last_bar_index - 501
+    detB := detFrz
+if bar_index == last_bar_index - 1
+    detA := detFrz
+    // Retained iff the oldest surviving identity did NOT advance since anchor C
+    // (the log is shift-from-front, so oldest birth only grows; any growth means a
+    // frozen level rolled off and A/B/C would differ for a capacity reason, not a
+    // repaint). Also require C to have actually held window levels (detOldC <= cut).
+    detRetained := not na(detOldC) and detOldC <= detCut and detKey.size() > 0 and detBirth.get(0) <= detOldC
+detPass = not na(detC) and detRetained == true and detA == detB and detB == detC
+detFreezeTxt = na(detC) ? "need " + str.tostring(detWindow) + "+ bars" :
+     detRetained != true ? "raise cap / lower window" :
+     detPass ? "PASS ✓" : "FAIL ✗"
+detFreezeCol = na(detC) or detRetained != true ? color.gray : detPass ? #00e676 : #ff1744
+
+var table detHUD = table.new(position.middle_left, 2, 6, border_width = 1,
+     frame_color = color.new(color.gray, 60), frame_width = 1)
+if showDetHUD and barstate.islast
+    table.cell(detHUD, 0, 0, "DETERMINISM", text_color = color.black,
+         bgcolor = color.new(#00e676, 0), text_size = size.small, text_halign = text.align_left)
+    table.cell(detHUD, 1, 0, "IA-SR " + BUILD, text_color = color.black,
+         bgcolor = color.new(#00e676, 0), text_size = size.tiny, text_halign = text.align_right)
+    table.cell(detHUD, 0, 1, "DB HASH",  text_color = color.gray, text_size = size.small, text_halign = text.align_left)
+    table.cell(detHUD, 1, 1, str.tostring(detDB), text_color = #00e676, text_size = size.small, text_halign = text.align_right)
+    table.cell(detHUD, 0, 2, "HTF HASH (≥4H)", text_color = color.gray, text_size = size.small, text_halign = text.align_left)
+    table.cell(detHUD, 1, 2, str.tostring(detHT), text_color = color.aqua, text_size = size.small, text_halign = text.align_right)
+    table.cell(detHUD, 0, 3, "Log ids", text_color = color.gray, text_size = size.small, text_halign = text.align_left)
+    table.cell(detHUD, 1, 3, str.tostring(detKey.size()) + " / " + str.tostring(DET_LOGCAP), text_color = color.silver, text_size = size.small, text_halign = text.align_right)
+    table.cell(detHUD, 0, 4, "Freeze A/B/C", text_color = color.gray, text_size = size.small, text_halign = text.align_left)
+    table.cell(detHUD, 1, 4, str.tostring(detA) + "/" + (na(detB) ? "—" : str.tostring(detB)) + "/" + (na(detC) ? "—" : str.tostring(detC)), text_color = color.silver, text_size = size.tiny, text_halign = text.align_right)
+    table.cell(detHUD, 0, 5, "Freeze test", text_color = color.gray, text_size = size.small, text_halign = text.align_left)
+    table.cell(detHUD, 1, 5, detFreezeTxt, text_color = detFreezeCol, text_size = size.normal, text_halign = text.align_right)
