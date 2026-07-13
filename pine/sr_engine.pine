@@ -430,13 +430,24 @@ f_htfPack() =>
     pLo  = low[1]
     [lastH, lastL, hArr, lArr, aF, leg, tr, pHi, pLo]
 
-[phMN, plMN, hiMN, loMN, atrMN, legMN, trMN, pHiMN, pLoMN] = request.security(syminfo.tickerid, "M",   f_htfPack(), lookahead = barmerge.lookahead_off)
-[phW,  plW,  hiW,  loW,  atrW,  legW,  trW,  pHiW,  pLoW ] = request.security(syminfo.tickerid, "W",   f_htfPack(), lookahead = barmerge.lookahead_off)
-[phD,  plD,  hiD,  loD,  atrD,  legD,  trD,  pHiD,  pLoD ] = request.security(syminfo.tickerid, "D",   f_htfPack(), lookahead = barmerge.lookahead_off)
-[phH4, plH4, hiH4, loH4, atrH4, legH4, trH4, pHiH4, pLoH4] = request.security(syminfo.tickerid, "240", f_htfPack(), lookahead = barmerge.lookahead_off)
-[phH1, plH1, hiH1, loH1, atrH1, legH1, trH1, pHiH1, pLoH1] = request.security(syminfo.tickerid, "60",  f_htfPack(), lookahead = barmerge.lookahead_off)
-[phM15, plM15, hiM15, loM15, atrM15, legM15, trM15, pHiM15, pLoM15] = request.security(syminfo.tickerid, "15", f_htfPack(), lookahead = barmerge.lookahead_off)
-[phM5,  plM5,  hiM5,  loM5,  atrM5,  legM5,  trM5,  pHiM5,  pLoM5 ] = request.security(syminfo.tickerid, "5",  f_htfPack(), lookahead = barmerge.lookahead_off)
+// SUB-CHART GUARD (fixes the 1W/1D + deep-history/forex runtime error). Requesting
+// a timeframe BELOW the chart TF forces request.security to replay that lower TF's
+// entire history inside a stateful pack — which blows TradingView's memory/time
+// limit (RE10139/RE10110) on 1D/1W charts (4H/1H/15/5 are sub-chart there) and on
+// deep-history forex even intraday. f_reqtf clamps each requested TF up to at least
+// the chart TF. Stores below the chart are NOT populated anyway (effUse* gates), so
+// their (now cheap, same-TF) data is unused — LEVEL IDENTITIES and the STRUCT HASH /
+// freeze test are byte-identical on every chart at/above each TF. The only change on
+// an intraday chart is that a sub-chart TREND row degrades to the chart TF, which an
+// HTF-context engine should not rely on regardless.
+f_reqtf(simple string tf) => timeframe.in_seconds(tf) < timeframe.in_seconds() ? timeframe.period : tf
+[phMN, plMN, hiMN, loMN, atrMN, legMN, trMN, pHiMN, pLoMN] = request.security(syminfo.tickerid, f_reqtf("M"),   f_htfPack(), lookahead = barmerge.lookahead_off)
+[phW,  plW,  hiW,  loW,  atrW,  legW,  trW,  pHiW,  pLoW ] = request.security(syminfo.tickerid, f_reqtf("W"),   f_htfPack(), lookahead = barmerge.lookahead_off)
+[phD,  plD,  hiD,  loD,  atrD,  legD,  trD,  pHiD,  pLoD ] = request.security(syminfo.tickerid, f_reqtf("D"),   f_htfPack(), lookahead = barmerge.lookahead_off)
+[phH4, plH4, hiH4, loH4, atrH4, legH4, trH4, pHiH4, pLoH4] = request.security(syminfo.tickerid, f_reqtf("240"), f_htfPack(), lookahead = barmerge.lookahead_off)
+[phH1, plH1, hiH1, loH1, atrH1, legH1, trH1, pHiH1, pLoH1] = request.security(syminfo.tickerid, f_reqtf("60"),  f_htfPack(), lookahead = barmerge.lookahead_off)
+[phM15, plM15, hiM15, loM15, atrM15, legM15, trM15, pHiM15, pLoM15] = request.security(syminfo.tickerid, f_reqtf("15"), f_htfPack(), lookahead = barmerge.lookahead_off)
+[phM5,  plM5,  hiM5,  loM5,  atrM5,  legM5,  trM5,  pHiM5,  pLoM5 ] = request.security(syminfo.tickerid, f_reqtf("5"),  f_htfPack(), lookahead = barmerge.lookahead_off)
 
 // --- Hold last confirmed swing per TF (verification preview for Phase 2) ----
 // Phase 3 replaces these single held values with managed, scored level arrays.
@@ -1304,6 +1315,16 @@ stateCol = marketState == "Trend Expansion" or marketState == "Momentum Continua
 // nearest live level, then to the dominant HTF trend swing (empty book).
 pATR = math.max(nz(atrD, atrFast), syminfo.mintick)
 
+// POWER-LINE HYSTERESIS. f_powerPick re-ranks every bar, so the winner flips
+// bar-to-bar between two comparable levels — the "jumping" (it tracked the bear
+// break-retest, then a small rank shift flipped it to another level). The
+// incumbent level keeps its spot unless a challenger beats it by POWER_HOLD×, so
+// marginal flips are suppressed while a DECISIVELY closer level still takes over
+// (no freezing far from price). Path state → updated on confirmed bars only
+// (non-repaint). Display/decision only — not part of the STRUCT hash.
+POWER_HOLD = 1.8
+var float pwrHold = na
+
 f_powerPick() =>
     float bp = na
     float bs = na
@@ -1356,6 +1377,10 @@ f_powerPick() =>
                              htfBull ? (below ? powerSideBias : 1.0 / powerSideBias) :
                              htfBear ? (below ? 1.0 / powerSideBias : powerSideBias) : 1.0
                         rank = prox * tfw * scw * sideW
+                        // incumbent stickiness (anti-jump): the currently-held
+                        // level defends its spot unless clearly out-ranked.
+                        if not na(pwrHold) and math.abs(p - pwrHold) <= pATR * 0.05
+                            rank *= POWER_HOLD
                         if rank > best
                             best := rank
                             bp := p
@@ -1368,6 +1393,9 @@ f_powerPick() =>
         br := fnR
     [bp, bs, br]
 [pwrP, pwrScore, pwrIsRes] = f_powerPick()
+// Remember the pick for next bar's incumbent stickiness (confirmed bars only).
+if barstate.isconfirmed and not na(pwrP)
+    pwrHold := pwrP
 
 // SINGLE SOURCE OF TRUTH: the Power Line is ALWAYS an existing frozen level
 // selected from the one level book (f_powerPick returns a store price, and its

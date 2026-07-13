@@ -460,13 +460,22 @@ if sP.size() > 0
 // (never the live bar); ANCHOR TIME points to the originating candle/session.
 // Prior day / week: price and anchor (previous bar's high/low and open time) are
 // pulled with lookahead_off, so they are identical on every chart timeframe.
-pdh = request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_off)
-pdl = request.security(syminfo.tickerid, "D", low[1],  lookahead = barmerge.lookahead_off)
-pdA = request.security(syminfo.tickerid, "D", time[1], lookahead = barmerge.lookahead_off)   // prev-day start
-pwh = request.security(syminfo.tickerid, "W", high[1], lookahead = barmerge.lookahead_off)
-pwl = request.security(syminfo.tickerid, "W", low[1],  lookahead = barmerge.lookahead_off)
-pwA = request.security(syminfo.tickerid, "W", time[1], lookahead = barmerge.lookahead_off)   // prev-week start
-atrDaily = request.security(syminfo.tickerid, "D", ta.atr(14), lookahead = barmerge.lookahead_off)
+// SUB-CHART GUARD (fixes the 1W/1D + deep-history runtime error). Requesting a
+// timeframe BELOW the chart TF forces request.security to replay that lower TF's
+// entire history — which blows TradingView's memory/time limit (RE10139/RE10110)
+// on 1D/1W charts (4H/Daily are sub-chart there) and is amplified on deep-history
+// forex. f_reqtf clamps any requested TF up to at least the chart TF, so the call
+// is never a sub-chart replay. On charts at/below the requested TF (all the crypto
+// intraday cases that already work) it returns the SAME tf → identical data, so
+// the STRUCT HASH and freeze test are byte-unchanged there.
+f_reqtf(simple string tf) => timeframe.in_seconds(tf) < timeframe.in_seconds() ? timeframe.period : tf
+pdh = request.security(syminfo.tickerid, f_reqtf("D"), high[1], lookahead = barmerge.lookahead_off)
+pdl = request.security(syminfo.tickerid, f_reqtf("D"), low[1],  lookahead = barmerge.lookahead_off)
+pdA = request.security(syminfo.tickerid, f_reqtf("D"), time[1], lookahead = barmerge.lookahead_off)   // prev-day start
+pwh = request.security(syminfo.tickerid, f_reqtf("W"), high[1], lookahead = barmerge.lookahead_off)
+pwl = request.security(syminfo.tickerid, f_reqtf("W"), low[1],  lookahead = barmerge.lookahead_off)
+pwA = request.security(syminfo.tickerid, f_reqtf("W"), time[1], lookahead = barmerge.lookahead_off)   // prev-week start
+atrDaily = request.security(syminfo.tickerid, f_reqtf("D"), ta.atr(14), lookahead = barmerge.lookahead_off)
 atrRef = na(atrDaily) or atrDaily <= 0 ? atr : atrDaily
 
 // Session highs/lows — the extreme and the TIME it printed are tracked live and
@@ -688,9 +697,9 @@ f_htrend(simple int L) =>
                 tr := -1
             psl := ll
     tr
-wTr  = request.security(syminfo.tickerid, "W",   f_htrend(3), lookahead = barmerge.lookahead_off)
-dTr  = request.security(syminfo.tickerid, "D",   f_htrend(3), lookahead = barmerge.lookahead_off)
-h4Tr = request.security(syminfo.tickerid, "240", f_htrend(5), lookahead = barmerge.lookahead_off)
+wTr  = request.security(syminfo.tickerid, f_reqtf("W"),   f_htrend(3), lookahead = barmerge.lookahead_off)
+dTr  = request.security(syminfo.tickerid, f_reqtf("D"),   f_htrend(3), lookahead = barmerge.lookahead_off)
+h4Tr = request.security(syminfo.tickerid, f_reqtf("240"), f_htrend(5), lookahead = barmerge.lookahead_off)
 // Weighted bias: Weekly 3 · Daily 2 · 4H 1 → W+D outrank D+4H (spec §4).
 dirScore = 3 * f_sgn(wTr) + 2 * f_sgn(dTr) + 1 * f_sgn(h4Tr)
 mtfBias  = dirScore >= 3 ? 1 : dirScore <= -3 ? -1 : 0
