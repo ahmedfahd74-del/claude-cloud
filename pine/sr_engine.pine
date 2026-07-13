@@ -177,6 +177,13 @@ MAXLEG = 14
 // only changes how many of the top-ranked ones are DRAWN (see f_scoreAndRender).
 MAXBOOK = 20
 
+// Fixed per-side HTF seed depth. The bar-1 history seed MUST NOT depend on the
+// user's "Max Levels" display setting, or changing that setting would re-seed a
+// different book — moving levels, scores and the Power Line (a determinism bug).
+// So the seed arrays are capped by this CONSTANT, never by maxLvl. 12/side ≥ the
+// book's useful depth (MAXBOOK); overflow is evicted deterministically.
+SEEDPERSIDE = 12
+
 // Level anchor blend: 0 = wick extreme, 0.5 = wick/body midpoint, 1 = body edge.
 anchorA = anchorMode == "Body" ? 1.0 : anchorMode == "Wick/Body Mid" ? 0.5 : 0.0
 
@@ -404,9 +411,11 @@ f_htfPack() =>
     // affects trade filtering only (see effMinScore/effMinProb).
     leg  = int(f_clamp(math.round(5 * vM), 3, MAXLEG))
     [ph, pl] = f_swing(leg)
-    // Hold last confirmed pivot + keep arrays of the last maxLvl pivots per side.
-    // The arrays let the chart seed full HTF history on bar 1 regardless of how
-    // few bars are loaded (fixes missing HTF levels on 1M/5M/15M). Non-repaint.
+    // Hold last confirmed pivot + keep arrays of the last SEEDPERSIDE pivots per
+    // side. The arrays let the chart seed full HTF history on bar 1 regardless of
+    // how few bars are loaded (fixes missing HTF levels on 1M/5M/15M). Non-repaint.
+    // CAP IS A FIXED CONSTANT, never maxLvl — the seeded book must not depend on
+    // the display setting, or changing Max Levels would move stored levels.
     var float lastH = na
     var float lastL = na
     var array<float> hArr = array.new<float>()
@@ -414,12 +423,12 @@ f_htfPack() =>
     if not na(ph)
         lastH := ph
         hArr.push(ph)
-        if hArr.size() > maxLvl
+        if hArr.size() > SEEDPERSIDE
             hArr.shift()
     if not na(pl)
         lastL := pl
         lArr.push(pl)
-        if lArr.size() > maxLvl
+        if lArr.size() > SEEDPERSIDE
             lArr.shift()
     emaP = ta.ema(close, 34)
     tr   = f_div(emaP - emaP[10], aF)
