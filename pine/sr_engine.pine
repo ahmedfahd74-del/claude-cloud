@@ -1387,6 +1387,11 @@ stateCol = marketState == "Trend Expansion" or marketState == "Momentum Continua
 // Daily/Weekly line beats a 5m line at similar distance. Falls back to the
 // nearest live level, then to the dominant HTF trend swing (empty book).
 pATR = math.max(nz(atrD, atrFast), syminfo.mintick)
+// CHART-INDEPENDENT price anchor for the Power Line pick: the Daily close is the
+// SAME value on a 1m and a 1D chart at the same instant, so ranking distance from
+// it (instead of the chart's own close, which differs per timeframe) makes the
+// pick identical across timeframes.
+dRef = nz(request.security(syminfo.tickerid, f_reqtf("D"), close, lookahead = barmerge.lookahead_off), close)
 
 // POWER-LINE HYSTERESIS. f_powerPick re-ranks every bar, so the winner flips
 // bar-to-bar between two comparable levels — the "jumping" (it tracked the bear
@@ -1426,7 +1431,7 @@ f_powerPick() =>
                 if not st.broken.get(i)
                     p  = st.price.get(i)
                     sc = st.score.get(i)
-                    d  = f_div(math.abs(close - p), pATR)
+                    d  = f_div(math.abs(dRef - p), pATR)   // distance from the chart-independent Daily close
                     if d < nbest
                         nbest := d
                         fnP := p
@@ -1446,16 +1451,18 @@ f_powerPick() =>
                         // is lightly demoted, not excluded).
                         prox = 1.0 / (0.30 + d)
                         tfw  = math.pow(0.55 + 0.45 * st.w, 2.0)
-                        scw  = (0.85 + 0.15 * f_clamp(sc / 100.0, 0.0, 1.0)) * (sc >= powerMinSc ? 1.0 : 0.85)
-                        // Trend-side preference: in a BULL trend the line that
-                        // matters is the LAUNCH level below price (bounce /
-                        // breakout-retest) — not a ceiling overhead. BEAR is
-                        // the mirror. Neutral bias → no side preference.
-                        below = p < close
+                        // CHART-INDEPENDENT selection: rank by proximity (to the
+                        // Daily close) × TF-importance (conviction) × trend-side —
+                        // all identical on every chart TF. The per-level SCORE is
+                        // deliberately NOT in the rank: touch mass accrues on chart
+                        // bars, so score differs per TF and re-introduced the
+                        // cross-TF drift. (Score still shows in the label.) TF
+                        // importance is squared so a Daily/Weekly level dominates.
+                        below = p < dRef
                         sideW = not powerTrendSide ? 1.0 :
                              htfBull ? (below ? powerSideBias : 1.0 / powerSideBias) :
                              htfBear ? (below ? 1.0 / powerSideBias : powerSideBias) : 1.0
-                        rank = prox * tfw * scw * sideW
+                        rank = prox * tfw * sideW
                         // incumbent stickiness (anti-jump): the currently-held
                         // level defends its spot unless clearly out-ranked.
                         if not na(pwrHold) and math.abs(p - pwrHold) <= pATR * 0.05

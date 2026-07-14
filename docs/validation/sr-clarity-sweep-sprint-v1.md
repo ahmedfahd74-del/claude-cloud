@@ -46,13 +46,27 @@ a Daily chart** and therefore **not populated** there, so a 15m chart (which doe
 populate 4H) and a 1D chart chose from **different candidate sets** → different
 picks.
 
-**Fix:** floor the candidate set at **Daily**. Daily/Weekly/Monthly are populated
-on *every* chart at or below them, so the candidate universe — and the pick — is
-**identical across 15m / 4H / 1D**. Verified: `{D, W, MN}` on all three; the old 4H
-floor gave `{4H,D,W,MN}` on 15m vs `{D,W,MN}` on 1D (the divergence). Combined with
-the incumbent-stickiness hysteresis already shipped, the Power Line is now one
-stable, high-timeframe reference, and its label already carries the evidence
-(side · score · distance-in-ATR · HTF bias · status).
+**Fix, part 1 — same candidate set.** Floor the candidate set at **Daily**.
+Daily/Weekly/Monthly are populated on *every* chart at or below them, so the
+candidate universe is **identical across 15m / 4H / 1D**. Verified: `{D, W, MN}` on
+all three; the old 4H floor gave `{4H,D,W,MN}` on 15m vs `{D,W,MN}` on 1D.
+
+**Fix, part 2 — chart-independent ranking (the residual divergence).** Even with
+the same candidates the pick still differed, because `f_powerPick` ranked by
+distance from the **chart's own `close`** (different per timeframe / capture
+instant) and by the **chart-dependent score** (touch mass accrues on chart bars).
+Now the rank uses only chart-independent inputs: **distance from the Daily close**
+(`dRef`, the same value on a 1m and a 1D chart at one instant) × **TF-importance**
+(conviction, squared so Daily/Weekly dominate) × **trend-side** (from
+security-derived HTF trends). **Score is removed from selection** (still shown in
+the label). Verified: the pick is a pure function of `(candidates, dRef)` —
+re-scoring never moves it, and two charts with the same Daily close but different
+chart-close and scores pick the identical level. Combined with the incumbent
+hysteresis, the Power Line is now one stable, timeframe-independent reference.
+
+*Caveat: if two screenshots are taken at different instants (the live price
+differs), the Daily close differs and the pick legitimately differs — that is a
+different market moment, not an inconsistency.*
 
 *Full explainable **ICS number** on the Power label is R3 in the microstructure
 audit — the current score is the interim conviction proxy; wiring the auction-aware
