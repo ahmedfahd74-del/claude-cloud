@@ -592,6 +592,7 @@ type Store
     array<int>   sweeps       // # liquidity sweeps / stop-hunts at this level
     array<int>   breaks       // break-quality mass: clean close-through=2, marginal/wick=1
     array<bool>  broken       // broken & kept (dash-dim mode) → frozen from scoring
+    array<string> why        // per-level reason codes (top ICS contributors) — display only
     float        w           // timeframe importance weight
     float        atrTF       // this store's OWN timeframe ATR (updated each bar)
     float        fhor        // freshness horizon in chart bars (TF-scaled)
@@ -600,7 +601,7 @@ f_newStore(float w, float tfMin) =>
     Store.new(array.new<float>(), array.new<line>(), array.new<box>(), array.new<label>(),
          array.new<bool>(), array.new<float>(), array.new<float>(),
          array.new<float>(), array.new<int>(), array.new<float>(), array.new<int>(),
-         array.new<int>(), array.new<bool>(), w, 0.0, f_clamp(500.0 * tfMin / math.max(chartMin, 1.0), 500.0, 5000.0))
+         array.new<int>(), array.new<bool>(), array.new<string>(), w, 0.0, f_clamp(500.0 * tfMin / math.max(chartMin, 1.0), 500.0, 5000.0))
 
 // Remove a level from every parallel array at index i (keeps them in lockstep).
 f_removeAt(Store s, int i) =>
@@ -624,6 +625,7 @@ f_removeAt(Store s, int i) =>
     s.sweeps.remove(i)
     s.breaks.remove(i)
     s.broken.remove(i)
+    s.why.remove(i)
 
 // Add a confirmed swing: skip if within adaptive merge distance; else draw a
 // line, seed its stats, and evict the WEAKEST level beyond the cap (broken
@@ -673,6 +675,7 @@ f_addLevel(Store s, float p, bool isRes, color col, int wdt, string lstyle) =>
             s.sweeps.unshift(0)
             s.breaks.unshift(0)
             s.broken.unshift(false)
+            s.why.unshift("")
             // DETERMINISM LOG (read-only): record this frozen identity. Append-only
             // and independent of the display eviction below, so the hash reflects
             // the true identity set, immune to chart-dependent eviction.
@@ -1047,6 +1050,10 @@ f_scoreAndRender(Store s, color baseCol, Store o1, Store o2, Store o3, Store o4,
                 // equal evidence, but low-TF levels are not crushed.
                 sc       = f_clamp(100.0 * icsRaw * (0.7 + 0.3 * s.w), 0.0, 100.0)
                 s.score.set(i, sc)
+                // REASON CODES — the qualities this level actually has (each above a
+                // meaningful threshold), so every displayed level justifies its ICS.
+                whyStr = (fStruct >= 0.99 ? "EXT " : "") + (fConf >= 0.5 ? "MTF " : "") + (fLiq >= 0.5 ? "LIQ " : "") + (fReactQ >= 0.6 ? "RESP " : "") + (fTouch >= 0.5 ? "TCH " : "") + (fMitig < 0.9 ? "BRK " : "")
+                s.why.set(i, whyStr)
         // Max Levels is a DISPLAY filter. With Chart Clarity on, the budget is
         // filled by RELEVANCE (strength × proximity) rather than raw score, so a
         // small count shows the near, strong levels — not distant high-score ones.
@@ -1093,7 +1100,8 @@ f_scoreAndRender(Store s, color baseCol, Store o1, Store o2, Store o3, Store o4,
                     if showLabel and not weak and show
                         grade = sc >= 90 ? "A+" : sc >= 80 ? "A" : sc >= 70 ? "B" : sc >= 55 ? "C" : "D"
                         label.set_xy(lb, bar_index, f_anchorY(lvl, res, s.atrTF))
-                        label.set_text(lb, grade + "  " + (res ? "R" : "S") + "  " + f_px(lvl) + "  ICS " + str.tostring(math.round(sc)))
+                        wy = s.why.get(i)
+                        label.set_text(lb, grade + "  " + (res ? "R" : "S") + "  " + f_px(lvl) + "  ICS " + str.tostring(math.round(sc)) + (wy == "" ? "" : "  · " + wy))
                         label.set_color(lb, color.new(baseCol, 25))
                         label.set_textcolor(lb, sc >= 80 ? color.white : color.new(color.white, 25))
                     else
@@ -1425,25 +1433,33 @@ pATR = math.max(nz(atrD, atrFast), syminfo.mintick)
 // pick identical across timeframes.
 dRef = nz(request.security(syminfo.tickerid, f_reqtf("D"), close, lookahead = barmerge.lookahead_off), close)
 
-// POWER-LINE HYSTERESIS. f_powerPick re-ranks every bar, so the winner flips
-// bar-to-bar between two comparable levels — the "jumping" (it tracked the bear
-// break-retest, then a small rank shift flipped it to another level). The
-// incumbent level keeps its spot unless a challenger beats it by POWER_HOLD×, so
-// marginal flips are suppressed while a DECISIVELY closer level still takes over
-// (no freezing far from price). Path state → updated on confirmed bars only
-// (non-repaint). Display/decision only — not part of the STRUCT hash.
-POWER_HOLD = 1.8
-var float pwrHold = na
+// POWER DECISION ENGINE. The engine continuously re-evaluates every candidate; the
+// drawn line is only the OUTPUT of that decision. STABILITY: a new candidate does
+// NOT replace the current Power Decision just for ranking marginally higher — it
+// must EITHER decisively out-rank the incumbent now (POWER_MARGIN×) OR remain the
+// instantaneous winner for `powerDwell` CONFIRMED bars. This removes flicker and
+// switching between near-equal candidates. All state on confirmed bars (non-repaint,
+// display/decision only — not in the STRUCT hash).
+powerDwell   = input.int(5, "Power Decision: dwell bars to switch", minval = 1, maxval = 50, group = grpPower,
+     tooltip = "A challenger must stay the top candidate for this many confirmed bars before it replaces the current Power Decision (unless it decisively out-ranks it). Higher = steadier line.")
+POWER_MARGIN = 1.5
+var float pwrDecision = na    // committed Power Decision (what the line draws)
+var float pwrCand     = na    // challenger currently being timed
+var int   pwrCandBars = 0     // confirmed bars the challenger has led
 
-f_powerPick() =>
+f_powerDecision(float heldPrice) =>
     float bp = na
     float bs = na
     bool  br = false
-    best  = -1.0
+    float bRank = -1.0
     float fnP = na
     float fnS = na
     bool  fnR = false
     nbest = 1.0e18
+    bool  heldFound = false
+    float heldS = na
+    bool  heldR = false
+    float heldRank = -1.0
     // Candidates: INSTITUTIONAL timeframes only (4H and above, or the chart TF
     // if higher). H4/D/W/MN data is identical on every chart via security(),
     // so the pick CANNOT differ between a 5m and a 1h chart — the jumping
@@ -1495,33 +1511,50 @@ f_powerPick() =>
                              htfBull ? (below ? powerSideBias : 1.0 / powerSideBias) :
                              htfBear ? (below ? 1.0 / powerSideBias : powerSideBias) : 1.0
                         rank = prox * tfw * sideW
-                        // incumbent stickiness (anti-jump): the currently-held
-                        // level defends its spot unless clearly out-ranked.
-                        if not na(pwrHold) and math.abs(p - pwrHold) <= pATR * 0.05
-                            rank *= POWER_HOLD
-                        if rank > best
-                            best := rank
+                        if rank > bRank
+                            bRank := rank
                             bp := p
                             bs := sc
                             br := st.isRes.get(i)
-    // Nothing inside the radius → the market's nearest live level IS the line.
+                        // Track the currently-displayed (held) level's LIVE rank so
+                        // the stability layer can compare challenger vs incumbent.
+                        if not na(heldPrice) and math.abs(p - heldPrice) <= pATR * 0.05
+                            heldFound := true
+                            heldS := sc
+                            heldR := st.isRes.get(i)
+                            heldRank := rank
+    // Nothing inside the radius → the market's nearest live level IS the raw pick.
     if na(bp)
         bp := fnP
         bs := fnS
         br := fnR
-    [bp, bs, br]
-[pwrP, pwrScore, pwrIsRes] = f_powerPick()
-// Remember the pick for next bar's incumbent stickiness (confirmed bars only).
-if barstate.isconfirmed and not na(pwrP)
-    pwrHold := pwrP
+    [bp, bs, br, bRank, heldFound, heldS, heldR, heldRank]
+[rawP, rawS, rawR, rawRank, heldFound, heldS, heldR, heldRank] = f_powerDecision(pwrDecision)
 
-// SINGLE SOURCE OF TRUTH: the Power Line is ALWAYS an existing frozen level
-// selected from the one level book (f_powerPick returns a store price, and its
-// own nearest-live-level fallback covers the out-of-radius case). It never
-// recalculates a fresh price — if the book is empty there is simply no Power
-// Line. This is what makes it the identical line on every timeframe.
-powerPrice = pwrP
-powerIsRes = pwrIsRes
+// STABILITY DECISION: commit a switch only on first pick, if the committed level is
+// gone, if the challenger DECISIVELY out-ranks the incumbent now (POWER_MARGIN×), or
+// if the same challenger has led for `powerDwell` confirmed bars. Otherwise HOLD.
+if barstate.isconfirmed
+    if not na(rawP) and not na(pwrCand) and math.abs(rawP - pwrCand) <= pATR * 0.05
+        pwrCandBars += 1
+    else
+        pwrCand     := rawP
+        pwrCandBars := 1
+    firstTime = na(pwrDecision)
+    heldGone  = not na(pwrDecision) and not heldFound
+    differs   = na(pwrDecision) or (not na(rawP) and math.abs(rawP - pwrDecision) > pATR * 0.05)
+    decisive  = heldFound and heldRank > 0 and rawRank > heldRank * POWER_MARGIN
+    dwellMet  = pwrCandBars >= powerDwell
+    if not na(rawP) and (firstTime or heldGone or (differs and (decisive or dwellMet)))
+        pwrDecision := rawP
+
+// The drawn line is the OUTPUT of the Power Decision. Resolve its live attributes:
+// if the committed level is the current raw winner use its fresh values, else the
+// held level's live values (still on chart), else fall back to the raw winner.
+onRaw      = not na(pwrDecision) and not na(rawP) and math.abs(pwrDecision - rawP) <= pATR * 0.05
+powerPrice = pwrDecision
+pwrScore   = na(pwrDecision) ? na    : onRaw ? rawS : heldFound ? heldS : rawS
+powerIsRes = na(pwrDecision) ? false : onRaw ? rawR : heldFound ? heldR : rawR
 pdist      = na(powerPrice) ? na : f_div(math.abs(close - powerPrice), pATR)
 
 // Status intelligence — what the engine expects at this line (existing
