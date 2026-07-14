@@ -933,14 +933,21 @@ f_sameSideNear(Store s, float p, bool res, float tol, int selfIdx) =>
 
 // Factor weights (sum = 1.0). Confluence is heaviest — HTF agreement is the
 // strongest institutional signal; sweeps + SMC footprint add the smart-money edge.
-W_TOUCH = 0.16
-W_REACT = 0.16
-W_CONF  = 0.24
-W_TREND = 0.08
-W_VOL   = 0.06
-W_FRESH = 0.10
-W_SWEEP = 0.10
-W_SMC   = 0.10
+// ── INSTITUTIONAL CONFIDENCE SCORE (ICS) weights — our framework (ADR-002 / I1,
+//    microstructure-audit rubric). The per-level score IS the ICS: a 0–100
+//    institutional confidence, not a cosmetic blend. It lives in s.score (which is
+//    NOT part of the STRUCT/DB hash), so replacing the old flat blend changes no
+//    identity and leaves the freeze/hash determinism proof intact. The Auction
+//    factor (Dalton) is weight 0 until I3 adds volume/TPO; the rest sum to 1.0.
+ICS_STRUCT = 0.14   // structural significance — range boundary / external extreme (Murphy)
+ICS_LIQ    = 0.16   // institutional liquidity — sweeps + SMC/EQ footprint (Harris/O'Hara)
+ICS_REACTQ = 0.16   // reaction quality — bounce/break respect-rate + wick rejection (Weis)
+ICS_TOUCH  = 0.12   // multiple historical reactions — touch mass (Murphy)
+ICS_CONF   = 0.18   // multi-timeframe confluence — TF-native (Murphy)
+ICS_FRESH  = 0.08   // freshness — wall-clock-invariant decay
+ICS_MITIG  = 0.08   // mitigation integrity — not consumed/broken through
+ICS_TREND  = 0.08   // structure/trend alignment context
+ICS_AUCTION = 0.0   // auction behavior (Dalton) — held at 0 until I3 (volume/TPO)
 
 // Score threshold for the top-n levels by score (display filter). Returns -1
 // when the store holds <= n live levels (draw all). Pure read — never mutates.
@@ -991,6 +998,16 @@ f_scoreAndRender(Store s, color baseCol, Store o1, Store o2, Store o3, Store o4,
         // mixed chart-bar ATR and the per-bar regime multiplier into the score.
         atrRef = s.atrTF > 0 ? s.atrTF : atrSafe
         band   = atrRef * CONF_BAND_K
+        // Structural significance needs the store's range boundaries: the highest
+        // and lowest UNBROKEN level are the external extremes (Murphy) — the levels
+        // that define the range and matter most. Computed once per store per bar.
+        hiP = -1.0e18
+        loP =  1.0e18
+        for e = 0 to s.price.size() - 1
+            if not s.broken.get(e)
+                pv = s.price.get(e)
+                hiP := math.max(hiP, pv)
+                loP := math.min(loP, pv)
         // --- PASS 1: score every live level (no rendering, no mutation of price)
         for i = 0 to s.price.size() - 1
             if not s.broken.get(i)
@@ -1011,9 +1028,24 @@ f_scoreAndRender(Store s, color baseCol, Store o1, Store o2, Store o3, Store o4,
                 fFresh   = f_clamp(1.0 - recency * decaySpd / s.fhor, 0.0, 1.0)
                 fSweep   = f_norm01(s.sweeps.get(i), 2)
                 fSMC     = f_clamp(f_smcBonus(lvl) + f_norm01(eqCount, 1) * 0.5, 0.0, 1.0)
-                raw      = W_TOUCH * fTouch + W_REACT * fReact + W_CONF * fConf + W_TREND * fTrend + W_VOL * fVol + W_FRESH * fFresh + W_SWEEP * fSweep + W_SMC * fSMC
-                sc       = f_clamp(100.0 * raw * (0.6 + 0.4 * s.w), 0.0, 100.0)
-                sc      *= f_clamp(1.0 - 0.12 * math.min(s.breaks.get(i), 3), 0.5, 1.0)
+                // ── ICS institutional factors (deterministic, from existing stats) ──
+                // Structural: the store's range boundaries score full; interior half.
+                fStruct  = (lvl >= hiP or lvl <= loP) ? 1.0 : 0.5
+                // Liquidity: sweep footprint + SMC/equal-level pools.
+                fLiq     = f_clamp(0.6 * fSweep + 0.7 * fSMC, 0.0, 1.0)
+                // Reaction quality: respect-rate (bounce vs break — teardown idea,
+                // our own frozen-identity implementation) blended with wick rejection.
+                // touches = respected mass; breaks = break-quality mass. A level never
+                // broken → respect ~1; heavily broken → low.
+                breaksM  = s.breaks.get(i)
+                fRespect = (t + breaksM) > 0 ? t / (t + 1.5 * breaksM) : 0.5
+                fReactQ  = f_clamp(0.5 * fRespect + 0.3 * fReact + 0.2 * fVol, 0.0, 1.0)
+                // Mitigation integrity: a level partially broken through is less intact.
+                fMitig   = f_clamp(1.0 - 0.20 * breaksM, 0.3, 1.0)
+                icsRaw   = ICS_STRUCT * fStruct + ICS_LIQ * fLiq + ICS_REACTQ * fReactQ + ICS_TOUCH * fTouch + ICS_CONF * fConf + ICS_FRESH * fFresh + ICS_MITIG * fMitig + ICS_TREND * fTrend + ICS_AUCTION * 0.0
+                // TF importance nudges (0.7..1.0) — a Weekly level outranks a 5m one at
+                // equal evidence, but low-TF levels are not crushed.
+                sc       = f_clamp(100.0 * icsRaw * (0.7 + 0.3 * s.w), 0.0, 100.0)
                 s.score.set(i, sc)
         // Max Levels is a DISPLAY filter. With Chart Clarity on, the budget is
         // filled by RELEVANCE (strength × proximity) rather than raw score, so a
@@ -1061,7 +1093,7 @@ f_scoreAndRender(Store s, color baseCol, Store o1, Store o2, Store o3, Store o4,
                     if showLabel and not weak and show
                         grade = sc >= 90 ? "A+" : sc >= 80 ? "A" : sc >= 70 ? "B" : sc >= 55 ? "C" : "D"
                         label.set_xy(lb, bar_index, f_anchorY(lvl, res, s.atrTF))
-                        label.set_text(lb, grade + "  " + (res ? "R" : "S") + "  " + f_px(lvl) + "  " + str.tostring(math.round(sc)) + "%")
+                        label.set_text(lb, grade + "  " + (res ? "R" : "S") + "  " + f_px(lvl) + "  ICS " + str.tostring(math.round(sc)))
                         label.set_color(lb, color.new(baseCol, 25))
                         label.set_textcolor(lb, sc >= 80 ? color.white : color.new(color.white, 25))
                     else
@@ -1517,7 +1549,7 @@ if showPowerLine and not na(powerPrice)
         line.set_color(powerLn, colPower)
         line.set_width(powerLn, powerWidth)
         label.set_xy(powerLb, bar_index, powerPrice)
-    ptxt = "⚡ POWER  " + f_px(powerPrice) + " · " + (powerIsRes ? "R" : "S") + (na(pwrScore) ? "" : " " + str.tostring(math.round(pwrScore))) + " · " + str.tostring(pdist, "#.#") + " ATR · " + (htfBull ? "BULL" : htfBear ? "BEAR" : "NEUTRAL")
+    ptxt = "⚡ POWER  " + f_px(powerPrice) + " · " + (powerIsRes ? "R" : "S") + (na(pwrScore) ? "" : " · ICS " + str.tostring(math.round(pwrScore))) + " · " + str.tostring(pdist, "#.#") + " ATR · " + (htfBull ? "BULL" : htfBear ? "BEAR" : "NEUTRAL")
     if powerShowStat
         ptxt += " · " + pwrStatus + (htfBull ? "  → higher" : htfBear ? "  → lower" : "  → range")
     label.set_text(powerLb, ptxt)
