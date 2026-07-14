@@ -92,6 +92,16 @@ brkMode      = input.string("Keep", "Broken Level Behaviour", options = ["Keep",
      tooltip = "Keep = line never changes/disappears (stable). Dim = dashed grey after break. Remove = delete on break (auto-clean).")
 colBrk       = input.color(color.new(#787b86, 35), "Broken Level Color (Dim mode)", group = grpLvl)
 
+grpClar = "Chart Clarity (fewer, stronger, non-overlapping lines)"
+clarityOn   = input.bool(true, "Enable Chart Clarity", group = grpClar,
+     tooltip = "Display-only. Fills the level budget by RELEVANCE (strength × proximity) so a small count shows the levels that matter now, collapses nearby levels to the single strongest representative, and hides levels far from price. Never changes the level book, scores, or the hash.")
+clarNearK   = input.float(0.5,  "Proximity weight (relevance)", minval = 0.0, maxval = 3.0, step = 0.1, group = grpClar,
+     tooltip = "How strongly nearness to price is favoured when choosing which levels to draw. 0 = pure strength; higher = prefer levels close to price.")
+clusterATRk = input.float(0.35, "Cluster distance (× Daily ATR)", minval = 0.0, maxval = 3.0, step = 0.05, group = grpClar,
+     tooltip = "A level within this of an already-shown stronger / higher-timeframe level is hidden — nearby levels collapse to one representative. 0 = off.")
+hideFarATRk = input.float(6.0,  "Hide levels beyond (× Daily ATR)", minval = 0.0, maxval = 30.0, step = 0.5, group = grpClar,
+     tooltip = "Hide any level farther than this many Daily-ATR from current price. 0 = show every distance.")
+
 grpStyle = "Line Styles (per timeframe)"
 styleMN = input.string("Solid", "Monthly", options = ["Solid", "Dashed", "Dotted"], group = grpStyle, inline = "s1")
 styleW  = input.string("Solid", "Weekly",  options = ["Solid", "Dashed", "Dotted"], group = grpStyle, inline = "s1")
@@ -946,6 +956,29 @@ f_rankThresh(Store s, int n) =>
         thr := tmp.get(n - 1)
     thr
 
+// ── CHART CLARITY helpers (display-only; never touch the book, scores, or hash) ─
+// Daily-ATR reference for all clarity distances — chart-TF independent.
+clarATR = math.max(nz(atrD, atrFast), syminfo.mintick)
+// Relevance = strength discounted by distance to price, so a small display budget
+// shows the levels that matter NOW instead of distant high-score ones.
+f_rel(float sc, float lvl) => sc / (1.0 + clarNearK * f_div(math.abs(close - lvl), clarATR))
+// Registry of level prices already drawn THIS bar. HTF stores render first, so a
+// lower-priority level within the cluster distance of one already shown is hidden
+// — nearby levels collapse to the single strongest representative.
+var array<float> gShownPx = array.new<float>()
+// Relevance-ranked display threshold: the n-th highest relevance among live levels.
+f_relThresh(Store s, int n) =>
+    tmp = array.new<float>()
+    if s.price.size() > 0
+        for i = 0 to s.price.size() - 1
+            if not s.broken.get(i)
+                tmp.push(f_rel(s.score.get(i), s.price.get(i)))
+    thr = -1.0
+    if tmp.size() > n and n > 0
+        tmp.sort(order.descending)
+        thr := tmp.get(n - 1)
+    thr
+
 // Two passes: (1) compute every live level's score, (2) render. Scoring NEVER
 // touches price/identity. Max Levels + strength + timeframe visibility are all
 // applied in pass 2 as pure display filters — a hidden level keeps its exact
@@ -982,8 +1015,10 @@ f_scoreAndRender(Store s, color baseCol, Store o1, Store o2, Store o3, Store o4,
                 sc       = f_clamp(100.0 * raw * (0.6 + 0.4 * s.w), 0.0, 100.0)
                 sc      *= f_clamp(1.0 - 0.12 * math.min(s.breaks.get(i), 3), 0.5, 1.0)
                 s.score.set(i, sc)
-        // Max Levels is a DISPLAY filter: only the top-maxLvl by score are drawn.
-        thr = f_rankThresh(s, maxLvl)
+        // Max Levels is a DISPLAY filter. With Chart Clarity on, the budget is
+        // filled by RELEVANCE (strength × proximity) rather than raw score, so a
+        // small count shows the near, strong levels — not distant high-score ones.
+        thr = clarityOn ? f_relThresh(s, maxLvl) : f_rankThresh(s, maxLvl)
         // --- PASS 2: render (all gating here is visual; positions never move)
         for i = 0 to s.price.size() - 1
             if not s.broken.get(i)
@@ -995,8 +1030,20 @@ f_scoreAndRender(Store s, color baseCol, Store o1, Store o2, Store o3, Store o4,
                 clsStrong = sc >= 70
                 clsMed    = sc >= 50 and sc < 70
                 vizOK  = clsStrong ? showStrongLvl : clsMed ? showMedLvl : showWeakLvl
-                rankOK = thr < 0 or sc >= thr
-                show   = drawOK and t >= minTouches and vizOK and rankOK
+                metric = clarityOn ? f_rel(sc, lvl) : sc
+                rankOK = thr < 0 or metric >= thr
+                // CHART CLARITY display gates (visual only):
+                distA  = f_div(math.abs(close - lvl), clarATR)
+                farOK  = not clarityOn or hideFarATRk <= 0 or distA <= hideFarATRk
+                clustOK = true
+                if clarityOn and clusterATRk > 0 and gShownPx.size() > 0
+                    for gi = 0 to gShownPx.size() - 1
+                        if math.abs(gShownPx.get(gi) - lvl) <= clusterATRk * clarATR
+                            clustOK := false
+                            break
+                show   = drawOK and t >= minTouches and vizOK and rankOK and farOK and clustOK
+                if show and clarityOn
+                    gShownPx.push(lvl)
                 lnCol  = color.new(baseCol, show ? lineOpacity : 100)
                 line.set_color(s.ln.get(i), lnCol)
                 line.set_width(s.ln.get(i), lineWidth)
@@ -1161,6 +1208,9 @@ touchEvents = f_touchUpdate(stMN) + f_touchUpdate(stW) + f_touchUpdate(stD) + f_
 gBreaks += brkEvents
 gHolds  += touchEvents
 
+// Clear the clarity registry each bar; HTF stores render first so they claim
+// clusters before lower-timeframe levels (which collapse into them).
+gShownPx.clear()
 f_scoreAndRender(stMN,  colMN,  stW,  stD,  stH4, stH1, stM15, stM5,  drawMN)
 f_scoreAndRender(stW,   colW,   stMN, stD,  stH4, stH1, stM15, stM5,  drawW)
 f_scoreAndRender(stD,   colD,   stMN, stW,  stH4, stH1, stM15, stM5,  drawD)
@@ -1239,8 +1289,22 @@ distCond   = rangeEnv and pos > 0.60 and highLiq
 
 wickUp     = f_div(high - math.max(open, close), atrFast)
 wickDn     = f_div(math.min(open, close) - low, atrFast)
-sweepRes   = wickUp > mWick and nearRes
-sweepSup   = wickDn > mWick and nearSup
+// SWEEP PRECISION (audit fix). A sweep is not merely a big wick NEAR a level — it
+// must (1) actually PIERCE the level (take the liquidity resting beyond it) and
+// (2) CLOSE BACK across it with rejection (closed in the far half of the bar).
+// The old test flagged any large wick within 0.5 ATR, so continuation bars that
+// closed THROUGH the level, and bars that never reached it, registered as false
+// sweeps. Requiring pierce + reclaim removes those false positives. rng guards
+// divide-by-zero on doji/empty bars.
+rng        = high - low
+resPx      = close + distRes          // nearest unbroken resistance above
+supPx      = close - distSup          // nearest unbroken support below
+piercedRes = high >= resPx            // wick took buy-side liquidity above
+piercedSup = low  <= supPx            // wick took sell-side liquidity below
+rejDown    = rng > 0 and (high - close) / rng >= 0.5   // closed in lower half → rejected up-move
+rejUp      = rng > 0 and (close - low)  / rng >= 0.5   // closed in upper half → rejected down-move
+sweepRes   = wickUp > mWick and nearRes and piercedRes and close < resPx and rejDown
+sweepSup   = wickDn > mWick and nearSup and piercedSup and close > supPx and rejUp
 sweepBar   = sweepRes or sweepSup
 
 // Sweep LINES: anchored at the wick extreme (the exact harvested-liquidity
@@ -1348,7 +1412,13 @@ f_powerPick() =>
     // so the pick CANNOT differ between a 5m and a 1h chart — the jumping
     // came from chart-local low-TF levels that exist in one book but not the
     // other (e.g. sampled sub-chart data creating a phantom S-30 level).
-    powerFloor = math.max(240.0, chartMin)
+    // DAILY floor (was 240=4H). The Power Line is the ONE highest-conviction
+    // institutional reference, and it must read the SAME level on 15m / 4H / 1D.
+    // 4H is not populated on a Daily chart (sub-chart), so a 4H-floor pick differed
+    // between a 15m and a 1D chart. Daily/Weekly/Monthly ARE populated on every
+    // chart at or below them, so a Daily floor makes the pick identical across all
+    // intraday-and-Daily charts — a single, stable, high-timeframe reference.
+    powerFloor = math.max(1440.0, chartMin)
     for si = 0 to allSt.size() - 1
         st = allSt.get(si)
         if st.price.size() > 0 and allStMin.get(si) >= powerFloor
