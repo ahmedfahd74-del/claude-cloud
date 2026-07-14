@@ -64,8 +64,8 @@ factor **deterministic and chart-native where possible**:
 | Structural significance | 12 | external/range-boundary swing, BOS/CHoCH origin | extend (expose structure rank) |
 | Institutional liquidity | 15 | PDH/PDL/PWH/PWL, EQH/EQL, round numbers | mostly present |
 | **Auction behavior** | 15 | POC / VAH-VAL / single-print / excess | **new (R1) — needs volume/TPO** |
-| Multiple reactions | 12 | touch **mass** (prox×rejection×momentum) | present |
-| Reaction / effort-vs-result | 12 | rejection wick **+** volume-vs-progress | extend (Weis effort/result) |
+| Multiple reactions | 12 | touch **mass** + frozen-identity **pivot/touch count** (no averaging) | present; +count evidence (teardown) |
+| Reaction / effort-vs-result | 12 | **bounce-vs-break respect-rate** + rejection wick + volume-vs-progress | extend (Weis effort/result + outcome win-rate, teardown) |
 | MTF confluence | 12 | TF-native `f_nearCount` | present (deterministic) |
 | Freshness | 6 | wall-clock-invariant decay | present |
 | Mitigation state | 8 | broken/polarity-flip; partial-fill for FVG/OB | extend |
@@ -106,7 +106,9 @@ moves the hash or trips the freeze test.
   risk — reuses present signals.*
 - **I2 — Consolidate selection into the ILSE pipeline.** Fold Chart-Clarity +
   `f_powerPick` into the explicit compete→cluster→merge/prune→select→power order,
-  driven by ICS.
+  driven by ICS. Selection uses a **global** top-K + min-separation (was
+  per-timeframe) so total on-chart lines are bounded regardless of TF count
+  (teardown refinement).
 - **I3 — Auction layer (R1).** Volume/TPO → POC/VAH-VAL/single-print/excess as the
   auction factor + first-class levels. Highest institutional lift; gated hardest.
 - **I4 — Effort-vs-result (Weis) + mitigation depth (partial fills).**
