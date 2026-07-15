@@ -31,7 +31,7 @@ indicator("Institutional Adaptive S/R Engine  [v2.1.1 · 2026-07-06]", "IA-SR", 
 // (top-left) and on the dashboard's top row, so you can always confirm the
 // running version. If this differs from the tag I quote in chat, you're on an
 // old copy — re-paste the file I attached. Keep this in sync with the title.
-BUILD = "v2.4-DBFP · 2026-07-15"
+BUILD = "v2.5-DBFP · 2026-07-15"
 
 // #############################################################################
 // # SECTION 1 — INPUTS
@@ -428,18 +428,34 @@ f_htfPack() =>
     // the display setting, or changing Max Levels would move stored levels.
     var float lastH = na
     var float lastL = na
+    // CROSS-TF IDENTITY: carry each pivot's OWN HTF bar-time (the pivot sits at
+    // [leg] bars back on this TF). Level age is anchored to this pivot time, not
+    // to the chart bar-time at which it happens to be ingested — so age-based
+    // eviction keeps the SAME newest-N levels on every chart timeframe. birthT is
+    // NOT part of the identity/DB hash, so this changes eviction only, never a
+    // frozen identity or the freeze/hash proof.
+    var int lastHT = na
+    var int lastLT = na
     var array<float> hArr = array.new<float>()
     var array<float> lArr = array.new<float>()
+    var array<int>   hArrT = array.new<int>()
+    var array<int>   lArrT = array.new<int>()
     if not na(ph)
-        lastH := ph
+        lastH  := ph
+        lastHT := time[leg]
         hArr.push(ph)
+        hArrT.push(time[leg])
         if hArr.size() > SEEDPERSIDE
             hArr.shift()
+            hArrT.shift()
     if not na(pl)
-        lastL := pl
+        lastL  := pl
+        lastLT := time[leg]
         lArr.push(pl)
+        lArrT.push(time[leg])
         if lArr.size() > SEEDPERSIDE
             lArr.shift()
+            lArrT.shift()
     emaP = ta.ema(close, 34)
     tr   = f_div(emaP - emaP[10], aF)
     // Prev-period extremes (PDH/PDL, PWH/PWL, …): exact candle prices that
@@ -447,7 +463,8 @@ f_htfPack() =>
     // guarantees true Daily/Weekly lines on 1m/5m charts. Non-repaint ([1]).
     pHi  = high[1]
     pLo  = low[1]
-    [lastH, lastL, hArr, lArr, aF, leg, tr, pHi, pLo]
+    pXT  = time[1]   // prev-period bar time — chart-independent birth for PDH/PDL
+    [lastH, lastL, hArr, lArr, aF, leg, tr, pHi, pLo, lastHT, lastLT, hArrT, lArrT, pXT]
 
 // SUB-CHART GUARD (fixes the 1W/1D + deep-history/forex runtime error). Requesting
 // a timeframe BELOW the chart TF forces request.security to replay that lower TF's
@@ -460,13 +477,13 @@ f_htfPack() =>
 // an intraday chart is that a sub-chart TREND row degrades to the chart TF, which an
 // HTF-context engine should not rely on regardless.
 f_reqtf(simple string tf) => timeframe.in_seconds(tf) < timeframe.in_seconds() ? timeframe.period : tf
-[phMN, plMN, hiMN, loMN, atrMN, legMN, trMN, pHiMN, pLoMN] = request.security(syminfo.tickerid, f_reqtf("M"),   f_htfPack(), lookahead = barmerge.lookahead_off)
-[phW,  plW,  hiW,  loW,  atrW,  legW,  trW,  pHiW,  pLoW ] = request.security(syminfo.tickerid, f_reqtf("W"),   f_htfPack(), lookahead = barmerge.lookahead_off)
-[phD,  plD,  hiD,  loD,  atrD,  legD,  trD,  pHiD,  pLoD ] = request.security(syminfo.tickerid, f_reqtf("D"),   f_htfPack(), lookahead = barmerge.lookahead_off)
-[phH4, plH4, hiH4, loH4, atrH4, legH4, trH4, pHiH4, pLoH4] = request.security(syminfo.tickerid, f_reqtf("240"), f_htfPack(), lookahead = barmerge.lookahead_off)
-[phH1, plH1, hiH1, loH1, atrH1, legH1, trH1, pHiH1, pLoH1] = request.security(syminfo.tickerid, f_reqtf("60"),  f_htfPack(), lookahead = barmerge.lookahead_off)
-[phM15, plM15, hiM15, loM15, atrM15, legM15, trM15, pHiM15, pLoM15] = request.security(syminfo.tickerid, f_reqtf("15"), f_htfPack(), lookahead = barmerge.lookahead_off)
-[phM5,  plM5,  hiM5,  loM5,  atrM5,  legM5,  trM5,  pHiM5,  pLoM5 ] = request.security(syminfo.tickerid, f_reqtf("5"),  f_htfPack(), lookahead = barmerge.lookahead_off)
+[phMN, plMN, hiMN, loMN, atrMN, legMN, trMN, pHiMN, pLoMN, phtMN, pltMN, hitMN, lotMN, pxtMN] = request.security(syminfo.tickerid, f_reqtf("M"),   f_htfPack(), lookahead = barmerge.lookahead_off)
+[phW,  plW,  hiW,  loW,  atrW,  legW,  trW,  pHiW,  pLoW,  phtW,  pltW,  hitW,  lotW,  pxtW ] = request.security(syminfo.tickerid, f_reqtf("W"),   f_htfPack(), lookahead = barmerge.lookahead_off)
+[phD,  plD,  hiD,  loD,  atrD,  legD,  trD,  pHiD,  pLoD,  phtD,  pltD,  hitD,  lotD,  pxtD ] = request.security(syminfo.tickerid, f_reqtf("D"),   f_htfPack(), lookahead = barmerge.lookahead_off)
+[phH4, plH4, hiH4, loH4, atrH4, legH4, trH4, pHiH4, pLoH4, phtH4, pltH4, hitH4, lotH4, pxtH4] = request.security(syminfo.tickerid, f_reqtf("240"), f_htfPack(), lookahead = barmerge.lookahead_off)
+[phH1, plH1, hiH1, loH1, atrH1, legH1, trH1, pHiH1, pLoH1, phtH1, pltH1, hitH1, lotH1, pxtH1] = request.security(syminfo.tickerid, f_reqtf("60"),  f_htfPack(), lookahead = barmerge.lookahead_off)
+[phM15, plM15, hiM15, loM15, atrM15, legM15, trM15, pHiM15, pLoM15, phtM15, pltM15, hitM15, lotM15, pxtM15] = request.security(syminfo.tickerid, f_reqtf("15"), f_htfPack(), lookahead = barmerge.lookahead_off)
+[phM5,  plM5,  hiM5,  loM5,  atrM5,  legM5,  trM5,  pHiM5,  pLoM5,  phtM5,  pltM5,  hitM5,  lotM5,  pxtM5 ] = request.security(syminfo.tickerid, f_reqtf("5"),  f_htfPack(), lookahead = barmerge.lookahead_off)
 
 // --- Hold last confirmed swing per TF (verification preview for Phase 2) ----
 // Phase 3 replaces these single held values with managed, scored level arrays.
@@ -634,7 +651,7 @@ f_removeAt(Store s, int i) =>
 // first, then lowest score — proven institutional levels persist, unlike FIFO).
 // Merge radius scales with the level's OWN timeframe ATR, so a store behaves
 // identically on every chart timeframe.
-f_addLevel(Store s, float p, bool isRes, color col, int wdt, string lstyle) =>
+f_addLevel(Store s, float p, bool isRes, color col, int wdt, string lstyle, int birthTime) =>
     if not na(p)
         // TF-NATIVE MERGE (deterministic): the merge radius depends ONLY on
         // this store's own timeframe ATR — never the chart/base-bar ATR or the
@@ -678,63 +695,47 @@ f_addLevel(Store s, float p, bool isRes, color col, int wdt, string lstyle) =>
             s.breaks.unshift(0)
             s.broken.unshift(false)
             s.why.unshift("")
-            s.birthT.unshift(time)
+            // Chart-INDEPENDENT age: the pivot's own HTF bar time. Falls back to
+            // chart time only if a caller has no pivot time (never, in practice).
+            s.birthT.unshift(na(birthTime) ? time : birthTime)
             // DETERMINISM LOG (read-only): record this frozen identity. Append-only
             // and independent of the display eviction below, so the hash reflects
             // the true identity set, immune to chart-dependent eviction.
             f_detLog(p, isRes, s.w)
             while s.price.size() > MAXBOOK
-                // Evict weakest, never the just-added level (index 0) and never
-                // the store's STRUCTURAL EXTREMES (highest / lowest unbroken
-                // level = the range boundaries) — a fresh major top/bottom has
-                // few touches yet, but it is the level that matters most.
-                // CHART-INDEPENDENT eviction (cross-TF identity): evict broken
-                // levels first, then the OLDEST surviving level by creation TIME —
-                // NEVER by the chart-dependent score. Every chart therefore keeps
-                // the SAME recent set of institutional levels, so the closest HTF
-                // level is identical on a 5m and a 1D chart (issues #1/#2).
-                hiIdx = -1
-                loIdx = -1
-                hiP   = -1.0e18
-                loP   = 1.0e18
-                for j = 0 to s.price.size() - 1
-                    if not s.broken.get(j)
-                        pj = s.price.get(j)
-                        if pj > hiP
-                            hiP := pj
-                            hiIdx := j
-                        if pj < loP
-                            loP := pj
-                            loIdx := j
-                worst = -1
+                // PURE RECENCY EVICTION (cross-TF identity, v2.5): evict broken
+                // levels first, then the OLDEST surviving level by its PIVOT TIME
+                // (birthT is now the pivot's own HTF bar-time — chart-independent).
+                // The old structural-extreme protection (keep highest/lowest price)
+                // is REMOVED: it pinned a chart-DEPENDENT all-time extreme — a
+                // deeper-history chart sees a different highest/lowest pivot and
+                // protected it forever, so two chart TFs held different books at
+                // equal count (the measured D-store divergence). With pure recency,
+                // any two charts that see the same newest-MAXBOOK pivots hold a
+                // byte-identical book. Prev-period extremes (PDH/PWH/PMH) are
+                // re-added every period, so major reference levels persist as recent
+                // regardless. Index 0 (the just-added level) is never evicted.
+                worst = 1
                 ws    = 1.0e18
                 for j = 1 to s.price.size() - 1
-                    if j != hiIdx and j != loIdx
-                        cs = s.broken.get(j) ? -1.0 : float(s.birthT.get(j))
-                        if cs <= ws
-                            ws := cs
-                            worst := j
-                if worst < 0
-                    // Everything except index 0 is protected → oldest overall.
-                    worst := 1
-                    ws := 1.0e18
-                    for j = 1 to s.price.size() - 1
-                        cs = s.broken.get(j) ? -1.0 : float(s.birthT.get(j))
-                        if cs <= ws
-                            ws := cs
-                            worst := j
+                    cs = s.broken.get(j) ? -1.0 : float(s.birthT.get(j))
+                    if cs <= ws
+                        ws := cs
+                        worst := j
                 f_removeAt(s, worst)
 
 // Seed a store from HTF pivot arrays (oldest→newest so newest survives the cap).
-f_seed(Store s, array<float> his, array<float> los, bool use, color col, int wdt, string sty) =>
+// hisT/losT are the parallel pivot TIMES (chart-independent birth) kept in
+// lockstep with his/los in f_htfPack, so each seeded level ages by its own pivot.
+f_seed(Store s, array<float> his, array<float> los, array<int> hisT, array<int> losT, bool use, color col, int wdt, string sty) =>
     if use and not na(his) and not na(los)
         n = math.max(his.size(), los.size())
         if n > 0
             for i = 0 to n - 1
                 if i < his.size()
-                    f_addLevel(s, f_tick(his.get(i)), true,  col, wdt, sty)
+                    f_addLevel(s, f_tick(his.get(i)), true,  col, wdt, sty, hisT.get(i))
                 if i < los.size()
-                    f_addLevel(s, f_tick(los.get(i)), false, col, wdt, sty)
+                    f_addLevel(s, f_tick(los.get(i)), false, col, wdt, sty, losT.get(i))
 
 // Detect a close-through; remove it (clean) or freeze it as a dash-dim line.
 f_updateBreaks(Store s) =>
@@ -1199,81 +1200,81 @@ var bool sdM15 = false
 var bool sdM5  = false
 if bar_index <= 50
     if not sdMN and not na(hiMN) and hiMN.size() + loMN.size() > 0
-        f_seed(stMN,  hiMN,  loMN,  effUseMN,  colMN,  2, lsMN)
+        f_seed(stMN,  hiMN,  loMN,  hitMN,  lotMN,  effUseMN,  colMN,  2, lsMN)
         sdMN := true
     if not sdW and not na(hiW) and hiW.size() + loW.size() > 0
-        f_seed(stW,   hiW,   loW,   effUseW,   colW,   3, lsW)
+        f_seed(stW,   hiW,   loW,   hitW,   lotW,   effUseW,   colW,   3, lsW)
         sdW := true
     if not sdD and not na(hiD) and hiD.size() + loD.size() > 0
-        f_seed(stD,   hiD,   loD,   effUseD,   colD,   2, lsD)
+        f_seed(stD,   hiD,   loD,   hitD,   lotD,   effUseD,   colD,   2, lsD)
         sdD := true
     if not sdH4 and not na(hiH4) and hiH4.size() + loH4.size() > 0
-        f_seed(stH4,  hiH4,  loH4,  effUseH4,  colH4,  1, lsH4)
+        f_seed(stH4,  hiH4,  loH4,  hitH4,  lotH4,  effUseH4,  colH4,  1, lsH4)
         sdH4 := true
     if not sdH1 and not na(hiH1) and hiH1.size() + loH1.size() > 0
-        f_seed(stH1,  hiH1,  loH1,  effUseH1,  colH1,  1, lsH1)
+        f_seed(stH1,  hiH1,  loH1,  hitH1,  lotH1,  effUseH1,  colH1,  1, lsH1)
         sdH1 := true
     if not sdM15 and not na(hiM15) and hiM15.size() + loM15.size() > 0
-        f_seed(stM15, hiM15, loM15, effUseM15, colM15, 1, lsM15)
+        f_seed(stM15, hiM15, loM15, hitM15, lotM15, effUseM15, colM15, 1, lsM15)
         sdM15 := true
     if not sdM5 and not na(hiM5) and hiM5.size() + loM5.size() > 0
-        f_seed(stM5,  hiM5,  loM5,  effUseM5,  colM5,  1, lsM5)
+        f_seed(stM5,  hiM5,  loM5,  hitM5,  lotM5,  effUseM5,  colM5,  1, lsM5)
         sdM5 := true
 
 // Line style per timeframe — user controlled (defaults all solid).
 if effUseMN and chgPhMN
-    f_addLevel(stMN, f_tick(phMN), true,  colMN, 2, lsMN)
+    f_addLevel(stMN, f_tick(phMN), true,  colMN, 2, lsMN, phtMN)
 if effUseMN and chgPlMN
-    f_addLevel(stMN, f_tick(plMN), false, colMN, 2, lsMN)
+    f_addLevel(stMN, f_tick(plMN), false, colMN, 2, lsMN, pltMN)
 if effUseW and chgPhW
-    f_addLevel(stW, f_tick(phW), true,  colW, 3, lsW)
+    f_addLevel(stW, f_tick(phW), true,  colW, 3, lsW, phtW)
 if effUseW and chgPlW
-    f_addLevel(stW, f_tick(plW), false, colW, 3, lsW)
+    f_addLevel(stW, f_tick(plW), false, colW, 3, lsW, pltW)
 if effUseD and chgPhD
-    f_addLevel(stD, f_tick(phD), true,  colD, 2, lsD)
+    f_addLevel(stD, f_tick(phD), true,  colD, 2, lsD, phtD)
 if effUseD and chgPlD
-    f_addLevel(stD, f_tick(plD), false, colD, 2, lsD)
+    f_addLevel(stD, f_tick(plD), false, colD, 2, lsD, pltD)
 if effUseH4 and chgPhH4
-    f_addLevel(stH4, f_tick(phH4), true,  colH4, 1, lsH4)
+    f_addLevel(stH4, f_tick(phH4), true,  colH4, 1, lsH4, phtH4)
 if effUseH4 and chgPlH4
-    f_addLevel(stH4, f_tick(plH4), false, colH4, 1, lsH4)
+    f_addLevel(stH4, f_tick(plH4), false, colH4, 1, lsH4, pltH4)
 if effUseH1 and chgPhH1
-    f_addLevel(stH1, f_tick(phH1), true,  colH1, 1, lsH1)
+    f_addLevel(stH1, f_tick(phH1), true,  colH1, 1, lsH1, phtH1)
 if effUseH1 and chgPlH1
-    f_addLevel(stH1, f_tick(plH1), false, colH1, 1, lsH1)
+    f_addLevel(stH1, f_tick(plH1), false, colH1, 1, lsH1, pltH1)
 if effUseM15 and chgPhM15
-    f_addLevel(stM15, f_tick(phM15), true,  colM15, 1, lsM15)
+    f_addLevel(stM15, f_tick(phM15), true,  colM15, 1, lsM15, phtM15)
 if effUseM15 and chgPlM15
-    f_addLevel(stM15, f_tick(plM15), false, colM15, 1, lsM15)
+    f_addLevel(stM15, f_tick(plM15), false, colM15, 1, lsM15, pltM15)
 if effUseM5 and chgPhM5
-    f_addLevel(stM5, f_tick(phM5), true,  colM5, 1, lsM5)
+    f_addLevel(stM5, f_tick(phM5), true,  colM5, 1, lsM5, phtM5)
 if effUseM5 and chgPlM5
-    f_addLevel(stM5, f_tick(plM5), false, colM5, 1, lsM5)
+    f_addLevel(stM5, f_tick(plM5), false, colM5, 1, lsM5, pltM5)
 
 // Prev-period extremes (PMH/PML, PWH/PWL, PDH/PDL, prev-4H/1H H/L): committed
 // as first-class levels. These are the exact prices institutions defend, they
 // exist from the 2nd bar of every timeframe (no swing confirmation needed), and
 // merge-refine snaps any nearby swing level onto the true candle extreme.
 if effUseMN and chgXhMN
-    f_addLevel(stMN, f_tick(pHiMN), true,  colMN, 2, lsMN)
+    f_addLevel(stMN, f_tick(pHiMN), true,  colMN, 2, lsMN, pxtMN)
 if effUseMN and chgXlMN
-    f_addLevel(stMN, f_tick(pLoMN), false, colMN, 2, lsMN)
+    f_addLevel(stMN, f_tick(pLoMN), false, colMN, 2, lsMN, pxtMN)
 if effUseW and chgXhW
-    f_addLevel(stW, f_tick(pHiW), true,  colW, 3, lsW)
+    f_addLevel(stW, f_tick(pHiW), true,  colW, 3, lsW, pxtW)
 if effUseW and chgXlW
-    f_addLevel(stW, f_tick(pLoW), false, colW, 3, lsW)
+    f_addLevel(stW, f_tick(pLoW), false, colW, 3, lsW, pxtW)
 if effUseD and chgXhD
-    f_addLevel(stD, f_tick(pHiD), true,  colD, 2, lsD)
+    f_addLevel(stD, f_tick(pHiD), true,  colD, 2, lsD, pxtD)
 if effUseD and chgXlD
-    f_addLevel(stD, f_tick(pLoD), false, colD, 2, lsD)
+    f_addLevel(stD, f_tick(pLoD), false, colD, 2, lsD, pxtD)
 if effUseH4 and chgXhH4
-    f_addLevel(stH4, f_tick(pHiH4), true,  colH4, 1, lsH4)
+    f_addLevel(stH4, f_tick(pHiH4), true,  colH4, 1, lsH4, pxtH4)
 if effUseH4 and chgXlH4
-    f_addLevel(stH4, f_tick(pLoH4), false, colH4, 1, lsH4)
+    f_addLevel(stH4, f_tick(pLoH4), false, colH4, 1, lsH4, pxtH4)
 if effUseH1 and chgXhH1
-    f_addLevel(stH1, f_tick(pHiH1), true,  colH1, 1, lsH1)
+    f_addLevel(stH1, f_tick(pHiH1), true,  colH1, 1, lsH1, pxtH1)
 if effUseH1 and chgXlH1
-    f_addLevel(stH1, f_tick(pLoH1), false, colH1, 1, lsH1)
+    f_addLevel(stH1, f_tick(pLoH1), false, colH1, 1, lsH1, pxtH1)
 
 // Break handling → touch stats → score + render (order matters). Per-bar event
 // counts are kept as globals so the Alert Engine reuses them without rescans.
