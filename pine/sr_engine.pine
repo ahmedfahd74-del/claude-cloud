@@ -31,7 +31,7 @@ indicator("Institutional Adaptive S/R Engine  [v2.1.1 · 2026-07-06]", "IA-SR", 
 // (top-left) and on the dashboard's top row, so you can always confirm the
 // running version. If this differs from the tag I quote in chat, you're on an
 // old copy — re-paste the file I attached. Keep this in sync with the title.
-BUILD = "v2.7.1-IRL · 2026-07-15"
+BUILD = "v2.8-PDT · 2026-07-15"
 
 // #############################################################################
 // # SECTION 1 — INPUTS
@@ -1515,7 +1515,21 @@ f_bookScore(float px) =>
                         best := st.score.get(i)
     na(best) ? 50.0 : best
 
-f_powerDecision(float heldPrice) =>
+// Push one fixed anchor (price, TF-weight, side, tag) into the candidate pool if
+// it exists. Shared by the Power decision and its trace — one source of truth.
+f_anchPush(array<float> px, array<float> w, array<bool> rs, array<string> tg, float p, float wt, bool r, string t) =>
+    if not na(p)
+        px.push(p)
+        w.push(wt)
+        rs.push(r)
+        tg.push(t)
+
+// FIXED INSTITUTIONAL ANCHORS (Phase 2) — the Power candidate pool is a fixed set
+// of last-confirmed HTF swings + prev-period extremes, each a SINGLE security value,
+// byte-identical on every chart TF. Built ONCE at global scope (below) so the Power
+// decision AND the Power-Decision Trace read the exact same candidate list. Ranking
+// is proximity (to the stable prior-Daily-close pRefS) × TF-importance × trend-side.
+f_powerDecision(float heldPrice, array<float> aPx, array<float> aW, array<bool> aRs) =>
     float bp = na
     float bs = na
     bool  br = false
@@ -1528,43 +1542,6 @@ f_powerDecision(float heldPrice) =>
     float heldS = na
     bool  heldR = false
     float heldRank = -1.0
-    // FIXED INSTITUTIONAL ANCHORS (Phase 2) — the Power Line's candidate pool is a
-    // fixed set of last-confirmed HTF swings + prev-period extremes (Daily / Weekly
-    // / Monthly), each a SINGLE request.security value. Every one is BYTE-IDENTICAL
-    // on every chart TF regardless of history depth or the detected pivot book, so
-    // the Power Line reads the SAME price on 1m…1D even on thin / newer tokens where
-    // the book legitimately differs (the seed-snapshot / detection-depth problem the
-    // fingerprint exposed). Selection is proximity (to the chart-independent Daily
-    // close dRef) × TF-importance × trend-side — all chart-independent. Score for the
-    // label is looked up from the book (chart-influenced, display only); the PRICE is
-    // guaranteed identical. This decouples the Power decision from the book entirely.
-    aPx = array.new<float>()
-    aW  = array.new<float>()
-    aRs = array.new<bool>()
-    if not na(phMN)
-        aPx.push(phMN),  aW.push(1.00), aRs.push(true)
-    if not na(plMN)
-        aPx.push(plMN),  aW.push(1.00), aRs.push(false)
-    if not na(pHiMN)
-        aPx.push(pHiMN), aW.push(1.00), aRs.push(true)
-    if not na(pLoMN)
-        aPx.push(pLoMN), aW.push(1.00), aRs.push(false)
-    if not na(phW)
-        aPx.push(phW),   aW.push(0.85), aRs.push(true)
-    if not na(plW)
-        aPx.push(plW),   aW.push(0.85), aRs.push(false)
-    if not na(pHiW)
-        aPx.push(pHiW),  aW.push(0.85), aRs.push(true)
-    if not na(pLoW)
-        aPx.push(pLoW),  aW.push(0.85), aRs.push(false)
-    if not na(phD)
-        aPx.push(phD),   aW.push(0.70), aRs.push(true)
-    if not na(plD)
-        aPx.push(plD),   aW.push(0.70), aRs.push(false)
-    if not na(pHiD)
-        aPx.push(pHiD),  aW.push(0.70), aRs.push(true)
-    if not na(pLoD)
-        aPx.push(pLoD),  aW.push(0.70), aRs.push(false)
     if aPx.size() > 0
         for i = 0 to aPx.size() - 1
             p  = aPx.get(i)
@@ -1606,7 +1583,55 @@ f_powerDecision(float heldPrice) =>
         bs := fnS
         br := fnR
     [bp, bs, br, bRank, heldFound, heldS, heldR, heldRank]
-[rawP, rawS, rawR, rawRank, heldFound, heldS, heldR, heldRank] = f_powerDecision(pwrDecision)
+
+// ── Build the fixed anchor candidate pool ONCE — the single source of truth for
+//    both the Power decision and the Power-Decision Trace. Order is fixed (ties in
+//    the decision resolve first-wins), so the trace mirrors the decision exactly.
+var array<float>  aPx  = array.new<float>()
+var array<float>  aW   = array.new<float>()
+var array<bool>   aRs  = array.new<bool>()
+var array<string> aTag = array.new<string>()
+aPx.clear(), aW.clear(), aRs.clear(), aTag.clear()
+f_anchPush(aPx, aW, aRs, aTag, phMN,  1.00, true,  "MNH")
+f_anchPush(aPx, aW, aRs, aTag, plMN,  1.00, false, "MNL")
+f_anchPush(aPx, aW, aRs, aTag, pHiMN, 1.00, true,  "PMH")
+f_anchPush(aPx, aW, aRs, aTag, pLoMN, 1.00, false, "PML")
+f_anchPush(aPx, aW, aRs, aTag, phW,   0.85, true,  "WH")
+f_anchPush(aPx, aW, aRs, aTag, plW,   0.85, false, "WL")
+f_anchPush(aPx, aW, aRs, aTag, pHiW,  0.85, true,  "PWH")
+f_anchPush(aPx, aW, aRs, aTag, pLoW,  0.85, false, "PWL")
+f_anchPush(aPx, aW, aRs, aTag, phD,   0.70, true,  "DH")
+f_anchPush(aPx, aW, aRs, aTag, plD,   0.70, false, "DL")
+f_anchPush(aPx, aW, aRs, aTag, pHiD,  0.70, true,  "PDH")
+f_anchPush(aPx, aW, aRs, aTag, pLoD,  0.70, false, "PDL")
+[rawP, rawS, rawR, rawRank, heldFound, heldS, heldR, heldRank] = f_powerDecision(pwrDecision, aPx, aW, aRs)
+
+// ── POWER DECISION TRACE — per-stage commutative fingerprints. Two chart TFs must
+//    produce identical hashes at every stage BEFORE the winner can match. Stages:
+//    S1 count · S2 prices(+side)=candidate identity · S3 TF-weights · S4 book score
+//    (display-only, NOT used to select) · S5 trend-side factor (a real select input).
+//    The FIRST stage that differs across TFs is the root cause. S6 = winner.
+//    Computed ONLY on the last bar (the table is last-bar) to avoid per-bar cost.
+pwrCount = aPx.size()
+var int trPxH = 0
+var int trWH  = 0
+var int trScH = 0
+var int trSdH = 0
+var string trWinTag = "—"
+if barstate.islast
+    trPxH := 0, trWH := 0, trScH := 0, trSdH := 0, trWinTag := "—"
+    if pwrCount > 0
+        for ti = 0 to pwrCount - 1
+            pT     = aPx.get(ti)
+            tickP  = int(math.round(pT / syminfo.mintick))
+            trPxH := int(math.abs((trPxH + tickP * 131 + (aRs.get(ti) ? 17 : 3)) % 99999989))
+            trWH  := int(math.abs((trWH + int(math.round(aW.get(ti) * 100)) * 7) % 99999989))
+            trScH := int(math.abs((trScH + int(math.round(f_bookScore(pT))) * 9) % 99999989))
+            belowT = pT < pRefS
+            sideT  = not powerTrendSide ? 1.0 : htfBull ? (belowT ? powerSideBias : 1.0 / powerSideBias) : htfBear ? (belowT ? 1.0 / powerSideBias : powerSideBias) : 1.0
+            trSdH := int(math.abs((trSdH + tickP + int(math.round(sideT * 1000))) % 99999989))
+            if not na(rawP) and math.abs(pT - rawP) <= pATR * 0.05
+                trWinTag := aTag.get(ti)
 
 // STABILITY DECISION: commit a switch only on first pick, if the committed level is
 // gone, if the challenger DECISIVELY out-ranks the incumbent now (POWER_MARGIN×), or
@@ -1634,66 +1659,55 @@ pwrScore   = na(pwrDecision) ? na    : onRaw ? rawS : heldFound ? heldS : rawS
 powerIsRes = na(pwrDecision) ? false : onRaw ? rawR : heldFound ? heldR : rawR
 pdist      = na(powerPrice) ? na : f_div(math.abs(close - powerPrice), pATR)
 
-// ═══ TEMPORARY DATABASE FINGERPRINT (remove after cross-TF identity proven) ══
-// EVIDENCE-DRIVEN: before any Power ranking, prove whether every chart timeframe
-// builds the SAME candidate database. For each store it emits an ORDER-INDEPENDENT
-// (commutative) hash of the whole level book:
-//   • idHash  — over price + type only (the FROZEN identity). This MUST be
-//     byte-identical on 15m / 1H / 4H / 1D. If it differs, the book itself
-//     diverges at detection/eviction — that is the true root cause.
-//   • scHash  — over the chart-INFLUENCED ICS score (documented to accrue on
-//     chart bars). May legitimately differ across TFs; isolates score drift
-//     from book drift.
-//   • live / brk counts — a mismatch here also localizes the divergence.
-// Compare the D / W / MN rows (yellow) across chart TFs — those HTF books feed
-// the Power Decision. HTF-BOOK is the combined D+W+MN identity: the single number
-// that must match across all chart timeframes.
-f_tfName(int m) => m >= 43200 ? "MN" : m >= 10080 ? "W" : m >= 1440 ? "D" : m >= 240 ? "4H" : m >= 60 ? "1H" : m >= 15 ? "15" : "5"
-f_storeFp(Store s) =>
-    int idH = 0
-    int scH = 0
-    int liveN = 0
-    int brkN = 0
-    if s.price.size() > 0
-        for i = 0 to s.price.size() - 1
-            tickP = int(math.round(s.price.get(i) / syminfo.mintick))
-            typ   = s.isRes.get(i) ? 17 : 3
-            idH := int(math.abs((idH + tickP * 131 + typ) % 99999989))
-            scH := int(math.abs((scH + tickP * 131 + int(math.round(s.score.get(i))) * 9) % 99999989))
-            if s.broken.get(i)
-                brkN += 1
-            else
-                liveN += 1
-    [idH, scH, liveN, brkN]
-showDbFp = input.bool(true, "DEBUG: database fingerprint", group = grpPower)
-var table dbgT = table.new(position.top_center, 5, 10, border_width = 1, frame_color = color.new(#00e676, 0), bgcolor = color.new(#0a0e14, 0))
-if showDbFp and barstate.islast
-    table.cell(dbgT, 0, 0, "TF",     text_color = color.white, text_size = size.tiny)
-    table.cell(dbgT, 1, 0, "live",   text_color = color.white, text_size = size.tiny)
-    table.cell(dbgT, 2, 0, "brk",    text_color = color.white, text_size = size.tiny)
-    table.cell(dbgT, 3, 0, "idHash", text_color = color.white, text_size = size.tiny)
-    table.cell(dbgT, 4, 0, "scHash", text_color = color.white, text_size = size.tiny)
-    int htfId = 0
-    int htfLive = 0
-    for si = 0 to allSt.size() - 1
-        [idH, scH, liveN, brkN] = f_storeFp(allSt.get(si))
-        tfm = int(allStMin.get(si))
-        isHTF = tfm >= 1440
-        col = isHTF ? color.yellow : color.silver
-        table.cell(dbgT, 0, si + 1, f_tfName(tfm),        text_color = col, text_size = size.tiny)
-        table.cell(dbgT, 1, si + 1, str.tostring(liveN),  text_color = col, text_size = size.tiny)
-        table.cell(dbgT, 2, si + 1, str.tostring(brkN),   text_color = col, text_size = size.tiny)
-        table.cell(dbgT, 3, si + 1, str.tostring(idH),    text_color = col, text_size = size.tiny)
-        table.cell(dbgT, 4, si + 1, str.tostring(scH),    text_color = col, text_size = size.tiny)
-        if isHTF
-            htfId := int(math.abs((htfId + idH) % 99999989))
-            htfLive += liveN
-    r = allSt.size() + 1
-    table.cell(dbgT, 0, r, "HTF-BOOK",             text_color = color.aqua, text_size = size.tiny)
-    table.cell(dbgT, 1, r, str.tostring(htfLive),  text_color = color.aqua, text_size = size.tiny)
-    table.cell(dbgT, 2, r, "cM" + str.tostring(int(chartMin)), text_color = color.aqua, text_size = size.tiny)
-    table.cell(dbgT, 3, r, str.tostring(htfId),    text_color = color.aqua, text_size = size.tiny)
-    table.cell(dbgT, 4, r, "ref " + f_px(dRef),    text_color = color.aqua, text_size = size.tiny)
+// ═══ POWER DECISION TRACE (temporary) — prove the decision is deterministic ══
+// Per-STAGE commutative fingerprints of the Power candidate pipeline. Two chart
+// TFs must produce identical hashes at every stage BEFORE the winner can match;
+// the FIRST stage that differs is the root cause. Below the stages, every
+// candidate is listed (idx · tag · price · score · sideW) so the exact diverging
+// candidate is visible. Screenshot on two TFs and compare row-by-row:
+//   S1 count   — same number of candidates?
+//   S2 px+id   — same candidate PRICES + sides (candidate identity)?  [selection]
+//   S3 weight  — same TF-importance weights?                          [selection]
+//   S4 score*  — book ICS lookup — DISPLAY ONLY, NOT used to select (may differ)
+//   S5 side    — trend-side factor (htfBull/htfBear × side)           [selection]
+//   S6 WIN     — the selected anchor (tag + price). If S1/S2/S3/S5 all PASS, S6
+//                MUST match; if S6 differs, one of them differs above.
+showPwrTrace = input.bool(true, "DEBUG: Power Decision trace", group = grpPower)
+var table dbgT = table.new(position.top_center, 5, 24, border_width = 1, frame_color = color.new(#00e676, 0), bgcolor = color.new(#0a0e14, 0))
+if showPwrTrace and barstate.islast
+    table.cell(dbgT, 0, 0, "POWER TRACE", text_color = color.white, text_size = size.tiny)
+    table.cell(dbgT, 1, 0, "S1 count", text_color = color.yellow, text_size = size.tiny)
+    table.cell(dbgT, 2, 0, str.tostring(pwrCount), text_color = color.yellow, text_size = size.tiny)
+    table.cell(dbgT, 3, 0, "S2 px+id", text_color = color.yellow, text_size = size.tiny)
+    table.cell(dbgT, 4, 0, str.tostring(trPxH), text_color = color.yellow, text_size = size.tiny)
+    table.cell(dbgT, 0, 1, "S3 weight", text_color = color.yellow, text_size = size.tiny)
+    table.cell(dbgT, 1, 1, str.tostring(trWH), text_color = color.yellow, text_size = size.tiny)
+    table.cell(dbgT, 2, 1, "S4 score*", text_color = color.gray, text_size = size.tiny)
+    table.cell(dbgT, 3, 1, str.tostring(trScH), text_color = color.gray, text_size = size.tiny)
+    table.cell(dbgT, 4, 1, "", text_color = color.gray, text_size = size.tiny)
+    table.cell(dbgT, 0, 2, "S5 side", text_color = color.yellow, text_size = size.tiny)
+    table.cell(dbgT, 1, 2, str.tostring(trSdH), text_color = color.yellow, text_size = size.tiny)
+    table.cell(dbgT, 2, 2, "S6 WIN", text_color = color.aqua, text_size = size.tiny)
+    table.cell(dbgT, 3, 2, trWinTag + " " + f_px(rawP), text_color = color.aqua, text_size = size.tiny)
+    table.cell(dbgT, 4, 2, (htfBull ? "BULL" : htfBear ? "BEAR" : "NEUT") + " cM" + str.tostring(int(chartMin)), text_color = color.aqua, text_size = size.tiny)
+    table.cell(dbgT, 0, 3, "#",      text_color = color.white, text_size = size.tiny)
+    table.cell(dbgT, 1, 3, "tag",    text_color = color.white, text_size = size.tiny)
+    table.cell(dbgT, 2, 3, "price",  text_color = color.white, text_size = size.tiny)
+    table.cell(dbgT, 3, 3, "score*", text_color = color.white, text_size = size.tiny)
+    table.cell(dbgT, 4, 3, "sideW",  text_color = color.white, text_size = size.tiny)
+    if pwrCount > 0
+        for ci = 0 to pwrCount - 1
+            pc     = aPx.get(ci)
+            belowc = pc < pRefS
+            sidec  = not powerTrendSide ? 1.0 : htfBull ? (belowc ? powerSideBias : 1.0 / powerSideBias) : htfBear ? (belowc ? 1.0 / powerSideBias : powerSideBias) : 1.0
+            win    = not na(rawP) and math.abs(pc - rawP) <= pATR * 0.05
+            cc     = win ? color.new(#00e676, 0) : color.silver
+            rr     = ci + 4
+            table.cell(dbgT, 0, rr, str.tostring(ci) + (win ? "◄" : ""), text_color = cc, text_size = size.tiny)
+            table.cell(dbgT, 1, rr, aTag.get(ci), text_color = cc, text_size = size.tiny)
+            table.cell(dbgT, 2, rr, f_px(pc), text_color = cc, text_size = size.tiny)
+            table.cell(dbgT, 3, rr, str.tostring(int(math.round(f_bookScore(pc)))), text_color = cc, text_size = size.tiny)
+            table.cell(dbgT, 4, rr, str.tostring(sidec, "#.##"), text_color = cc, text_size = size.tiny)
 
 // Status intelligence — what the engine expects at this line (existing
 // globals only: htfAlign, momentum, side; no recomputation).
