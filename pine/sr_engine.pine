@@ -593,6 +593,7 @@ type Store
     array<int>   breaks       // break-quality mass: clean close-through=2, marginal/wick=1
     array<bool>  broken       // broken & kept (dash-dim mode) → frozen from scoring
     array<string> why        // per-level reason codes (top ICS contributors) — display only
+    array<int>   birthT      // creation TIME (ms) — chart-independent, drives cross-TF-stable eviction
     float        w           // timeframe importance weight
     float        atrTF       // this store's OWN timeframe ATR (updated each bar)
     float        fhor        // freshness horizon in chart bars (TF-scaled)
@@ -601,7 +602,7 @@ f_newStore(float w, float tfMin) =>
     Store.new(array.new<float>(), array.new<line>(), array.new<box>(), array.new<label>(),
          array.new<bool>(), array.new<float>(), array.new<float>(),
          array.new<float>(), array.new<int>(), array.new<float>(), array.new<int>(),
-         array.new<int>(), array.new<bool>(), array.new<string>(), w, 0.0, f_clamp(500.0 * tfMin / math.max(chartMin, 1.0), 500.0, 5000.0))
+         array.new<int>(), array.new<bool>(), array.new<string>(), array.new<int>(), w, 0.0, f_clamp(500.0 * tfMin / math.max(chartMin, 1.0), 500.0, 5000.0))
 
 // Remove a level from every parallel array at index i (keeps them in lockstep).
 f_removeAt(Store s, int i) =>
@@ -626,6 +627,7 @@ f_removeAt(Store s, int i) =>
     s.breaks.remove(i)
     s.broken.remove(i)
     s.why.remove(i)
+    s.birthT.remove(i)
 
 // Add a confirmed swing: skip if within adaptive merge distance; else draw a
 // line, seed its stats, and evict the WEAKEST level beyond the cap (broken
@@ -676,6 +678,7 @@ f_addLevel(Store s, float p, bool isRes, color col, int wdt, string lstyle) =>
             s.breaks.unshift(0)
             s.broken.unshift(false)
             s.why.unshift("")
+            s.birthT.unshift(time)
             // DETERMINISM LOG (read-only): record this frozen identity. Append-only
             // and independent of the display eviction below, so the hash reflects
             // the true identity set, immune to chart-dependent eviction.
@@ -685,7 +688,11 @@ f_addLevel(Store s, float p, bool isRes, color col, int wdt, string lstyle) =>
                 // the store's STRUCTURAL EXTREMES (highest / lowest unbroken
                 // level = the range boundaries) — a fresh major top/bottom has
                 // few touches yet, but it is the level that matters most.
-                // Broken levels go first (-100), then lowest score; ties → oldest.
+                // CHART-INDEPENDENT eviction (cross-TF identity): evict broken
+                // levels first, then the OLDEST surviving level by creation TIME —
+                // NEVER by the chart-dependent score. Every chart therefore keeps
+                // the SAME recent set of institutional levels, so the closest HTF
+                // level is identical on a 5m and a 1D chart (issues #1/#2).
                 hiIdx = -1
                 loIdx = -1
                 hiP   = -1.0e18
@@ -700,19 +707,19 @@ f_addLevel(Store s, float p, bool isRes, color col, int wdt, string lstyle) =>
                             loP := pj
                             loIdx := j
                 worst = -1
-                ws    = 1.0e9
+                ws    = 1.0e18
                 for j = 1 to s.price.size() - 1
                     if j != hiIdx and j != loIdx
-                        cs = s.score.get(j) - (s.broken.get(j) ? 100.0 : 0.0)
+                        cs = s.broken.get(j) ? -1.0 : float(s.birthT.get(j))
                         if cs <= ws
                             ws := cs
                             worst := j
                 if worst < 0
-                    // Everything except index 0 is protected → weakest overall.
+                    // Everything except index 0 is protected → oldest overall.
                     worst := 1
-                    ws := 1.0e9
+                    ws := 1.0e18
                     for j = 1 to s.price.size() - 1
-                        cs = s.score.get(j) - (s.broken.get(j) ? 100.0 : 0.0)
+                        cs = s.broken.get(j) ? -1.0 : float(s.birthT.get(j))
                         if cs <= ws
                             ws := cs
                             worst := j
