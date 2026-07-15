@@ -31,7 +31,7 @@ indicator("Institutional Adaptive S/R Engine  [v2.1.1 · 2026-07-06]", "IA-SR", 
 // (top-left) and on the dashboard's top row, so you can always confirm the
 // running version. If this differs from the tag I quote in chat, you're on an
 // old copy — re-paste the file I attached. Keep this in sync with the title.
-BUILD = "v2.8-PDT · 2026-07-15"
+BUILD = "v2.9-DET · 2026-07-15"
 
 // #############################################################################
 // # SECTION 1 — INPUTS
@@ -1636,27 +1636,20 @@ if barstate.islast
 // STABILITY DECISION: commit a switch only on first pick, if the committed level is
 // gone, if the challenger DECISIVELY out-ranks the incumbent now (POWER_MARGIN×), or
 // if the same challenger has led for `powerDwell` confirmed bars. Otherwise HOLD.
-if barstate.isconfirmed
-    if not na(rawP) and not na(pwrCand) and math.abs(rawP - pwrCand) <= pATR * 0.05
-        pwrCandBars += 1
-    else
-        pwrCand     := rawP
-        pwrCandBars := 1
-    firstTime = na(pwrDecision)
-    heldGone  = not na(pwrDecision) and not heldFound
-    differs   = na(pwrDecision) or (not na(rawP) and math.abs(rawP - pwrDecision) > pATR * 0.05)
-    decisive  = heldFound and heldRank > 0 and rawRank > heldRank * POWER_MARGIN
-    dwellMet  = pwrCandBars >= powerDwell
-    if not na(rawP) and (firstTime or heldGone or (differs and (decisive or dwellMet)))
-        pwrDecision := rawP
-
-// The drawn line is the OUTPUT of the Power Decision. Resolve its live attributes:
-// if the committed level is the current raw winner use its fresh values, else the
-// held level's live values (still on chart), else fall back to the raw winner.
-onRaw      = not na(pwrDecision) and not na(rawP) and math.abs(pwrDecision - rawP) <= pATR * 0.05
-powerPrice = pwrDecision
-pwrScore   = na(pwrDecision) ? na    : onRaw ? rawS : heldFound ? heldS : rawS
-powerIsRes = na(pwrDecision) ? false : onRaw ? rawR : heldFound ? heldR : rawR
+// DETERMINISTIC OUTPUT (v2.9): the drawn Power Line IS the raw argmax of the fixed
+// anchor pool — a pure function of chart-independent inputs (fixed anchors + the
+// prior-Daily-close reference pRefS + trend side). It is identical on every chart
+// timeframe and naturally stable within a session (the inputs only change when a
+// new Daily/Weekly/Monthly level prints), so NO chart-bar dwell/commit is needed.
+// The old stability layer committed a value that was PATH-DEPENDENT on each chart's
+// own bar sequence — two timeframes locked onto different anchors from the SAME
+// pool. That path dependence WAS the cross-TF divergence; it is removed here.
+// (pwrDecision / pwrCand / powerDwell are retained but inert — kept only so the
+// input and the held-rank tracking in f_powerDecision compile unchanged.)
+pwrDecision := rawP
+powerPrice = rawP
+pwrScore   = rawS
+powerIsRes = rawR
 pdist      = na(powerPrice) ? na : f_div(math.abs(close - powerPrice), pATR)
 
 // ═══ POWER DECISION TRACE (temporary) — prove the decision is deterministic ══
