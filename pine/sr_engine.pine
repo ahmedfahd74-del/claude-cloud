@@ -97,7 +97,7 @@ clarityOn   = input.bool(true, "Enable Chart Clarity", group = grpClar,
      tooltip = "Display-only. Fills the level budget by RELEVANCE (strength × proximity) so a small count shows the levels that matter now, collapses nearby levels to the single strongest representative, and hides levels far from price. Never changes the level book, scores, or the hash.")
 clarNearK   = input.float(0.5,  "Proximity weight (relevance)", minval = 0.0, maxval = 3.0, step = 0.1, group = grpClar,
      tooltip = "How strongly nearness to price is favoured when choosing which levels to draw. 0 = pure strength; higher = prefer levels close to price.")
-clusterATRk = input.float(0.35, "Cluster distance (× Daily ATR)", minval = 0.0, maxval = 3.0, step = 0.05, group = grpClar,
+clusterATRk = input.float(0.50, "Cluster distance (× Daily ATR)", minval = 0.0, maxval = 3.0, step = 0.05, group = grpClar,
      tooltip = "A level within this of an already-shown stronger / higher-timeframe level is hidden — nearby levels collapse to one representative. 0 = off.")
 hideFarATRk = input.float(6.0,  "Hide levels beyond (× Daily ATR)", minval = 0.0, maxval = 30.0, step = 0.5, group = grpClar,
      tooltip = "Hide any level farther than this many Daily-ATR from current price. 0 = show every distance.")
@@ -983,6 +983,9 @@ f_rel(float sc, float lvl) => sc / (1.0 + clarNearK * f_div(math.abs(close - lvl
 // lower-priority level within the cluster distance of one already shown is hidden
 // — nearby levels collapse to the single strongest representative.
 var array<float> gShownPx = array.new<float>()
+var array<float> gShownSc = array.new<float>()   // shown level's ICS (for strongest-wins merge)
+var array<line>  gShownLn = array.new<line>()    // its line ref (to hide the weaker on collision)
+var array<label> gShownLb = array.new<label>()   // its label ref
 // Relevance-ranked display threshold: the n-th highest relevance among live levels.
 f_relThresh(Store s, int n) =>
     tmp = array.new<float>()
@@ -1081,15 +1084,39 @@ f_scoreAndRender(Store s, color baseCol, Store o1, Store o2, Store o3, Store o4,
                 // CHART CLARITY display gates (visual only):
                 distA  = f_div(math.abs(close - lvl), clarATR)
                 farOK  = not clarityOn or hideFarATRk <= 0 or distA <= hideFarATRk
+                // MIN-SEPARATION MERGE — strongest wins. A candidate that passes the
+                // other gates is hidden if a STRONGER already-shown level sits within
+                // clusterATRk×Daily-ATR; otherwise it hides every WEAKER shown level
+                // in that band (retroactively) and takes their place. Order-
+                // independent: the highest-ICS level in each cluster is the survivor.
                 clustOK = true
-                if clarityOn and clusterATRk > 0 and gShownPx.size() > 0
+                gatesOK = drawOK and t >= minTouches and vizOK and rankOK and farOK
+                minSep  = clusterATRk * clarATR
+                if clarityOn and clusterATRk > 0 and gatesOK and gShownPx.size() > 0
                     for gi = 0 to gShownPx.size() - 1
-                        if math.abs(gShownPx.get(gi) - lvl) <= clusterATRk * clarATR
+                        // dominant = strictly higher ICS, or equal ICS with a
+                        // deterministic price tiebreak (higher price wins) so the
+                        // survivor is order-independent even on ties.
+                        domin = gShownSc.get(gi) > sc + 0.0001 or (math.abs(gShownSc.get(gi) - sc) <= 0.0001 and gShownPx.get(gi) >= lvl)
+                        if math.abs(gShownPx.get(gi) - lvl) <= minSep and domin
                             clustOK := false
                             break
-                show   = drawOK and t >= minTouches and vizOK and rankOK and farOK and clustOK
+                    if clustOK
+                        gj = gShownPx.size() - 1
+                        while gj >= 0
+                            if math.abs(gShownPx.get(gj) - lvl) <= minSep
+                                lnw = gShownLn.get(gj)
+                                if not na(lnw)
+                                    line.set_color(lnw, color.new(color.gray, 100))
+                                lbw = gShownLb.get(gj)
+                                if not na(lbw)
+                                    label.set_text(lbw, "")
+                                    label.set_color(lbw, color.new(color.white, 100))
+                                gShownPx.remove(gj), gShownSc.remove(gj), gShownLn.remove(gj), gShownLb.remove(gj)
+                            gj := gj - 1
+                show   = gatesOK and clustOK
                 if show and clarityOn
-                    gShownPx.push(lvl)
+                    gShownPx.push(lvl), gShownSc.push(sc), gShownLn.push(s.ln.get(i)), gShownLb.push(s.lb.get(i))
                 lnCol  = color.new(baseCol, show ? lineOpacity : 100)
                 line.set_color(s.ln.get(i), lnCol)
                 line.set_width(s.ln.get(i), lineWidth)
@@ -1257,7 +1284,7 @@ gHolds  += touchEvents
 
 // Clear the clarity registry each bar; HTF stores render first so they claim
 // clusters before lower-timeframe levels (which collapse into them).
-gShownPx.clear()
+gShownPx.clear(), gShownSc.clear(), gShownLn.clear(), gShownLb.clear()
 f_scoreAndRender(stMN,  colMN,  stW,  stD,  stH4, stH1, stM15, stM5,  drawMN)
 f_scoreAndRender(stW,   colW,   stMN, stD,  stH4, stH1, stM15, stM5,  drawW)
 f_scoreAndRender(stD,   colD,   stMN, stW,  stH4, stH1, stM15, stM5,  drawD)
