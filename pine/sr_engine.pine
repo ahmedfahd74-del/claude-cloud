@@ -1597,8 +1597,8 @@ pdist      = na(powerPrice) ? na : f_div(math.abs(close - powerPrice), pATR)
 // reveals why two timeframes pick different levels (a candidate present on one
 // chart's Daily store but not the other's, or a sub-floor TF leaking in).
 f_tfName(int m) => m >= 43200 ? "MN" : m >= 10080 ? "W" : m >= 1440 ? "D" : m >= 240 ? "4H" : m >= 60 ? "1H" : m >= 15 ? "15" : "5"
-showPowerDbg = input.bool(false, "DEBUG: dump Power candidates", group = grpPower)
-var table dbgT = table.new(position.top_center, 7, 20, border_width = 1, frame_color = color.new(color.gray, 40), bgcolor = color.new(#0a0e14, 0))
+showPowerDbg = input.bool(true, "DEBUG: dump Power candidates", group = grpPower)
+var table dbgT = table.new(position.middle_center, 7, 20, border_width = 1, frame_color = color.new(#00e676, 0), bgcolor = color.new(#0a0e14, 0))
 if showPowerDbg and barstate.islast
     dpx = array.new<float>()
     dtf = array.new<int>()
