@@ -31,7 +31,7 @@ indicator("Institutional Adaptive S/R Engine  [v2.1.1 · 2026-07-06]", "IA-SR", 
 // (top-left) and on the dashboard's top row, so you can always confirm the
 // running version. If this differs from the tag I quote in chat, you're on an
 // old copy — re-paste the file I attached. Keep this in sync with the title.
-BUILD = "v2.9-DET · 2026-07-15"
+BUILD = "v3.0-NAT · 2026-07-15"
 
 // #############################################################################
 // # SECTION 1 — INPUTS
@@ -494,6 +494,22 @@ f_reqtf(simple string tf) => timeframe.in_seconds(tf) < timeframe.in_seconds() ?
 [phH1, plH1, hiH1, loH1, atrH1, legH1, trH1, pHiH1, pLoH1, phtH1, pltH1, hitH1, lotH1, pxtH1] = request.security(syminfo.tickerid, f_reqtf("60"),  f_htfPack(), lookahead = barmerge.lookahead_off)
 [phM15, plM15, hiM15, loM15, atrM15, legM15, trM15, pHiM15, pLoM15, phtM15, pltM15, hitM15, lotM15, pxtM15] = request.security(syminfo.tickerid, f_reqtf("15"), f_htfPack(), lookahead = barmerge.lookahead_off)
 [phM5,  plM5,  hiM5,  loM5,  atrM5,  legM5,  trM5,  pHiM5,  pLoM5,  phtM5,  pltM5,  hitM5,  lotM5,  pxtM5 ] = request.security(syminfo.tickerid, f_reqtf("5"),  f_htfPack(), lookahead = barmerge.lookahead_off)
+
+// ── NATIVE INSTITUTIONAL ANCHORS (NO sub-chart clamp) — the fixed reference set.
+// bare high[1]/low[1]/high/low, prior close and ta.atr are LIGHTWEIGHT (no array
+// accumulation / swing loop), so requesting a lower TF than the chart here does NOT
+// trigger the RE10110 replay that f_reqtf guards the stateful f_htfPack from. Because
+// the TF is NOT clamped, every value below is byte-identical on EVERY chart timeframe
+// — 1m through 1M — so the Power Line and the reference lines built on them are truly
+// chart-timeframe-independent (fixes the 1W divergence: its Daily anchors, ranking
+// reference and ATR were previously clamped UP to Weekly).
+f_periodHL() => [high[1], low[1], high, low]   // prev H, prev L, current H, current L
+[nPDH, nPDL, nCDH, nCDL] = request.security(syminfo.tickerid, "D", f_periodHL(), lookahead = barmerge.lookahead_off)
+[nPWH, nPWL, nCWH, nCWL] = request.security(syminfo.tickerid, "W", f_periodHL(), lookahead = barmerge.lookahead_off)
+[nPMH, nPML, nCMH, nCML] = request.security(syminfo.tickerid, "M", f_periodHL(), lookahead = barmerge.lookahead_off)
+// Chart-independent Power reference + distance scale (native Daily, un-clamped).
+f_dRefAtr() => [close[1], ta.atr(14)]
+[nDref, nDatr] = request.security(syminfo.tickerid, "D", f_dRefAtr(), lookahead = barmerge.lookahead_off)
 
 // --- Hold last confirmed swing per TF (verification preview for Phase 2) ----
 // Phase 3 replaces these single held values with managed, scored level arrays.
@@ -1479,12 +1495,15 @@ pATR = math.max(nz(atrD, atrFast), syminfo.mintick)
 // it (instead of the chart's own close, which differs per timeframe) makes the
 // pick identical across timeframes.
 dRef = nz(request.security(syminfo.tickerid, f_reqtf("D"), close, lookahead = barmerge.lookahead_off), close)
-// STABLE Power-ranking reference: the PRIOR (confirmed) Daily close. Unlike dRef
-// (the developing daily close, which moves every tick), close[1] on the Daily is
-// FIXED for the whole session, so the Power pick cannot flip intraday as price
-// wiggles between two anchors — it stops the jumping. Still identical on every
-// chart TF (a single security value), so cross-TF Power identity is preserved.
-pRefS = nz(request.security(syminfo.tickerid, f_reqtf("D"), close[1], lookahead = barmerge.lookahead_off), dRef)
+// STABLE + FULLY NATIVE Power-ranking reference and distance scale. pRefS is the
+// PRIOR confirmed Daily close (nDref) — fixed for the session (no intraday jitter)
+// AND requested WITHOUT the sub-chart clamp, so it is identical even on a 1W/1M
+// chart (where the clamped f_reqtf("D") would have returned the Weekly close).
+// pATRn is the native Daily ATR (nDatr) used ONLY to normalise the Power ranking
+// distance, so the ranking scale is the same on every chart TF too. Both fall back
+// to the clamped values if the native request is unavailable.
+pRefS = nz(nDref, nz(request.security(syminfo.tickerid, f_reqtf("D"), close[1], lookahead = barmerge.lookahead_off), dRef))
+pATRn = math.max(nz(nDatr, nz(atrD, atrFast)), syminfo.mintick)
 
 // POWER DECISION ENGINE. The engine continuously re-evaluates every candidate; the
 // drawn line is only the OUTPUT of that decision. STABILITY: a new candidate does
@@ -1547,7 +1566,7 @@ f_powerDecision(float heldPrice, array<float> aPx, array<float> aW, array<bool> 
             p  = aPx.get(i)
             w  = aW.get(i)
             sc = f_bookScore(p)
-            d  = f_div(math.abs(pRefS - p), pATR)   // distance from the STABLE prior-Daily-close reference
+            d  = f_div(math.abs(pRefS - p), pATRn)  // distance from the native prior-Daily-close, native-ATR scaled
             if d < nbest
                 nbest := d
                 fnP := p
@@ -1572,7 +1591,7 @@ f_powerDecision(float heldPrice, array<float> aPx, array<float> aW, array<bool> 
                     br := aRs.get(i)
                 // Track the currently-displayed (held) level's LIVE rank so the
                 // stability layer can compare challenger vs incumbent.
-                if not na(heldPrice) and math.abs(p - heldPrice) <= pATR * 0.05
+                if not na(heldPrice) and math.abs(p - heldPrice) <= pATRn * 0.05
                     heldFound := true
                     heldS := sc
                     heldR := aRs.get(i)
@@ -1591,19 +1610,17 @@ var array<float>  aPx  = array.new<float>()
 var array<float>  aW   = array.new<float>()
 var array<bool>   aRs  = array.new<bool>()
 var array<string> aTag = array.new<string>()
+// The pool is the 6 NATIVE prev-period extremes only (PMH/PML, PWH/PWL, PDH/PDL) —
+// each un-clamped, so byte-identical on every chart TF incl. 1W/1M. Confirmed swings
+// were dropped: they are noisier and were clamped (the old 1W divergence). This is
+// exactly the institutional reference set (prev D/W/M highs & lows).
 aPx.clear(), aW.clear(), aRs.clear(), aTag.clear()
-f_anchPush(aPx, aW, aRs, aTag, phMN,  1.00, true,  "MNH")
-f_anchPush(aPx, aW, aRs, aTag, plMN,  1.00, false, "MNL")
-f_anchPush(aPx, aW, aRs, aTag, pHiMN, 1.00, true,  "PMH")
-f_anchPush(aPx, aW, aRs, aTag, pLoMN, 1.00, false, "PML")
-f_anchPush(aPx, aW, aRs, aTag, phW,   0.85, true,  "WH")
-f_anchPush(aPx, aW, aRs, aTag, plW,   0.85, false, "WL")
-f_anchPush(aPx, aW, aRs, aTag, pHiW,  0.85, true,  "PWH")
-f_anchPush(aPx, aW, aRs, aTag, pLoW,  0.85, false, "PWL")
-f_anchPush(aPx, aW, aRs, aTag, phD,   0.70, true,  "DH")
-f_anchPush(aPx, aW, aRs, aTag, plD,   0.70, false, "DL")
-f_anchPush(aPx, aW, aRs, aTag, pHiD,  0.70, true,  "PDH")
-f_anchPush(aPx, aW, aRs, aTag, pLoD,  0.70, false, "PDL")
+f_anchPush(aPx, aW, aRs, aTag, nPMH, 1.00, true,  "PMH")
+f_anchPush(aPx, aW, aRs, aTag, nPML, 1.00, false, "PML")
+f_anchPush(aPx, aW, aRs, aTag, nPWH, 0.85, true,  "PWH")
+f_anchPush(aPx, aW, aRs, aTag, nPWL, 0.85, false, "PWL")
+f_anchPush(aPx, aW, aRs, aTag, nPDH, 0.70, true,  "PDH")
+f_anchPush(aPx, aW, aRs, aTag, nPDL, 0.70, false, "PDL")
 [rawP, rawS, rawR, rawRank, heldFound, heldS, heldR, heldRank] = f_powerDecision(pwrDecision, aPx, aW, aRs)
 
 // ── POWER DECISION TRACE — per-stage commutative fingerprints. Two chart TFs must
@@ -1630,7 +1647,7 @@ if barstate.islast
             belowT = pT < pRefS
             sideT  = not powerTrendSide ? 1.0 : htfBull ? (belowT ? powerSideBias : 1.0 / powerSideBias) : htfBear ? (belowT ? 1.0 / powerSideBias : powerSideBias) : 1.0
             trSdH := int(math.abs((trSdH + tickP + int(math.round(sideT * 1000))) % 99999989))
-            if not na(rawP) and math.abs(pT - rawP) <= pATR * 0.05
+            if not na(rawP) and math.abs(pT - rawP) <= pATRn * 0.05
                 trWinTag := aTag.get(ti)
 
 // STABILITY DECISION: commit a switch only on first pick, if the committed level is
@@ -1693,7 +1710,7 @@ if showPwrTrace and barstate.islast
             pc     = aPx.get(ci)
             belowc = pc < pRefS
             sidec  = not powerTrendSide ? 1.0 : htfBull ? (belowc ? powerSideBias : 1.0 / powerSideBias) : htfBear ? (belowc ? 1.0 / powerSideBias : powerSideBias) : 1.0
-            win    = not na(rawP) and math.abs(pc - rawP) <= pATR * 0.05
+            win    = not na(rawP) and math.abs(pc - rawP) <= pATRn * 0.05
             cc     = win ? color.new(#00e676, 0) : color.silver
             rr     = ci + 4
             table.cell(dbgT, 0, rr, str.tostring(ci) + (win ? "◄" : ""), text_color = cc, text_size = size.tiny)
@@ -1746,7 +1763,7 @@ else
 f_refAdd(array<float> px, array<string> tag, array<bool> res, array<int> wd, float p, string t, bool r, int w) =>
     if not na(p)
         dup = false
-        md  = pATR * 0.15
+        md  = pATRn * 0.15
         if px.size() > 0
             for i = 0 to px.size() - 1
                 if math.abs(px.get(i) - p) <= md
@@ -1777,18 +1794,20 @@ if showRefLines and barstate.islast
     rtag = array.new<string>()
     rres = array.new<bool>()
     rwd  = array.new<int>()
-    f_refAdd(rpx, rtag, rres, rwd, pHiMN, "PMH", true,  3)
-    f_refAdd(rpx, rtag, rres, rwd, pLoMN, "PML", false, 3)
-    f_refAdd(rpx, rtag, rres, rwd, phMN,  "MN·H", true,  3)
-    f_refAdd(rpx, rtag, rres, rwd, plMN,  "MN·L", false, 3)
-    f_refAdd(rpx, rtag, rres, rwd, pHiW,  "PWH", true,  2)
-    f_refAdd(rpx, rtag, rres, rwd, pLoW,  "PWL", false, 2)
-    f_refAdd(rpx, rtag, rres, rwd, phW,   "W·H", true,  2)
-    f_refAdd(rpx, rtag, rres, rwd, plW,   "W·L", false, 2)
-    f_refAdd(rpx, rtag, rres, rwd, pHiD,  "PDH", true,  1)
-    f_refAdd(rpx, rtag, rres, rwd, pLoD,  "PDL", false, 1)
-    f_refAdd(rpx, rtag, rres, rwd, phD,   "D·H", true,  1)
-    f_refAdd(rpx, rtag, rres, rwd, plD,   "D·L", false, 1)
+    // NATIVE prev-period + current-period extremes (un-clamped) — identical on every
+    // chart TF. Prev-period first so a current extreme sitting on it merges cleanly.
+    f_refAdd(rpx, rtag, rres, rwd, nPMH, "PMH", true,  3)
+    f_refAdd(rpx, rtag, rres, rwd, nPML, "PML", false, 3)
+    f_refAdd(rpx, rtag, rres, rwd, nCMH, "CMH", true,  3)
+    f_refAdd(rpx, rtag, rres, rwd, nCML, "CML", false, 3)
+    f_refAdd(rpx, rtag, rres, rwd, nPWH, "PWH", true,  2)
+    f_refAdd(rpx, rtag, rres, rwd, nPWL, "PWL", false, 2)
+    f_refAdd(rpx, rtag, rres, rwd, nCWH, "CWH", true,  2)
+    f_refAdd(rpx, rtag, rres, rwd, nCWL, "CWL", false, 2)
+    f_refAdd(rpx, rtag, rres, rwd, nPDH, "PDH", true,  1)
+    f_refAdd(rpx, rtag, rres, rwd, nPDL, "PDL", false, 1)
+    f_refAdd(rpx, rtag, rres, rwd, nCDH, "CDH", true,  1)
+    f_refAdd(rpx, rtag, rres, rwd, nCDL, "CDL", false, 1)
     if rpx.size() > 0
         for i = 0 to rpx.size() - 1
             p   = rpx.get(i)
