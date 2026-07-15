@@ -1616,7 +1616,7 @@ if showPowerLine and not na(powerPrice)
         line.set_color(powerLn, colPower)
         line.set_width(powerLn, powerWidth)
         label.set_xy(powerLb, bar_index, powerPrice)
-    ptxt = "⚡ POWER  " + f_px(powerPrice) + " · " + (powerIsRes ? "R" : "S") + (na(pwrScore) ? "" : " · ICS " + str.tostring(math.round(pwrScore))) + " · " + str.tostring(pdist, "#.#") + " ATR · " + (htfBull ? "BULL" : htfBear ? "BEAR" : "NEUTRAL") + " · ref " + f_px(dRef) + " · " + BUILD
+    ptxt = "⚡ " + BUILD + " · ref " + f_px(dRef) + " · P " + f_px(powerPrice) + " · " + (powerIsRes ? "R" : "S") + (na(pwrScore) ? "" : " ICS " + str.tostring(math.round(pwrScore))) + " · " + str.tostring(pdist, "#.#") + " ATR · " + (htfBull ? "BULL" : htfBear ? "BEAR" : "NEUTRAL")
     if powerShowStat
         ptxt += " · " + pwrStatus + (htfBull ? "  → higher" : htfBear ? "  → lower" : "  → range")
     label.set_text(powerLb, ptxt)
