@@ -31,7 +31,7 @@ indicator("Institutional Adaptive S/R Engine  [v2.1.1 · 2026-07-06]", "IA-SR", 
 // (top-left) and on the dashboard's top row, so you can always confirm the
 // running version. If this differs from the tag I quote in chat, you're on an
 // old copy — re-paste the file I attached. Keep this in sync with the title.
-BUILD = "v2.3-ILSE · 2026-07-12"
+BUILD = "v2.4-DBFP · 2026-07-15"
 
 // #############################################################################
 // # SECTION 1 — INPUTS
@@ -1623,7 +1623,7 @@ f_storeFp(Store s) =>
                 liveN += 1
     [idH, scH, liveN, brkN]
 showDbFp = input.bool(true, "DEBUG: database fingerprint", group = grpPower)
-var table dbgT = table.new(position.middle_center, 5, 10, border_width = 1, frame_color = color.new(#00e676, 0), bgcolor = color.new(#0a0e14, 0))
+var table dbgT = table.new(position.top_center, 5, 10, border_width = 1, frame_color = color.new(#00e676, 0), bgcolor = color.new(#0a0e14, 0))
 if showDbFp and barstate.islast
     table.cell(dbgT, 0, 0, "TF",     text_color = color.white, text_size = size.tiny)
     table.cell(dbgT, 1, 0, "live",   text_color = color.white, text_size = size.tiny)
