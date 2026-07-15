@@ -1591,81 +1591,66 @@ pwrScore   = na(pwrDecision) ? na    : onRaw ? rawS : heldFound ? heldS : rawS
 powerIsRes = na(pwrDecision) ? false : onRaw ? rawR : heldFound ? heldR : rawR
 pdist      = na(powerPrice) ? na : f_div(math.abs(close - powerPrice), pATR)
 
-// ═══ TEMPORARY POWER-DECISION DEBUG (remove after root cause fixed) ══════════
-// Dumps EVERY Daily+ candidate the Power Decision sees, with its source store TF,
-// ICS, distance-from-dRef, and rank — winner marked. One screenshot per chart
-// reveals why two timeframes pick different levels (a candidate present on one
-// chart's Daily store but not the other's, or a sub-floor TF leaking in).
+// ═══ TEMPORARY DATABASE FINGERPRINT (remove after cross-TF identity proven) ══
+// EVIDENCE-DRIVEN: before any Power ranking, prove whether every chart timeframe
+// builds the SAME candidate database. For each store it emits an ORDER-INDEPENDENT
+// (commutative) hash of the whole level book:
+//   • idHash  — over price + type only (the FROZEN identity). This MUST be
+//     byte-identical on 15m / 1H / 4H / 1D. If it differs, the book itself
+//     diverges at detection/eviction — that is the true root cause.
+//   • scHash  — over the chart-INFLUENCED ICS score (documented to accrue on
+//     chart bars). May legitimately differ across TFs; isolates score drift
+//     from book drift.
+//   • live / brk counts — a mismatch here also localizes the divergence.
+// Compare the D / W / MN rows (yellow) across chart TFs — those HTF books feed
+// the Power Decision. HTF-BOOK is the combined D+W+MN identity: the single number
+// that must match across all chart timeframes.
 f_tfName(int m) => m >= 43200 ? "MN" : m >= 10080 ? "W" : m >= 1440 ? "D" : m >= 240 ? "4H" : m >= 60 ? "1H" : m >= 15 ? "15" : "5"
-showPowerDbg = input.bool(true, "DEBUG: dump Power candidates", group = grpPower)
-var table dbgT = table.new(position.middle_center, 7, 20, border_width = 1, frame_color = color.new(#00e676, 0), bgcolor = color.new(#0a0e14, 0))
-if showPowerDbg and barstate.islast
-    dpx = array.new<float>()
-    dtf = array.new<int>()
-    dsc = array.new<float>()
-    dpr = array.new<float>()
-    dsd = array.new<float>()
-    drk = array.new<float>()
-    dfloor = math.max(1440.0, chartMin)
+f_storeFp(Store s) =>
+    int idH = 0
+    int scH = 0
+    int liveN = 0
+    int brkN = 0
+    if s.price.size() > 0
+        for i = 0 to s.price.size() - 1
+            tickP = int(math.round(s.price.get(i) / syminfo.mintick))
+            typ   = s.isRes.get(i) ? 17 : 3
+            idH := int(math.abs((idH + tickP * 131 + typ) % 99999989))
+            scH := int(math.abs((scH + tickP * 131 + int(math.round(s.score.get(i))) * 9) % 99999989))
+            if s.broken.get(i)
+                brkN += 1
+            else
+                liveN += 1
+    [idH, scH, liveN, brkN]
+showDbFp = input.bool(true, "DEBUG: database fingerprint", group = grpPower)
+var table dbgT = table.new(position.middle_center, 5, 10, border_width = 1, frame_color = color.new(#00e676, 0), bgcolor = color.new(#0a0e14, 0))
+if showDbFp and barstate.islast
+    table.cell(dbgT, 0, 0, "TF",     text_color = color.white, text_size = size.tiny)
+    table.cell(dbgT, 1, 0, "live",   text_color = color.white, text_size = size.tiny)
+    table.cell(dbgT, 2, 0, "brk",    text_color = color.white, text_size = size.tiny)
+    table.cell(dbgT, 3, 0, "idHash", text_color = color.white, text_size = size.tiny)
+    table.cell(dbgT, 4, 0, "scHash", text_color = color.white, text_size = size.tiny)
+    int htfId = 0
+    int htfLive = 0
     for si = 0 to allSt.size() - 1
-        st = allSt.get(si)
+        [idH, scH, liveN, brkN] = f_storeFp(allSt.get(si))
         tfm = int(allStMin.get(si))
-        if tfm >= dfloor and st.price.size() > 0
-            for i = 0 to st.price.size() - 1
-                if not st.broken.get(i)
-                    p    = st.price.get(i)
-                    d    = f_div(math.abs(dRef - p), pATR)
-                    prox = 1.0 / (0.30 + d)
-                    tfw  = math.pow(0.55 + 0.45 * st.w, 2.0)
-                    below = p < dRef
-                    sideW = not powerTrendSide ? 1.0 : htfBull ? (below ? powerSideBias : 1.0 / powerSideBias) : htfBear ? (below ? 1.0 / powerSideBias : powerSideBias) : 1.0
-                    dpx.push(p), dtf.push(tfm), dsc.push(st.score.get(i)), dpr.push(prox), dsd.push(sideW), drk.push(prox * tfw * sideW)
-    table.cell(dbgT, 0, 0, "TF",    text_color = color.white, text_size = size.tiny)
-    table.cell(dbgT, 1, 0, "Price", text_color = color.white, text_size = size.tiny)
-    table.cell(dbgT, 2, 0, "ICS",   text_color = color.white, text_size = size.tiny)
-    table.cell(dbgT, 3, 0, "dATR",  text_color = color.white, text_size = size.tiny)
-    table.cell(dbgT, 4, 0, "prox",  text_color = color.white, text_size = size.tiny)
-    table.cell(dbgT, 5, 0, "sideW", text_color = color.white, text_size = size.tiny)
-    table.cell(dbgT, 6, 0, "rank",  text_color = color.white, text_size = size.tiny)
-    n = dpx.size()
-    used = array.new<bool>(n, false)
-    rows = math.min(n, 12)
-    r = 1
-    while r <= rows
-        bi = -1
-        bR = -1.0e18
-        for k = 0 to n - 1
-            if not used.get(k) and drk.get(k) > bR
-                bR := drk.get(k)
-                bi := k
-        if bi < 0
-            break
-        used.set(bi, true)
-        isWin = not na(powerPrice) and math.abs(dpx.get(bi) - powerPrice) <= pATR * 0.05
-        col = isWin ? color.new(#00e676, 0) : color.silver
-        table.cell(dbgT, 0, r, f_tfName(dtf.get(bi)) + (isWin ? "◄" : ""), text_color = col, text_size = size.tiny)
-        table.cell(dbgT, 1, r, f_px(dpx.get(bi)), text_color = col, text_size = size.tiny)
-        table.cell(dbgT, 2, r, str.tostring(math.round(dsc.get(bi))), text_color = col, text_size = size.tiny)
-        table.cell(dbgT, 3, r, str.tostring(f_div(math.abs(dRef - dpx.get(bi)), pATR), "#.##"), text_color = col, text_size = size.tiny)
-        table.cell(dbgT, 4, r, str.tostring(dpr.get(bi), "#.##"), text_color = col, text_size = size.tiny)
-        table.cell(dbgT, 5, r, str.tostring(dsd.get(bi), "#.##"), text_color = col, text_size = size.tiny)
-        table.cell(dbgT, 6, r, str.tostring(drk.get(bi), "#.###"), text_color = col, text_size = size.tiny)
-        r += 1
-    // trend footer — the inputs to sideW (the suspected cross-TF divergence)
-    table.cell(dbgT, 0, r, "align", text_color = color.aqua, text_size = size.tiny)
-    table.cell(dbgT, 1, r, str.tostring(htfAlign), text_color = color.aqua, text_size = size.tiny)
-    table.cell(dbgT, 2, r, "trW" + str.tostring(f_trendSign(trW)), text_color = color.aqua, text_size = size.tiny)
-    table.cell(dbgT, 3, r, "trD" + str.tostring(f_trendSign(trD)), text_color = color.aqua, text_size = size.tiny)
-    table.cell(dbgT, 4, r, "tr4H" + str.tostring(f_trendSign(trH4)), text_color = color.aqua, text_size = size.tiny)
-    table.cell(dbgT, 5, r, htfBull ? "BULL" : htfBear ? "BEAR" : "NEUT", text_color = color.aqua, text_size = size.tiny)
-    table.cell(dbgT, 6, r, "bias" + str.tostring(powerSideBias, "#.#"), text_color = color.aqua, text_size = size.tiny)
-    table.cell(dbgT, 0, r + 1, "ref",  text_color = color.yellow, text_size = size.tiny)
-    table.cell(dbgT, 1, r + 1, f_px(dRef), text_color = color.yellow, text_size = size.tiny)
-    table.cell(dbgT, 2, r + 1, "P",    text_color = color.yellow, text_size = size.tiny)
-    table.cell(dbgT, 3, r + 1, f_px(powerPrice), text_color = color.yellow, text_size = size.tiny)
-    table.cell(dbgT, 4, r + 1, "n" + str.tostring(n), text_color = color.yellow, text_size = size.tiny)
-    table.cell(dbgT, 5, r + 1, "cM" + str.tostring(int(chartMin)), text_color = color.yellow, text_size = size.tiny)
-    table.cell(dbgT, 6, r + 1, "flr" + str.tostring(int(dfloor)), text_color = color.yellow, text_size = size.tiny)
+        isHTF = tfm >= 1440
+        col = isHTF ? color.yellow : color.silver
+        table.cell(dbgT, 0, si + 1, f_tfName(tfm),        text_color = col, text_size = size.tiny)
+        table.cell(dbgT, 1, si + 1, str.tostring(liveN),  text_color = col, text_size = size.tiny)
+        table.cell(dbgT, 2, si + 1, str.tostring(brkN),   text_color = col, text_size = size.tiny)
+        table.cell(dbgT, 3, si + 1, str.tostring(idH),    text_color = col, text_size = size.tiny)
+        table.cell(dbgT, 4, si + 1, str.tostring(scH),    text_color = col, text_size = size.tiny)
+        if isHTF
+            htfId := int(math.abs((htfId + idH) % 99999989))
+            htfLive += liveN
+    r = allSt.size() + 1
+    table.cell(dbgT, 0, r, "HTF-BOOK",             text_color = color.aqua, text_size = size.tiny)
+    table.cell(dbgT, 1, r, str.tostring(htfLive),  text_color = color.aqua, text_size = size.tiny)
+    table.cell(dbgT, 2, r, "cM" + str.tostring(int(chartMin)), text_color = color.aqua, text_size = size.tiny)
+    table.cell(dbgT, 3, r, str.tostring(htfId),    text_color = color.aqua, text_size = size.tiny)
+    table.cell(dbgT, 4, r, "ref " + f_px(dRef),    text_color = color.aqua, text_size = size.tiny)
 
 // Status intelligence — what the engine expects at this line (existing
 // globals only: htfAlign, momentum, side; no recomputation).
