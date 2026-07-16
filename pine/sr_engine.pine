@@ -31,7 +31,7 @@ indicator("Institutional Adaptive S/R Engine  [v2.1.1 · 2026-07-06]", "IA-SR", 
 // (top-left) and on the dashboard's top row, so you can always confirm the
 // running version. If this differs from the tag I quote in chat, you're on an
 // old copy — re-paste the file I attached. Keep this in sync with the title.
-BUILD = "v3.2-LBL · 2026-07-15"
+BUILD = "v3.3-ADJ · 2026-07-15"
 
 // #############################################################################
 // # SECTION 1 — INPUTS
@@ -89,6 +89,17 @@ labelDeclutter = input.bool(true, "Stagger overlapping labels", group = grpLvl,
      tooltip = "When two reference labels are vertically close, step the later one horizontally to the left so the text does not overlap.")
 labelGapATR  = input.float(0.6, "Label Min Gap (Daily ATR)", minval = 0.1, maxval = 3.0, step = 0.1, group = grpLvl,
      tooltip = "Two labels closer than this (in native Daily ATR) are treated as a cluster and staggered horizontally.")
+labelOffset  = input.int(3, "Label Right Offset (bars)", minval = 0, maxval = 30, group = grpLvl,
+     tooltip = "Pushes the on-line labels to the right of the last candle, into the chart margin.")
+// LEVEL ADJUSTMENT — refines only the DRAWN position of a line. It NEVER changes the
+// institutional level identity, the Power selection, merge logic, ICS, or the
+// deterministic cross-TF behaviour (the raw level is always what is selected/scored;
+// only where the line is painted is snapped, by a deterministic, chart-independent
+// function of the raw price). Default None = raw levels, unchanged.
+levelAdjust  = input.string("None", "Level Adjustment (drawn position only)", options = ["None", "Nearest Round Number", "Nearest Psychological Level", "Highest Touch Level"], group = grpLvl,
+     tooltip = "None = raw. Round/Psychological = snap the drawn line to the nearest round / .00-.50 level. Highest Touch = snap to the most-tested price within the window. Identity, selection, ICS and determinism are untouched — display only.")
+adjATRWin    = input.float(0.5, "Adjustment Window (Daily ATR)", minval = 0.1, maxval = 3.0, step = 0.1, group = grpLvl,
+     tooltip = "For 'Highest Touch Level': how far from the raw level (in native Daily ATR) to search for a more-tested price.")
 minTouches   = input.int(0, "Min Touches to Show Level", minval = 0, maxval = 20, group = grpLvl,
      tooltip = "0 = show all. Higher = only show levels price has reacted to at least this many times (proven S/R).")
 anchorMode   = input.string("Wick", "Level Anchor (visual only)", options = ["Wick", "Wick/Body Mid", "Body"], group = grpLvl,
@@ -135,8 +146,10 @@ showRefLines    = input.bool(true,  "Institutional reference lines (identical on
      tooltip = "Draws PDH/PDL, PWH/PWL, PMH/PML and the last confirmed Daily/Weekly/Monthly swings at their exact prices. Each is a single higher-timeframe value, so these lines are byte-identical on a 1m and a 1D chart — the institutional MTF reference set.")
 showDetectedBook = input.bool(false, "Also show detected swing book (per-chart)", group = grpPower,
      tooltip = "The auto-detected pivot levels. These depend on how much history each chart timeframe loads, so they are NOT identical across timeframes — off by default. Turn on for extra per-chart detail.")
-colRefRes       = input.color(color.new(#ef5350, 0), "Reference Resistance Color", group = grpPower)
-colRefSup       = input.color(color.new(#26a69a, 0), "Reference Support Color", group = grpPower)
+colRefRes       = input.color(color.new(#ef5350, 0), "Line Color — ABOVE price", group = grpPower)
+colRefSup       = input.color(color.new(#26a69a, 0), "Line Color — BELOW price", group = grpPower)
+colorByPos      = input.bool(true, "Color lines by price position (red above / green below)", group = grpPower,
+     tooltip = "On: every line above current price is red and every line below is green, regardless of its type. Off: colour by type (resistance red / support green).")
 showPowerLine = input.bool(true, "Show Power Line", group = grpPower,
      tooltip = "A single line marking the nearest turning point where price is expected to flip back into the dominant HTF trend. Overall bear → nearest resistance above; overall bull → nearest support below. Does not touch the main S/R lines.")
 colPower      = input.color(color.new(#ffd600, 0), "Power Line Color", group = grpPower)
@@ -572,6 +585,49 @@ f_touchCount(float lvl, float band) =>
             for i = 0 to mLoE.size() - 1
                 c += math.abs(mLoE.get(i) - lvl) <= band ? 1.6 : 0.0
     c
+
+// LEVEL ADJUSTMENT (display only). Returns a snapped DRAW position for a raw level.
+// Pure function of the raw price + native Daily ATR (both chart-independent), so the
+// adjusted value is identical on every chart TF — determinism preserved. The raw
+// price is what the engine selects/scores/merges; this only moves where it is drawn.
+f_bestTouch(float px, float atr) =>
+    band = atr * touchBandK
+    win  = atr * adjATRWin
+    float bestP = px
+    float bestC = f_touchCount(px, band)
+    all = array.new<float>()
+    if not na(dHiE)
+        all.concat(dHiE)
+    if not na(dLoE)
+        all.concat(dLoE)
+    if not na(wHiE)
+        all.concat(wHiE)
+    if not na(wLoE)
+        all.concat(wLoE)
+    if not na(mHiE)
+        all.concat(mHiE)
+    if not na(mLoE)
+        all.concat(mLoE)
+    if all.size() > 0
+        for i = 0 to all.size() - 1
+            v = all.get(i)
+            if math.abs(v - px) <= win
+                cc = f_touchCount(v, band)
+                if cc > bestC
+                    bestC := cc
+                    bestP := v
+    bestP
+
+f_adjust(float px, float atr) =>
+    float outp = px
+    if not na(px) and levelAdjust != "None"
+        if levelAdjust == "Highest Touch Level"
+            outp := f_bestTouch(px, atr)
+        else
+            mag  = math.pow(10.0, math.floor(math.log10(math.max(math.abs(px), syminfo.mintick))))
+            step = (levelAdjust == "Nearest Psychological Level" ? mag / 2.0 : mag / 10.0)
+            outp := step > 0 ? math.round(px / step) * step : px
+    outp
 
 // --- Hold last confirmed swing per TF (verification preview for Phase 2) ----
 // Phase 3 replaces these single held values with managed, scored level arrays.
@@ -1206,7 +1262,8 @@ f_scoreAndRender(Store s, color baseCol, Store o1, Store o2, Store o3, Store o4,
                 show   = gatesOK and clustOK
                 if show and clarityOn
                     gShownPx.push(lvl), gShownSc.push(sc), gShownLn.push(s.ln.get(i)), gShownLb.push(s.lb.get(i))
-                lnCol  = color.new(baseCol, show ? lineOpacity : 100)
+                posCol = colorByPos ? (lvl >= close ? colRefRes : colRefSup) : baseCol
+                lnCol  = color.new(posCol, show ? lineOpacity : 100)
                 line.set_color(s.ln.get(i), lnCol)
                 line.set_width(s.ln.get(i), lineWidth)
                 bxo = s.bx.get(i)
@@ -1228,7 +1285,7 @@ f_scoreAndRender(Store s, color baseCol, Store o1, Store o2, Store o3, Store o4,
                              labelMode == "Compact" ? (res ? "R" : "S") + " " + f_px(lvl) + "  " + str.tostring(math.round(sc)) :
                              grade + "  " + (res ? "R" : "S") + "  " + f_px(lvl) + "  ICS " + str.tostring(math.round(sc)) + (wy == "" ? "" : "  · " + wy)
                         label.set_text(lb, ltxt)
-                        label.set_color(lb, color.new(baseCol, 25))
+                        label.set_color(lb, color.new(posCol, 25))
                         label.set_textcolor(lb, sc >= 80 ? color.white : color.new(color.white, 25))
                     else
                         label.set_text(lb, "")
@@ -1806,22 +1863,25 @@ pwrStatus    = na(powerPrice) ? "" :
      pwrBreaking                  ? "BREAK LIKELY" :
      pwrPressing                  ? "RESPECT EXPECTED" : "HOLDING"
 
+// Drawn Power position = the adjusted (snapped) level; SELECTION stays on the raw
+// powerPrice above, so identity/determinism are untouched — only the paint moves.
+powerDraw = na(powerPrice) ? na : f_adjust(powerPrice, pATRn)
 var line  powerLn = na
 var label powerLb = na
-if showPowerLine and not na(powerPrice)
+if showPowerLine and not na(powerDraw)
     if na(powerLn)
-        powerLn := line.new(bar_index - 1, powerPrice, bar_index, powerPrice, xloc = xloc.bar_index,
+        powerLn := line.new(bar_index - 1, powerDraw, bar_index, powerDraw, xloc = xloc.bar_index,
              extend = extend.both, color = colPower, width = powerWidth, style = line.style_solid)
-        powerLb := label.new(bar_index, powerPrice, "", xloc = xloc.bar_index,
+        powerLb := label.new(bar_index, powerDraw, "", xloc = xloc.bar_index,
              style = label.style_label_left, color = colPower, textcolor = color.black, size = size.normal)
     else
-        line.set_xy1(powerLn, bar_index - 1, powerPrice)
-        line.set_xy2(powerLn, bar_index, powerPrice)
+        line.set_xy1(powerLn, bar_index - 1, powerDraw)
+        line.set_xy2(powerLn, bar_index, powerDraw)
         line.set_color(powerLn, colPower)
         line.set_width(powerLn, powerWidth)
-        label.set_xy(powerLb, bar_index, powerPrice)
-    pwrTouch = na(powerPrice) ? 0.0 : f_touchCount(powerPrice, pATRn * touchBandK)
-    ptxt = "⚡ " + BUILD + " · ref " + f_px(dRef) + " · P " + f_px(powerPrice) + " · " + (powerIsRes ? "R" : "S") + (na(pwrScore) ? "" : " ICS " + str.tostring(math.round(pwrScore))) + (powerTouchOn ? " · TCH " + str.tostring(pwrTouch, "#.#") : "") + " · " + str.tostring(pdist, "#.#") + " ATR · " + (htfBull ? "BULL" : htfBear ? "BEAR" : "NEUTRAL")
+        label.set_xy(powerLb, bar_index, powerDraw)
+    pwrTouch = na(powerDraw) ? 0.0 : f_touchCount(powerDraw, pATRn * touchBandK)
+    ptxt = "⚡ " + BUILD + " · ref " + f_px(dRef) + " · P " + f_px(powerDraw) + " · " + (powerIsRes ? "R" : "S") + (na(pwrScore) ? "" : " ICS " + str.tostring(math.round(pwrScore))) + (powerTouchOn ? " · TCH " + str.tostring(pwrTouch, "#.#") : "") + " · " + str.tostring(pdist, "#.#") + " ATR · " + (htfBull ? "BULL" : htfBear ? "BEAR" : "NEUTRAL")
     if powerShowStat
         ptxt += " · " + pwrStatus + (htfBull ? "  → higher" : htfBear ? "  → lower" : "  → range")
     label.set_text(powerLb, ptxt)
@@ -1893,8 +1953,10 @@ if showRefLines and barstate.islast
         int   slot  = 0
         for oi = 0 to ord.size() - 1
             i   = ord.get(oi)
-            p   = rpx.get(i)
-            col = rres.get(i) ? colRefRes : colRefSup
+            praw = rpx.get(i)
+            p    = f_adjust(praw, pATRn)             // drawn position (snapped); identity stays raw
+            // COLOUR BY POSITION: above current price = red, below = green (or by type)
+            col  = colorByPos ? (p >= close ? colRefRes : colRefSup) : (rres.get(i) ? colRefRes : colRefSup)
             ln = line.new(bar_index - 1, p, bar_index, p, xloc = xloc.bar_index,
                  extend = extend.both, color = col, width = rwd.get(i), style = line.style_solid)
             refLns.push(ln)
@@ -1905,8 +1967,10 @@ if showRefLines and barstate.islast
                     slot := 0
                 lastY := p
                 ltxt = labelMode == "Price only" ? f_px(p) : rtag.get(i) + "  " + f_px(p)
-                lb = label.new(bar_index - slot * 8, p, ltxt, xloc = xloc.bar_index,
-                     style = label.style_label_left, color = color.new(col, 20), textcolor = color.white, size = size.small)
+                // Label sits ON TOP of the line (style_label_down) at the FAR RIGHT
+                // (labelOffset bars past the last candle); clusters step left.
+                lb = label.new(bar_index + labelOffset - slot * 6, p, ltxt, xloc = xloc.bar_index,
+                     style = label.style_label_down, color = color.new(col, 20), textcolor = color.white, size = size.tiny)
                 refLbs.push(lb)
 
 // #############################################################################
