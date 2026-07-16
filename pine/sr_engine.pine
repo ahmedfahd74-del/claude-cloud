@@ -31,7 +31,7 @@ indicator("Institutional Adaptive S/R Engine  [v2.1.1 · 2026-07-06]", "IA-SR", 
 // (top-left) and on the dashboard's top row, so you can always confirm the
 // running version. If this differs from the tag I quote in chat, you're on an
 // old copy — re-paste the file I attached. Keep this in sync with the title.
-BUILD = "v3.0-NAT · 2026-07-15"
+BUILD = "v3.1-TCH · 2026-07-15"
 
 // #############################################################################
 // # SECTION 1 — INPUTS
@@ -133,6 +133,16 @@ showPowerLine = input.bool(true, "Show Power Line", group = grpPower,
      tooltip = "A single line marking the nearest turning point where price is expected to flip back into the dominant HTF trend. Overall bear → nearest resistance above; overall bull → nearest support below. Does not touch the main S/R lines.")
 colPower      = input.color(color.new(#ffd600, 0), "Power Line Color", group = grpPower)
 powerWidth    = input.int(2, "Power Line Width", minval = 1, maxval = 6, group = grpPower)
+// TOUCH / TEST STRENGTH — a level tested repeatedly (high/low many times across
+// recent D/W/M history) earns more Power. Counted from NATIVE, un-clamped period
+// extremes so the strength is identical on every chart TF (does not break the
+// cross-TF determinism). Toggle off for exact v3.0 selection.
+powerTouchOn   = input.bool(true,  "Weight Power by touches / tests", group = grpPower,
+     tooltip = "A candidate that has been a Daily/Weekly/Monthly high or low many times (a repeatedly tested level) is boosted. Counted from native period extremes, so it stays identical on every chart timeframe.")
+powerTouchInfl = input.float(0.6, "Touch Influence", minval = 0.0, maxval = 2.0, step = 0.1, group = grpPower,
+     tooltip = "How strongly the test count boosts the Power ranking. 0 = ignore touches (v3.0 behaviour); higher = a well-tested level dominates a merely-close one.")
+touchBandK     = input.float(0.25, "Touch Cluster Band (Daily ATR)", minval = 0.05, maxval = 1.0, step = 0.05, group = grpPower,
+     tooltip = "How close a historical high/low must be to a level to count as a test of it, in native Daily ATR.")
 powerRadius   = input.float(8.0, "Search Radius (Daily ATR)", minval = 1.0, maxval = 30.0, step = 0.5, group = grpPower,
      tooltip = "How far from price the engine may look for its highest-confidence level. Measured in DAILY ATR so the Power Line is the same level on every chart timeframe.")
 powerMinSc    = input.int(60, "Min Level Score", minval = 0, maxval = 100, group = grpPower)
@@ -510,6 +520,50 @@ f_periodHL() => [high[1], low[1], high, low]   // prev H, prev L, current H, cur
 // Chart-independent Power reference + distance scale (native Daily, un-clamped).
 f_dRefAtr() => [close[1], ta.atr(14)]
 [nDref, nDatr] = request.security(syminfo.tickerid, "D", f_dRefAtr(), lookahead = barmerge.lookahead_off)
+
+// ── TOUCH / TEST STRENGTH source — last N period extremes per TF via INDEXED
+// history refs (high[k]/low[k]). This is light (a bounded k-loop, no array
+// accumulation over full history, no atr/ema/swing), so a sub-chart request cannot
+// trigger the RE10110 replay. Native (un-clamped) → the extreme set, and therefore
+// every level's test count, is identical on every chart TF. A price that has been a
+// D/W/M high or low many times is a repeatedly TESTED level = more Power.
+f_extHL(int n) =>
+    h = array.new<float>()
+    l = array.new<float>()
+    for k = 1 to n
+        if not na(high[k])
+            h.push(high[k])
+        if not na(low[k])
+            l.push(low[k])
+    [h, l]
+[dHiE, dLoE] = request.security(syminfo.tickerid, "D", f_extHL(8), lookahead = barmerge.lookahead_off)
+[wHiE, wLoE] = request.security(syminfo.tickerid, "W", f_extHL(6), lookahead = barmerge.lookahead_off)
+[mHiE, mLoE] = request.security(syminfo.tickerid, "M", f_extHL(4), lookahead = barmerge.lookahead_off)
+
+// Weighted count of historical period extremes within `band` of a level (Weekly and
+// Monthly tests weigh more than Daily). Chart-independent: same extremes everywhere.
+f_touchCount(float lvl, float band) =>
+    float c = 0.0
+    if not na(lvl) and band > 0
+        if not na(dHiE) and dHiE.size() > 0
+            for i = 0 to dHiE.size() - 1
+                c += math.abs(dHiE.get(i) - lvl) <= band ? 1.0 : 0.0
+        if not na(dLoE) and dLoE.size() > 0
+            for i = 0 to dLoE.size() - 1
+                c += math.abs(dLoE.get(i) - lvl) <= band ? 1.0 : 0.0
+        if not na(wHiE) and wHiE.size() > 0
+            for i = 0 to wHiE.size() - 1
+                c += math.abs(wHiE.get(i) - lvl) <= band ? 1.3 : 0.0
+        if not na(wLoE) and wLoE.size() > 0
+            for i = 0 to wLoE.size() - 1
+                c += math.abs(wLoE.get(i) - lvl) <= band ? 1.3 : 0.0
+        if not na(mHiE) and mHiE.size() > 0
+            for i = 0 to mHiE.size() - 1
+                c += math.abs(mHiE.get(i) - lvl) <= band ? 1.6 : 0.0
+        if not na(mLoE) and mLoE.size() > 0
+            for i = 0 to mLoE.size() - 1
+                c += math.abs(mLoE.get(i) - lvl) <= band ? 1.6 : 0.0
+    c
 
 // --- Hold last confirmed swing per TF (verification preview for Phase 2) ----
 // Phase 3 replaces these single held values with managed, scored level arrays.
@@ -1548,7 +1602,7 @@ f_anchPush(array<float> px, array<float> w, array<bool> rs, array<string> tg, fl
 // byte-identical on every chart TF. Built ONCE at global scope (below) so the Power
 // decision AND the Power-Decision Trace read the exact same candidate list. Ranking
 // is proximity (to the stable prior-Daily-close pRefS) × TF-importance × trend-side.
-f_powerDecision(float heldPrice, array<float> aPx, array<float> aW, array<bool> aRs) =>
+f_powerDecision(float heldPrice, array<float> aPx, array<float> aW, array<bool> aRs, array<float> aTch) =>
     float bp = na
     float bs = na
     bool  br = false
@@ -1583,7 +1637,11 @@ f_powerDecision(float heldPrice, array<float> aPx, array<float> aW, array<bool> 
                 sideW = not powerTrendSide ? 1.0 :
                      htfBull ? (below ? powerSideBias : 1.0 / powerSideBias) :
                      htfBear ? (below ? 1.0 / powerSideBias : powerSideBias) : 1.0
-                rank = prox * tfw * sideW
+                // TOUCH BOOST: a repeatedly-tested level (many coincident D/W/M
+                // extremes) earns more Power. Chart-independent (aTch comes from the
+                // native extreme set), so the ranking stays identical on every TF.
+                tchMul = powerTouchOn ? 1.0 + powerTouchInfl * math.min(aTch.get(i) / 4.0, 1.5) : 1.0
+                rank = prox * tfw * sideW * tchMul
                 if rank > bRank
                     bRank := rank
                     bp := p
@@ -1621,7 +1679,14 @@ f_anchPush(aPx, aW, aRs, aTag, nPWH, 0.85, true,  "PWH")
 f_anchPush(aPx, aW, aRs, aTag, nPWL, 0.85, false, "PWL")
 f_anchPush(aPx, aW, aRs, aTag, nPDH, 0.70, true,  "PDH")
 f_anchPush(aPx, aW, aRs, aTag, nPDL, 0.70, false, "PDL")
-[rawP, rawS, rawR, rawRank, heldFound, heldS, heldR, heldRank] = f_powerDecision(pwrDecision, aPx, aW, aRs)
+// Per-anchor test count (chart-independent), parallel to aPx — how many recent
+// D/W/M extremes cluster on each anchor. Feeds the Power touch boost + the trace.
+var array<float> aTch = array.new<float>()
+aTch.clear()
+if aPx.size() > 0
+    for ai = 0 to aPx.size() - 1
+        aTch.push(f_touchCount(aPx.get(ai), pATRn * touchBandK))
+[rawP, rawS, rawR, rawRank, heldFound, heldS, heldR, heldRank] = f_powerDecision(pwrDecision, aPx, aW, aRs, aTch)
 
 // ── POWER DECISION TRACE — per-stage commutative fingerprints. Two chart TFs must
 //    produce identical hashes at every stage BEFORE the winner can match. Stages:
@@ -1700,11 +1765,11 @@ if showPwrTrace and barstate.islast
     table.cell(dbgT, 2, 2, "S6 WIN", text_color = color.aqua, text_size = size.tiny)
     table.cell(dbgT, 3, 2, trWinTag + " " + f_px(rawP), text_color = color.aqua, text_size = size.tiny)
     table.cell(dbgT, 4, 2, (htfBull ? "BULL" : htfBear ? "BEAR" : "NEUT") + " cM" + str.tostring(int(chartMin)), text_color = color.aqua, text_size = size.tiny)
-    table.cell(dbgT, 0, 3, "#",      text_color = color.white, text_size = size.tiny)
-    table.cell(dbgT, 1, 3, "tag",    text_color = color.white, text_size = size.tiny)
-    table.cell(dbgT, 2, 3, "price",  text_color = color.white, text_size = size.tiny)
-    table.cell(dbgT, 3, 3, "score*", text_color = color.white, text_size = size.tiny)
-    table.cell(dbgT, 4, 3, "sideW",  text_color = color.white, text_size = size.tiny)
+    table.cell(dbgT, 0, 3, "#",     text_color = color.white, text_size = size.tiny)
+    table.cell(dbgT, 1, 3, "tag",   text_color = color.white, text_size = size.tiny)
+    table.cell(dbgT, 2, 3, "price", text_color = color.white, text_size = size.tiny)
+    table.cell(dbgT, 3, 3, "tch",   text_color = color.white, text_size = size.tiny)
+    table.cell(dbgT, 4, 3, "sideW", text_color = color.white, text_size = size.tiny)
     if pwrCount > 0
         for ci = 0 to pwrCount - 1
             pc     = aPx.get(ci)
@@ -1716,7 +1781,7 @@ if showPwrTrace and barstate.islast
             table.cell(dbgT, 0, rr, str.tostring(ci) + (win ? "◄" : ""), text_color = cc, text_size = size.tiny)
             table.cell(dbgT, 1, rr, aTag.get(ci), text_color = cc, text_size = size.tiny)
             table.cell(dbgT, 2, rr, f_px(pc), text_color = cc, text_size = size.tiny)
-            table.cell(dbgT, 3, rr, str.tostring(int(math.round(f_bookScore(pc)))), text_color = cc, text_size = size.tiny)
+            table.cell(dbgT, 3, rr, str.tostring(aTch.get(ci), "#.#"), text_color = cc, text_size = size.tiny)
             table.cell(dbgT, 4, rr, str.tostring(sidec, "#.##"), text_color = cc, text_size = size.tiny)
 
 // Status intelligence — what the engine expects at this line (existing
@@ -1744,7 +1809,8 @@ if showPowerLine and not na(powerPrice)
         line.set_color(powerLn, colPower)
         line.set_width(powerLn, powerWidth)
         label.set_xy(powerLb, bar_index, powerPrice)
-    ptxt = "⚡ " + BUILD + " · ref " + f_px(dRef) + " · P " + f_px(powerPrice) + " · " + (powerIsRes ? "R" : "S") + (na(pwrScore) ? "" : " ICS " + str.tostring(math.round(pwrScore))) + " · " + str.tostring(pdist, "#.#") + " ATR · " + (htfBull ? "BULL" : htfBear ? "BEAR" : "NEUTRAL")
+    pwrTouch = na(powerPrice) ? 0.0 : f_touchCount(powerPrice, pATRn * touchBandK)
+    ptxt = "⚡ " + BUILD + " · ref " + f_px(dRef) + " · P " + f_px(powerPrice) + " · " + (powerIsRes ? "R" : "S") + (na(pwrScore) ? "" : " ICS " + str.tostring(math.round(pwrScore))) + (powerTouchOn ? " · TCH " + str.tostring(pwrTouch, "#.#") : "") + " · " + str.tostring(pdist, "#.#") + " ATR · " + (htfBull ? "BULL" : htfBear ? "BEAR" : "NEUTRAL")
     if powerShowStat
         ptxt += " · " + pwrStatus + (htfBull ? "  → higher" : htfBear ? "  → lower" : "  → range")
     label.set_text(powerLb, ptxt)
