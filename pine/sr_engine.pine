@@ -31,7 +31,7 @@ indicator("Institutional Adaptive S/R Engine  [v2.1.1 · 2026-07-06]", "IA-SR", 
 // (top-left) and on the dashboard's top row, so you can always confirm the
 // running version. If this differs from the tag I quote in chat, you're on an
 // old copy — re-paste the file I attached. Keep this in sync with the title.
-BUILD = "v3.3.1-ADJ · 2026-07-15"
+BUILD = "v3.3.2-ADJ · 2026-07-15"
 
 // #############################################################################
 // # SECTION 1 — INPUTS
@@ -85,12 +85,12 @@ maxLvl       = input.int(8, "Max Levels per Timeframe", minval = 1, maxval = 20,
 // lines, horizontally staggers vertically-close labels so they never overlap.
 labelMode    = input.string("Compact", "Label Detail", options = ["Full", "Compact", "Price only", "Off"], group = grpLvl,
      tooltip = "Full = grade/side/price/ICS/reasons. Compact = side + price (+ICS). Price only = just the price. Off = no text (lines only). Reduces clutter when many lines are shown.")
-labelDeclutter = input.bool(true, "Stagger overlapping labels", group = grpLvl,
-     tooltip = "When two reference labels are vertically close, step the later one horizontally to the left so the text does not overlap.")
+labelDeclutter = input.bool(false, "Stagger overlapping labels", group = grpLvl,
+     tooltip = "OFF (default): all labels frozen at the same far-right column, on their line. ON: when two labels are vertically close, step the later one left so the text does not overlap.")
 labelGapATR  = input.float(0.6, "Label Min Gap (Daily ATR)", minval = 0.1, maxval = 3.0, step = 0.1, group = grpLvl,
-     tooltip = "Two labels closer than this (in native Daily ATR) are treated as a cluster and staggered horizontally.")
-labelOffset  = input.int(3, "Label Right Offset (bars)", minval = 0, maxval = 30, group = grpLvl,
-     tooltip = "Pushes the on-line labels to the right of the last candle, into the chart margin.")
+     tooltip = "Only used when Stagger is ON: two labels closer than this (in native Daily ATR) are treated as a cluster and staggered horizontally.")
+labelOffset  = input.int(10, "Label Right Offset (bars)", minval = 0, maxval = 200, group = grpLvl,
+     tooltip = "Pushes the on-line labels to the right of the last candle, into the chart margin. Higher = further right.")
 // LEVEL ADJUSTMENT — refines only the DRAWN position of a line. It NEVER changes the
 // institutional level identity, the Power selection, merge logic, ICS, or the
 // deterministic cross-TF behaviour (the raw level is always what is selected/scored;
@@ -1862,9 +1862,11 @@ pwrStatus    = na(powerPrice) ? "" :
      pwrBreaking                  ? "BREAK LIKELY" :
      pwrPressing                  ? "RESPECT EXPECTED" : "HOLDING"
 
-// Drawn Power position = the adjusted (snapped) level; SELECTION stays on the raw
-// powerPrice above, so identity/determinism are untouched — only the paint moves.
-powerDraw = na(powerPrice) ? na : f_adjust(powerPrice, pATRn)
+// The Power Line is IMMUNE to every other line setting (Level Adjustment, colour,
+// labels, min-touches, anchor). It always draws at its raw selected level and only
+// its OWN Power inputs affect it, so changing any reference-line setting never moves
+// it. (Level Adjustment applies to the reference/book lines only.)
+powerDraw = powerPrice
 var line  powerLn = na
 var label powerLb = na
 if showPowerLine and not na(powerDraw)
@@ -1945,14 +1947,18 @@ if showRefLines and barstate.islast
     f_refAdd(rpx, rtag, rres, rwd, nCDH, "CDH", true,  1)
     f_refAdd(rpx, rtag, rres, rwd, nCDL, "CDL", false, 1)
     if rpx.size() > 0
-        // Render lines in PRICE order and horizontally stagger labels that fall in
-        // the same vertical band, so a tight cluster of references never overlaps.
+        // Render in PRICE order. Labels are FROZEN at the same far-right column
+        // (bar_index + labelOffset); with Stagger ON, vertically-close ones step left.
         ord = rpx.sort_indices(order.ascending)
         float lastY = na
         int   slot  = 0
         for oi = 0 to ord.size() - 1
             i   = ord.get(oi)
             praw = rpx.get(i)
+            // MIN TOUCHES: hide a reference tested fewer than the threshold (0 = all).
+            // Uses the chart-independent test count, so it never affects the Power Line.
+            if minTouches > 0 and f_touchCount(praw, pATRn * touchBandK) < minTouches
+                continue
             p    = f_adjust(praw, pATRn)             // drawn position (snapped); identity stays raw
             // COLOUR BY POSITION: above current price = red, below = green (or by type)
             col  = colorByPos ? (p >= close ? colRefRes : colRefSup) : (rres.get(i) ? colRefRes : colRefSup)
@@ -1965,10 +1971,9 @@ if showRefLines and barstate.islast
                 else
                     slot := 0
                 lastY := p
-                ltxt = labelMode == "Price only" ? f_px(p) : rtag.get(i) + "  " + f_px(p)
-                // Plain COLOURED TEXT (no background box) sitting on the line at the
-                // FAR RIGHT (labelOffset bars past the last candle); clusters step left.
-                // Text colour = the line's position colour (red above / green below).
+                // Distinct detail: Full = tag + price · Compact = tag · Price only = price.
+                ltxt = labelMode == "Price only" ? f_px(p) : labelMode == "Compact" ? rtag.get(i) : rtag.get(i) + "  " + f_px(p)
+                // Plain COLOURED TEXT (no box) frozen at the far-right column, on the line.
                 lb = label.new(bar_index + labelOffset - slot * 6, p, ltxt, xloc = xloc.bar_index,
                      style = label.style_none, textcolor = col, size = size.small)
                 refLbs.push(lb)
