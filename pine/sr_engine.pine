@@ -31,7 +31,7 @@ indicator("Institutional Adaptive S/R Engine  [v2.1.1 · 2026-07-06]", "IA-SR", 
 // (top-left) and on the dashboard's top row, so you can always confirm the
 // running version. If this differs from the tag I quote in chat, you're on an
 // old copy — re-paste the file I attached. Keep this in sync with the title.
-BUILD = "v3.1-TCH · 2026-07-15"
+BUILD = "v3.2-LBL · 2026-07-15"
 
 // #############################################################################
 // # SECTION 1 — INPUTS
@@ -81,6 +81,14 @@ htfOnly = input.bool(true, "HTF-Only (hide timeframes below the chart)", group =
 
 grpLvl = "Levels"
 maxLvl       = input.int(8, "Max Levels per Timeframe", minval = 1, maxval = 20, group = grpLvl)
+// Label clutter control (display only). Shortens label text and, for the reference
+// lines, horizontally staggers vertically-close labels so they never overlap.
+labelMode    = input.string("Compact", "Label Detail", options = ["Full", "Compact", "Price only", "Off"], group = grpLvl,
+     tooltip = "Full = grade/side/price/ICS/reasons. Compact = side + price (+ICS). Price only = just the price. Off = no text (lines only). Reduces clutter when many lines are shown.")
+labelDeclutter = input.bool(true, "Stagger overlapping labels", group = grpLvl,
+     tooltip = "When two reference labels are vertically close, step the later one horizontally to the left so the text does not overlap.")
+labelGapATR  = input.float(0.6, "Label Min Gap (Daily ATR)", minval = 0.1, maxval = 3.0, step = 0.1, group = grpLvl,
+     tooltip = "Two labels closer than this (in native Daily ATR) are treated as a cluster and staggered horizontally.")
 minTouches   = input.int(0, "Min Touches to Show Level", minval = 0, maxval = 20, group = grpLvl,
      tooltip = "0 = show all. Higher = only show levels price has reacted to at least this many times (proven S/R).")
 anchorMode   = input.string("Wick", "Level Anchor (visual only)", options = ["Wick", "Wick/Body Mid", "Body"], group = grpLvl,
@@ -1212,11 +1220,14 @@ f_scoreAndRender(Store s, color baseCol, Store o1, Store o2, Store o3, Store o4,
                         box.set_bgcolor(bxo, color.new(baseCol, 100))
                 lb = s.lb.get(i)
                 if not na(lb)
-                    if showLabel and not weak and show
+                    if showLabel and not weak and show and labelMode != "Off"
                         grade = sc >= 90 ? "A+" : sc >= 80 ? "A" : sc >= 70 ? "B" : sc >= 55 ? "C" : "D"
                         label.set_xy(lb, bar_index, f_anchorY(lvl, res, s.atrTF))
                         wy = s.why.get(i)
-                        label.set_text(lb, grade + "  " + (res ? "R" : "S") + "  " + f_px(lvl) + "  ICS " + str.tostring(math.round(sc)) + (wy == "" ? "" : "  · " + wy))
+                        ltxt = labelMode == "Price only" ? f_px(lvl) :
+                             labelMode == "Compact" ? (res ? "R" : "S") + " " + f_px(lvl) + "  " + str.tostring(math.round(sc)) :
+                             grade + "  " + (res ? "R" : "S") + "  " + f_px(lvl) + "  ICS " + str.tostring(math.round(sc)) + (wy == "" ? "" : "  · " + wy)
+                        label.set_text(lb, ltxt)
                         label.set_color(lb, color.new(baseCol, 25))
                         label.set_textcolor(lb, sc >= 80 ? color.white : color.new(color.white, 25))
                     else
@@ -1875,15 +1886,28 @@ if showRefLines and barstate.islast
     f_refAdd(rpx, rtag, rres, rwd, nCDH, "CDH", true,  1)
     f_refAdd(rpx, rtag, rres, rwd, nCDL, "CDL", false, 1)
     if rpx.size() > 0
-        for i = 0 to rpx.size() - 1
+        // Render lines in PRICE order and horizontally stagger labels that fall in
+        // the same vertical band, so a tight cluster of references never overlaps.
+        ord = rpx.sort_indices(order.ascending)
+        float lastY = na
+        int   slot  = 0
+        for oi = 0 to ord.size() - 1
+            i   = ord.get(oi)
             p   = rpx.get(i)
             col = rres.get(i) ? colRefRes : colRefSup
             ln = line.new(bar_index - 1, p, bar_index, p, xloc = xloc.bar_index,
                  extend = extend.both, color = col, width = rwd.get(i), style = line.style_solid)
-            lb = label.new(bar_index, p, rtag.get(i) + "  " + f_px(p), xloc = xloc.bar_index,
-                 style = label.style_label_left, color = color.new(col, 20), textcolor = color.white, size = size.small)
             refLns.push(ln)
-            refLbs.push(lb)
+            if labelMode != "Off"
+                if labelDeclutter and not na(lastY) and math.abs(p - lastY) < pATRn * labelGapATR
+                    slot += 1
+                else
+                    slot := 0
+                lastY := p
+                ltxt = labelMode == "Price only" ? f_px(p) : rtag.get(i) + "  " + f_px(p)
+                lb = label.new(bar_index - slot * 8, p, ltxt, xloc = xloc.bar_index,
+                     style = label.style_label_left, color = color.new(col, 20), textcolor = color.white, size = size.small)
+                refLbs.push(lb)
 
 // #############################################################################
 // # SECTION 11 — PROBABILITY & TRADE-QUALITY ENGINE (weighted, explainable)
