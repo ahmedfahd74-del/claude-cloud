@@ -31,7 +31,7 @@ indicator("Institutional Adaptive S/R Engine  [v2.1.1 · 2026-07-06]", "IA-SR", 
 // (top-left) and on the dashboard's top row, so you can always confirm the
 // running version. If this differs from the tag I quote in chat, you're on an
 // old copy — re-paste the file I attached. Keep this in sync with the title.
-BUILD = "v3.3.2-ADJ · 2026-07-15"
+BUILD = "v3.4-PERF · 2026-07-15"
 
 // #############################################################################
 // # SECTION 1 — INPUTS
@@ -91,6 +91,8 @@ labelGapATR  = input.float(0.6, "Label Min Gap (Daily ATR)", minval = 0.1, maxva
      tooltip = "Only used when Stagger is ON: two labels closer than this (in native Daily ATR) are treated as a cluster and staggered horizontally.")
 labelOffset  = input.int(10, "Label Right Offset (bars)", minval = 0, maxval = 200, group = grpLvl,
      tooltip = "Pushes the on-line labels to the right of the last candle, into the chart margin. Higher = further right.")
+labelSize    = input.string("Small", "Label Size", options = ["Tiny", "Small", "Normal", "Large"], group = grpLvl)
+lblSz = labelSize == "Tiny" ? size.tiny : labelSize == "Normal" ? size.normal : labelSize == "Large" ? size.large : size.small
 // LEVEL ADJUSTMENT — refines only the DRAWN position of a line. It NEVER changes the
 // institutional level identity, the Power selection, merge logic, ICS, or the
 // deterministic cross-TF behaviour (the raw level is always what is selected/scored;
@@ -146,6 +148,16 @@ showRefLines    = input.bool(true,  "Institutional reference lines (identical on
      tooltip = "Draws PDH/PDL, PWH/PWL, PMH/PML and the last confirmed Daily/Weekly/Monthly swings at their exact prices. Each is a single higher-timeframe value, so these lines are byte-identical on a 1m and a 1D chart — the institutional MTF reference set.")
 showDetectedBook = input.bool(false, "Also show detected swing book (per-chart)", group = grpPower,
      tooltip = "The auto-detected pivot levels. These depend on how much history each chart timeframe loads, so they are NOT identical across timeframes — off by default. Turn on for extra per-chart detail.")
+// PERFORMANCE: the detected-book pipeline (seed + per-bar merge scans + confluence
+// scoring across 7 stores) is the heavy part. It is DISABLED unless the book is
+// shown or the Determinism HUD (which needs the full history) is on — so the default
+// chart (reference lines + Power) is fast. Debug toggles default OFF for the same
+// reason; turn them on only when needed (they slow the recalc).
+showDetHUD   = input.bool(false, "DEBUG: Determinism HUD (heavy — needs book)", group = grpPower,
+     tooltip = "Read-only hash + freeze/replay test of the level identities. Requires the full book pipeline, so it slows the recalc. Off by default.")
+showPwrTrace = input.bool(false, "DEBUG: Power Decision trace", group = grpPower,
+     tooltip = "Per-stage fingerprints of the Power decision. Off by default.")
+bookActive   = showDetectedBook or showDetHUD
 colRefRes       = input.color(color.new(#ef5350, 0), "Line Color — ABOVE price", group = grpPower)
 colRefSup       = input.color(color.new(#26a69a, 0), "Line Color — BELOW price", group = grpPower)
 colorByPos      = input.bool(true, "Color lines by price position (red above / green below)", group = grpPower,
@@ -1308,13 +1320,18 @@ var Store stM5  = f_newStore(0.30 * f_clamp(1.0 / ltfNoise, 0.5, 2.0), 5)
 // chart at or below their TF. The source toggles + htfOnly are DISPLAY-only
 // (draw*), passed to the renderer: hiding a timeframe hides its lines without
 // touching the book or the Power Line.
-effUseMN  = 43200 >= chartMin
-effUseW   = 10080 >= chartMin
-effUseD   = 1440  >= chartMin
-effUseH4  = 240   >= chartMin
-effUseH1  = 60    >= chartMin
-effUseM15 = 15    >= chartMin
-effUseM5  = 5     >= chartMin
+// PERFORMANCE GATE: fold bookActive in here so the whole book pipeline (seed,
+// per-bar f_addLevel merge scans, breaks, touches, and the 7× confluence scoring)
+// is skipped entirely when the book is not shown and no debug HUD needs it. The
+// reference lines + Power Line use NATIVE anchors, not these stores, so nothing on
+// the default chart depends on the book — it just stops computing when hidden.
+effUseMN  = bookActive and 43200 >= chartMin
+effUseW   = bookActive and 10080 >= chartMin
+effUseD   = bookActive and 1440  >= chartMin
+effUseH4  = bookActive and 240   >= chartMin
+effUseH1  = bookActive and 60    >= chartMin
+effUseM15 = bookActive and 15    >= chartMin
+effUseM5  = bookActive and 5     >= chartMin
 // The detected swing book renders only when explicitly enabled — by default the
 // chart shows the cross-TF-identical reference lines instead of the per-chart book.
 f_eff(bool use, float tfMin) => showDetectedBook and use and (not htfOnly or tfMin >= chartMin)
@@ -1347,7 +1364,7 @@ var bool sdH4  = false
 var bool sdH1  = false
 var bool sdM15 = false
 var bool sdM5  = false
-if bar_index <= 50
+if bar_index <= 50 and bookActive
     if not sdMN and not na(hiMN) and hiMN.size() + loMN.size() > 0
         f_seed(stMN,  hiMN,  loMN,  hitMN,  lotMN,  effUseMN,  colMN,  2, lsMN)
         sdMN := true
@@ -1814,7 +1831,6 @@ pdist      = na(powerPrice) ? na : f_div(math.abs(close - powerPrice), pATR)
 //   S5 side    — trend-side factor (htfBull/htfBear × side)           [selection]
 //   S6 WIN     — the selected anchor (tag + price). If S1/S2/S3/S5 all PASS, S6
 //                MUST match; if S6 differs, one of them differs above.
-showPwrTrace = input.bool(true, "DEBUG: Power Decision trace", group = grpPower)
 var table dbgT = table.new(position.top_center, 5, 24, border_width = 1, frame_color = color.new(#00e676, 0), bgcolor = color.new(#0a0e14, 0))
 if showPwrTrace and barstate.islast
     table.cell(dbgT, 0, 0, "POWER TRACE", text_color = color.white, text_size = size.tiny)
@@ -1873,26 +1889,30 @@ if showPowerLine and not na(powerDraw)
     if na(powerLn)
         powerLn := line.new(bar_index - 1, powerDraw, bar_index, powerDraw, xloc = xloc.bar_index,
              extend = extend.both, color = colPower, width = powerWidth, style = line.style_solid)
-        powerLb := label.new(bar_index, powerDraw, "", xloc = xloc.bar_index,
-             style = label.style_label_left, color = colPower, textcolor = color.black, size = size.normal)
+        powerLb := label.new(bar_index + labelOffset, powerDraw, "", xloc = xloc.bar_index,
+             style = label.style_none, textcolor = colPower, size = lblSz)
     else
         line.set_xy1(powerLn, bar_index - 1, powerDraw)
         line.set_xy2(powerLn, bar_index, powerDraw)
         line.set_color(powerLn, colPower)
         line.set_width(powerLn, powerWidth)
-        label.set_xy(powerLb, bar_index, powerDraw)
-    pwrTouch = na(powerDraw) ? 0.0 : f_touchCount(powerDraw, pATRn * touchBandK)
-    ptxt = "⚡ " + BUILD + " · ref " + f_px(dRef) + " · P " + f_px(powerDraw) + " · " + (powerIsRes ? "R" : "S") + (na(pwrScore) ? "" : " ICS " + str.tostring(math.round(pwrScore))) + (powerTouchOn ? " · TCH " + str.tostring(pwrTouch, "#.#") : "") + " · " + str.tostring(pdist, "#.#") + " ATR · " + (htfBull ? "BULL" : htfBear ? "BEAR" : "NEUTRAL")
-    if powerShowStat
-        ptxt += " · " + pwrStatus + (htfBull ? "  → higher" : htfBear ? "  → lower" : "  → range")
+        label.set_xy(powerLb, bar_index + labelOffset, powerDraw)
+    // SHORT label to match the other lines: ⚡ price + expected state only.
+    ptxt = "⚡ " + f_px(powerDraw) + (powerShowStat and pwrStatus != "" ? "  " + pwrStatus : "")
     label.set_text(powerLb, ptxt)
-    label.set_color(powerLb, colPower)
+    label.set_textcolor(powerLb, colPower)
 else
     if not na(powerLn)
         line.delete(powerLn)
         label.delete(powerLb)
         powerLn := na
         powerLb := na
+
+// Tiny always-on version marker (bottom-right) — replaces the version that used to
+// sit in the Power label, so a stale paste is still catchable at a glance.
+var table verT = table.new(position.bottom_right, 1, 1)
+if barstate.islast
+    table.cell(verT, 0, 0, BUILD, text_color = color.new(color.gray, 35), text_size = size.tiny)
 
 // ═══ INSTITUTIONAL REFERENCE LINES — cross-TF-identical MTF display ══════════
 // Add a fixed anchor to the draw list, de-duplicated (a swing sitting on a
@@ -1975,7 +1995,7 @@ if showRefLines and barstate.islast
                 ltxt = labelMode == "Price only" ? f_px(p) : labelMode == "Compact" ? rtag.get(i) : rtag.get(i) + "  " + f_px(p)
                 // Plain COLOURED TEXT (no box) frozen at the far-right column, on the line.
                 lb = label.new(bar_index + labelOffset - slot * 6, p, ltxt, xloc = xloc.bar_index,
-                     style = label.style_none, textcolor = col, size = size.small)
+                     style = label.style_none, textcolor = col, size = lblSz)
                 refLbs.push(lb)
 
 // #############################################################################
@@ -2593,8 +2613,6 @@ if enableExport and barstate.isconfirmed
 // #   All O(log) scans are gated to the bars where their result is displayed.
 // #############################################################################
 grpDet     = "Determinism Validation"
-showDetHUD = input.bool(true, "Show Determinism HUD", group = grpDet,
-     tooltip = "Read-only. Hash of the engine's real level identities + a freeze/replay test. Compare HTF HASH across 5m/15m/1h/4h (should match); FREEZE should read PASS on charts with 1000+ bars.")
 detWindow  = input.int(1200, "Freeze window (bars, must exceed 1001)", minval = 1050, group = grpDet)
 
 // Commutative identity hash (order-independent sum mod a prime). `htfOnly` limits
