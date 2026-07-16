@@ -31,7 +31,7 @@ indicator("Institutional Adaptive S/R Engine  [v2.1.1 · 2026-07-06]", "IA-SR", 
 // (top-left) and on the dashboard's top row, so you can always confirm the
 // running version. If this differs from the tag I quote in chat, you're on an
 // old copy — re-paste the file I attached. Keep this in sync with the title.
-BUILD = "v3.3-ADJ · 2026-07-15"
+BUILD = "v3.3.1-ADJ · 2026-07-15"
 
 // #############################################################################
 // # SECTION 1 — INPUTS
@@ -823,8 +823,8 @@ f_addLevel(Store s, float p, bool isRes, color col, int wdt, string lstyle, int 
             bx = showZones ? box.new(bar_index - 1, p, bar_index, p, xloc = xloc.bar_index,
                  extend = extend.both, border_width = 0, border_color = color.new(col, 100), bgcolor = color.new(col, 80)) : na
             lb = showLabel ? label.new(bar_index, dy, "", xloc = xloc.bar_index,
-                 style = label.style_label_left,
-                 color = color.new(col, 30), textcolor = color.white, size = size.small) : na
+                 style = label.style_none,
+                 textcolor = color.white, size = size.small) : na
             s.price.unshift(p)
             s.ln.unshift(ln)
             s.bx.unshift(bx)
@@ -1285,8 +1285,7 @@ f_scoreAndRender(Store s, color baseCol, Store o1, Store o2, Store o3, Store o4,
                              labelMode == "Compact" ? (res ? "R" : "S") + " " + f_px(lvl) + "  " + str.tostring(math.round(sc)) :
                              grade + "  " + (res ? "R" : "S") + "  " + f_px(lvl) + "  ICS " + str.tostring(math.round(sc)) + (wy == "" ? "" : "  · " + wy)
                         label.set_text(lb, ltxt)
-                        label.set_color(lb, color.new(posCol, 25))
-                        label.set_textcolor(lb, sc >= 80 ? color.white : color.new(color.white, 25))
+                        label.set_textcolor(lb, color.new(posCol, sc >= 80 ? 0 : 30))
                     else
                         label.set_text(lb, "")
                         label.set_color(lb, color.new(color.white, 100))
@@ -1967,10 +1966,11 @@ if showRefLines and barstate.islast
                     slot := 0
                 lastY := p
                 ltxt = labelMode == "Price only" ? f_px(p) : rtag.get(i) + "  " + f_px(p)
-                // Label sits ON TOP of the line (style_label_down) at the FAR RIGHT
-                // (labelOffset bars past the last candle); clusters step left.
+                // Plain COLOURED TEXT (no background box) sitting on the line at the
+                // FAR RIGHT (labelOffset bars past the last candle); clusters step left.
+                // Text colour = the line's position colour (red above / green below).
                 lb = label.new(bar_index + labelOffset - slot * 6, p, ltxt, xloc = xloc.bar_index,
-                     style = label.style_label_down, color = color.new(col, 20), textcolor = color.white, size = size.tiny)
+                     style = label.style_none, textcolor = col, size = size.small)
                 refLbs.push(lb)
 
 // #############################################################################
