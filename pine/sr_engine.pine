@@ -31,7 +31,7 @@ indicator("Institutional Adaptive S/R Engine  [v2.1.1 · 2026-07-06]", "IA-SR", 
 // (top-left) and on the dashboard's top row, so you can always confirm the
 // running version. If this differs from the tag I quote in chat, you're on an
 // old copy — re-paste the file I attached. Keep this in sync with the title.
-BUILD = "v3.4-PERF · 2026-07-15"
+BUILD = "v3.5-PERF · 2026-07-15"
 
 // #############################################################################
 // # SECTION 1 — INPUTS
@@ -85,10 +85,10 @@ maxLvl       = input.int(8, "Max Levels per Timeframe", minval = 1, maxval = 20,
 // lines, horizontally staggers vertically-close labels so they never overlap.
 labelMode    = input.string("Compact", "Label Detail", options = ["Full", "Compact", "Price only", "Off"], group = grpLvl,
      tooltip = "Full = grade/side/price/ICS/reasons. Compact = side + price (+ICS). Price only = just the price. Off = no text (lines only). Reduces clutter when many lines are shown.")
-labelDeclutter = input.bool(false, "Stagger overlapping labels", group = grpLvl,
-     tooltip = "OFF (default): all labels frozen at the same far-right column, on their line. ON: when two labels are vertically close, step the later one left so the text does not overlap.")
+labelDeclutter = input.bool(true, "Hide overlapping labels", group = grpLvl,
+     tooltip = "ON (default): all labels sit frozen at the same far-right column; any that would overlap a nearer one is hidden (its line still shows) so the labels never collide. OFF: show every label (may overlap when levels are close).")
 labelGapATR  = input.float(0.6, "Label Min Gap (Daily ATR)", minval = 0.1, maxval = 3.0, step = 0.1, group = grpLvl,
-     tooltip = "Only used when Stagger is ON: two labels closer than this (in native Daily ATR) are treated as a cluster and staggered horizontally.")
+     tooltip = "Labels closer together than this (in native Daily ATR) are collapsed — only the first is shown — so text never overlaps.")
 labelOffset  = input.int(10, "Label Right Offset (bars)", minval = 0, maxval = 200, group = grpLvl,
      tooltip = "Pushes the on-line labels to the right of the last candle, into the chart margin. Higher = further right.")
 labelSize    = input.string("Small", "Label Size", options = ["Tiny", "Small", "Normal", "Large"], group = grpLvl)
@@ -546,32 +546,27 @@ f_reqtf(simple string tf) => timeframe.in_seconds(tf) < timeframe.in_seconds() ?
 // — 1m through 1M — so the Power Line and the reference lines built on them are truly
 // chart-timeframe-independent (fixes the 1W divergence: its Daily anchors, ranking
 // reference and ATR were previously clamped UP to Weekly).
-f_periodHL() => [high[1], low[1], high, low]   // prev H, prev L, current H, current L
-[nPDH, nPDL, nCDH, nCDL] = request.security(syminfo.tickerid, "D", f_periodHL(), lookahead = barmerge.lookahead_off)
-[nPWH, nPWL, nCWH, nCWL] = request.security(syminfo.tickerid, "W", f_periodHL(), lookahead = barmerge.lookahead_off)
-[nPMH, nPML, nCMH, nCML] = request.security(syminfo.tickerid, "M", f_periodHL(), lookahead = barmerge.lookahead_off)
-// Chart-independent Power reference + distance scale (native Daily, un-clamped).
-f_dRefAtr() => [close[1], ta.atr(14)]
-[nDref, nDatr] = request.security(syminfo.tickerid, "D", f_dRefAtr(), lookahead = barmerge.lookahead_off)
-
-// ── TOUCH / TEST STRENGTH source — last N period extremes per TF via INDEXED
-// history refs (high[k]/low[k]). This is light (a bounded k-loop, no array
-// accumulation over full history, no atr/ema/swing), so a sub-chart request cannot
-// trigger the RE10110 replay. Native (un-clamped) → the extreme set, and therefore
-// every level's test count, is identical on every chart TF. A price that has been a
-// D/W/M high or low many times is a repeatedly TESTED level = more Power.
-f_extHL(int n) =>
-    h = array.new<float>()
-    l = array.new<float>()
+// PERFORMANCE: ONE native security call per TF now returns EVERYTHING native we need
+// — prev-period H/L, current-period H/L, the last-N extreme arrays (touch source),
+// and (Daily only) the prior close + ATR. This replaces the previous SEVEN native
+// calls with THREE, cutting the per-call security overhead that was the recent lag.
+// Still lightweight (bounded k-loop, no swing/ema), so no RE10110; still native
+// (un-clamped) so every value is identical on every chart TF.
+f_natPack(int n) =>
+    hi = array.new<float>()
+    lo = array.new<float>()
     for k = 1 to n
         if not na(high[k])
-            h.push(high[k])
+            hi.push(high[k])
         if not na(low[k])
-            l.push(low[k])
-    [h, l]
-[dHiE, dLoE] = request.security(syminfo.tickerid, "D", f_extHL(8), lookahead = barmerge.lookahead_off)
-[wHiE, wLoE] = request.security(syminfo.tickerid, "W", f_extHL(6), lookahead = barmerge.lookahead_off)
-[mHiE, mLoE] = request.security(syminfo.tickerid, "M", f_extHL(4), lookahead = barmerge.lookahead_off)
+            lo.push(low[k])
+    [high[1], low[1], high, low, hi, lo]
+f_natPackD() =>
+    [ph, pl, ch, cl, hi, lo] = f_natPack(8)
+    [ph, pl, ch, cl, hi, lo, close[1], ta.atr(14)]
+[nPDH, nPDL, nCDH, nCDL, dHiE, dLoE, nDref, nDatr] = request.security(syminfo.tickerid, "D", f_natPackD(), lookahead = barmerge.lookahead_off)
+[nPWH, nPWL, nCWH, nCWL, wHiE, wLoE] = request.security(syminfo.tickerid, "W", f_natPack(6), lookahead = barmerge.lookahead_off)
+[nPMH, nPML, nCMH, nCML, mHiE, mLoE] = request.security(syminfo.tickerid, "M", f_natPack(4), lookahead = barmerge.lookahead_off)
 
 // Weighted count of historical period extremes within `band` of a level (Weekly and
 // Monthly tests weigh more than Daily). Chart-independent: same extremes everywhere.
@@ -625,10 +620,29 @@ f_bestTouch(float px, float atr) =>
             v = all.get(i)
             if math.abs(v - px) <= win
                 cc = f_touchCount(v, band)
-                if cc > bestC
+                // ONE CLEAR WINNER, deterministic: higher test count wins; on a tie
+                // the price CLOSER to the raw level wins; on a further tie the HIGHER
+                // price wins. No order-dependence → identical result on every chart TF.
+                better = cc > bestC or (cc == bestC and (math.abs(v - px) < math.abs(bestP - px) or (math.abs(v - px) == math.abs(bestP - px) and v > bestP)))
+                if better
                     bestC := cc
                     bestP := v
     bestP
+
+// Institutional psychological increment PER MARKET (not arbitrary rounding).
+// Forex trades a 50-pip big-figure grid (…00 / …50); JPY pairs use 0.01 pips.
+// Everything else (crypto / indices / metals) uses the natural big-figure grid for
+// its price scale (10^floor(log10 price)/10) — BTC→1000, ETH→100, SOL→10, XAU→100,
+// NAS100/US30→1000. Deterministic function of price + syminfo.type only.
+f_psychStep(float px) =>
+    float step = na
+    if syminfo.type == "forex"
+        pip  = px >= 20.0 ? 0.01 : 0.0001          // JPY-quoted vs standard majors
+        step := pip * 50.0                          // 50-pip institutional grid
+    else
+        mag  = math.pow(10.0, math.floor(math.log10(math.max(math.abs(px), syminfo.mintick))))
+        step := mag / 10.0
+    step
 
 f_adjust(float px, float atr) =>
     float outp = px
@@ -637,7 +651,8 @@ f_adjust(float px, float atr) =>
             outp := f_bestTouch(px, atr)
         else
             mag  = math.pow(10.0, math.floor(math.log10(math.max(math.abs(px), syminfo.mintick))))
-            step = (levelAdjust == "Nearest Psychological Level" ? mag / 2.0 : mag / 10.0)
+            // Round Number = fine grid (mag/100). Psychological = per-market institutional grid.
+            step = levelAdjust == "Nearest Psychological Level" ? f_psychStep(px) : mag / 100.0
             outp := step > 0 ? math.round(px / step) * step : px
     outp
 
@@ -1967,11 +1982,13 @@ if showRefLines and barstate.islast
     f_refAdd(rpx, rtag, rres, rwd, nCDH, "CDH", true,  1)
     f_refAdd(rpx, rtag, rres, rwd, nCDL, "CDL", false, 1)
     if rpx.size() > 0
-        // Render in PRICE order. Labels are FROZEN at the same far-right column
-        // (bar_index + labelOffset); with Stagger ON, vertically-close ones step left.
+        // Render in PRICE order. Every label is ANCHORED TO ITS OWN LEVEL (price) and
+        // FROZEN at one far-right column (bar_index + labelOffset) — it cannot jump or
+        // drift with zoom/TF (it is pinned to (bar, price)). Overlap is prevented by
+        // SUPPRESSION, not scatter: a label within `labelGapATR` of the last one placed
+        // is hidden (its line still shows), so the visible labels stay neatly aligned.
         ord = rpx.sort_indices(order.ascending)
-        float lastY = na
-        int   slot  = 0
+        float lastLbl = na
         for oi = 0 to ord.size() - 1
             i   = ord.get(oi)
             praw = rpx.get(i)
@@ -1985,16 +2002,13 @@ if showRefLines and barstate.islast
             ln = line.new(bar_index - 1, p, bar_index, p, xloc = xloc.bar_index,
                  extend = extend.both, color = col, width = rwd.get(i), style = line.style_solid)
             refLns.push(ln)
-            if labelMode != "Off"
-                if labelDeclutter and not na(lastY) and math.abs(p - lastY) < pATRn * labelGapATR
-                    slot += 1
-                else
-                    slot := 0
-                lastY := p
+            crowded = labelDeclutter and not na(lastLbl) and math.abs(p - lastLbl) < pATRn * labelGapATR
+            if labelMode != "Off" and not crowded
+                lastLbl := p
                 // Distinct detail: Full = tag + price · Compact = tag · Price only = price.
                 ltxt = labelMode == "Price only" ? f_px(p) : labelMode == "Compact" ? rtag.get(i) : rtag.get(i) + "  " + f_px(p)
-                // Plain COLOURED TEXT (no box) frozen at the far-right column, on the line.
-                lb = label.new(bar_index + labelOffset - slot * 6, p, ltxt, xloc = xloc.bar_index,
+                // Plain COLOURED TEXT (no box) pinned to (far-right column, its level).
+                lb = label.new(bar_index + labelOffset, p, ltxt, xloc = xloc.bar_index,
                      style = label.style_none, textcolor = col, size = lblSz)
                 refLbs.push(lb)
 
