@@ -31,7 +31,7 @@ indicator("Institutional Adaptive S/R Engine  [v2.1.1 · 2026-07-06]", "IA-SR", 
 // (top-left) and on the dashboard's top row, so you can always confirm the
 // running version. If this differs from the tag I quote in chat, you're on an
 // old copy — re-paste the file I attached. Keep this in sync with the title.
-BUILD = "v3.9-LIQ · 2026-07-15"
+BUILD = "v3.9.1-MTF · 2026-07-15"
 
 // #############################################################################
 // # SECTION 1 — INPUTS
@@ -581,8 +581,13 @@ f_natPackD() =>
 [nPWH, nPWL, nCWH, nCWL, wHiE, wLoE] = request.security(syminfo.tickerid, "W", f_natPack(6), lookahead = barmerge.lookahead_off)
 [nPMH, nPML, nCMH, nCML, mHiE, mLoE] = request.security(syminfo.tickerid, "M", f_natPack(4), lookahead = barmerge.lookahead_off)
 
-// Weighted count of historical period extremes within `band` of a level (Weekly and
-// Monthly tests weigh more than Daily). Chart-independent: same extremes everywhere.
+// Count of recent DAILY extremes within `band` of a level. DAILY ONLY on purpose:
+// daily history loads on every chart from 1m up (a 1m chart still sees the last week+
+// of daily bars), so the count — and therefore every zone's strength, weighted centre
+// and rank — is IDENTICAL on every timeframe. The old version also summed Weekly and
+// Monthly extremes, but a 1m chart cannot load 6 weeks / 4 months of history, so those
+// arrays truncated and broke MTF consistency. Weekly/Monthly confluence is already
+// captured because PWH/PWL/PMH/PML are among the clustered reference anchors.
 f_touchCount(float lvl, float band) =>
     float c = 0.0
     if not na(lvl) and band > 0
@@ -592,18 +597,6 @@ f_touchCount(float lvl, float band) =>
         if not na(dLoE) and dLoE.size() > 0
             for i = 0 to dLoE.size() - 1
                 c += math.abs(dLoE.get(i) - lvl) <= band ? 1.0 : 0.0
-        if not na(wHiE) and wHiE.size() > 0
-            for i = 0 to wHiE.size() - 1
-                c += math.abs(wHiE.get(i) - lvl) <= band ? 1.3 : 0.0
-        if not na(wLoE) and wLoE.size() > 0
-            for i = 0 to wLoE.size() - 1
-                c += math.abs(wLoE.get(i) - lvl) <= band ? 1.3 : 0.0
-        if not na(mHiE) and mHiE.size() > 0
-            for i = 0 to mHiE.size() - 1
-                c += math.abs(mHiE.get(i) - lvl) <= band ? 1.6 : 0.0
-        if not na(mLoE) and mLoE.size() > 0
-            for i = 0 to mLoE.size() - 1
-                c += math.abs(mLoE.get(i) - lvl) <= band ? 1.6 : 0.0
     c
 
 // LEVEL ADJUSTMENT (display only). Returns a snapped DRAW position for a raw level.
