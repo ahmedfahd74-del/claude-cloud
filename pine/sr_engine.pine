@@ -31,7 +31,7 @@ indicator("Institutional Adaptive S/R Engine  [v2.1.1 · 2026-07-06]", "IA-SR", 
 // (top-left) and on the dashboard's top row, so you can always confirm the
 // running version. If this differs from the tag I quote in chat, you're on an
 // old copy — re-paste the file I attached. Keep this in sync with the title.
-BUILD = "v3.5.1-PERF · 2026-07-15"
+BUILD = "v3.5.2-PERF · 2026-07-15"
 
 // #############################################################################
 // # SECTION 1 — INPUTS
@@ -80,7 +80,10 @@ htfOnly = input.bool(true, "HTF-Only (hide timeframes below the chart)", group =
      tooltip = "On (default): only levels from the current chart TF and higher. TradingView SAMPLES sub-chart timeframe data (e.g. 15m data requested on a 1h chart), which creates phantom low-quality levels — keep this on unless you know why you need it off.")
 
 grpLvl = "Levels"
-maxLvl       = input.int(8, "Max Levels per Timeframe", minval = 1, maxval = 20, group = grpLvl)
+maxRefLines  = input.int(12, "Max Reference Lines (strongest kept)", minval = 1, maxval = 12, group = grpLvl,
+     tooltip = "How many of the reference lines to draw. Keeps the STRONGEST by test count (most-touched first, then timeframe tier, then nearest price). Set to 1 to show only the single most-tested level. THIS is the control for the lines you see by default.")
+maxLvl       = input.int(8, "Max Levels per Timeframe (detected book only)", minval = 1, maxval = 20, group = grpLvl,
+     tooltip = "Only affects the optional detected swing book (off by default). Does NOT limit the reference lines — use 'Max Reference Lines' above for those.")
 // Label clutter control (display only). Shortens label text and, for the reference
 // lines, horizontally staggers vertically-close labels so they never overlap.
 labelMode    = input.string("Compact", "Label Detail", options = ["Full", "Compact", "Price only", "Off"], group = grpLvl,
@@ -146,8 +149,6 @@ grpPower = "Power Line"
 // the chart shows only levels that are identical on every timeframe.
 showRefLines    = input.bool(true,  "Institutional reference lines (identical on every TF)", group = grpPower,
      tooltip = "Draws PDH/PDL, PWH/PWL, PMH/PML and the last confirmed Daily/Weekly/Monthly swings at their exact prices. Each is a single higher-timeframe value, so these lines are byte-identical on a 1m and a 1D chart — the institutional MTF reference set.")
-maxRefLines     = input.int(12, "Max Reference Lines (strongest kept)", minval = 1, maxval = 12, group = grpPower,
-     tooltip = "Caps how many reference lines are drawn, keeping only the strongest by TEST COUNT (most-touched first, then timeframe tier, then nearest price). Set to 1 to show only the single most-tested level. This is the count limit for the reference lines — 'Max Levels per Timeframe' only affects the detected book.")
 showDetectedBook = input.bool(false, "Also show detected swing book (per-chart)", group = grpPower,
      tooltip = "The auto-detected pivot levels. These depend on how much history each chart timeframe loads, so they are NOT identical across timeframes — off by default. Turn on for extra per-chart detail.")
 // PERFORMANCE: the detected-book pipeline (seed + per-bar merge scans + confluence
