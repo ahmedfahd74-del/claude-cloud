@@ -31,7 +31,7 @@ indicator("Institutional Adaptive S/R Engine  [v2.1.1 · 2026-07-06]", "IA-SR", 
 // (top-left) and on the dashboard's top row, so you can always confirm the
 // running version. If this differs from the tag I quote in chat, you're on an
 // old copy — re-paste the file I attached. Keep this in sync with the title.
-BUILD = "v3.6-MTF · 2026-07-15"
+BUILD = "v3.7-ZONE · 2026-07-15"
 
 // #############################################################################
 // # SECTION 1 — INPUTS
@@ -81,7 +81,9 @@ htfOnly = input.bool(true, "HTF-Only (hide timeframes below the chart)", group =
 
 grpLvl = "Levels"
 maxRefLines  = input.int(12, "Max Reference Lines (strongest kept)", minval = 1, maxval = 12, group = grpLvl,
-     tooltip = "How many of the reference lines to draw. Keeps the STRONGEST by test count (most-touched first, then timeframe tier, then nearest price). Set to 1 to show only the single most-tested level. THIS is the control for the lines you see by default.")
+     tooltip = "How many reference ZONES to draw. Nearby levels are first clustered into one zone (see Zone Cluster Width); zones are ranked by COMBINED test count and the strongest kept. Set to 1 to show only the single strongest zone.")
+clusterBandATR = input.float(0.5, "Zone Cluster Width (Daily ATR)", minval = 0.0, maxval = 3.0, step = 0.1, group = grpLvl,
+     tooltip = "Reference levels closer together than this (in native Daily ATR) are merged into ONE zone, drawn at the test-weighted center, with strength = the SUM of the cluster's touches — so a dense band of repeatedly-tested levels ranks as one strong zone. 0 = no clustering (each level separate).")
 maxLvl       = input.int(8, "Max Levels per Timeframe (detected book only)", minval = 1, maxval = 20, group = grpLvl,
      tooltip = "Only affects the optional detected swing book (off by default). Does NOT limit the reference lines — use 'Max Reference Lines' above for those.")
 // Label clutter control (display only). Shortens label text and, for the reference
@@ -1985,50 +1987,67 @@ if showRefLines and barstate.islast
     f_refAdd(rpx, rtag, rres, rwd, nCDH, "CDH", true,  1)
     f_refAdd(rpx, rtag, rres, rwd, nCDL, "CDL", false, 1)
     if rpx.size() > 0
-        // STRONGEST-N: rank references by TEST COUNT (most-touched first; tie → higher
-        // timeframe tier → nearer price) and keep only the top `maxRefLines`. Set to 1
-        // to show the single most-tested level. Chart-independent (touch count is), so
-        // the kept set is identical on every TF.
-        strengths = array.new<float>()
-        for si = 0 to rpx.size() - 1
-            // proximity tiebreak measured from the NATIVE daily close (chart-independent),
-            // NOT the chart's own close — so the kept top-N set is identical on every TF.
-            dd = f_div(math.abs(nDref - rpx.get(si)), pATRn)
-            strengths.push(f_touchCount(rpx.get(si), pATRn * touchBandK) + rwd.get(si) * 0.1 + 1.0 / (1.0 + dd) * 0.01)
-        rankIdx = strengths.sort_indices(order.descending)
+        // ── CLUSTER nearby levels into ZONES ────────────────────────────────────
+        // Walk the levels in price order; levels within `clusterBandATR` (native Daily
+        // ATR) of the running cluster join it. Each zone's PRICE = the test-weighted
+        // centre of its members, its STRENGTH = the SUM of their test counts, its TAG =
+        // the strongest member. So a dense band price has hit many times (e.g. the
+        // 1824/1841/1849/1862 cluster) becomes ONE strong zone at ~its centre. All
+        // inputs are native (touch count, ATR, price) → identical on every chart TF.
+        ord = rpx.sort_indices(order.ascending)
+        zPx  = array.new<float>()      // zone drawn price (test-weighted centre)
+        zStr = array.new<float>()      // zone strength (sum of member touches)
+        zTag = array.new<string>()     // strongest member's tag
+        zRes = array.new<bool>()       // majority side (by touch)
+        band = nDatr * clusterBandATR
+        float cW = 0.0                 // Σ price·touch
+        float cT = 0.0                 // Σ touch
+        float cA = 0.0                 // Σ touch of resistance members
+        float cBest = -1.0
+        string cTag = ""
+        float lastP = na
+        for oi = 0 to ord.size() - 1
+            i  = ord.get(oi)
+            pv = rpx.get(i)
+            tv = math.max(f_touchCount(pv, pATRn * touchBandK), 0.01)
+            if not na(lastP) and (pv - lastP) > band and cT > 0
+                zPx.push(cW / cT), zStr.push(cT), zTag.push(cTag), zRes.push(cA >= cT * 0.5)
+                cW := 0.0, cT := 0.0, cA := 0.0, cBest := -1.0, cTag := ""
+            cW += pv * tv
+            cT += tv
+            cA += rres.get(i) ? tv : 0.0
+            if tv > cBest
+                cBest := tv
+                cTag  := rtag.get(i)
+            lastP := pv
+        if cT > 0
+            zPx.push(cW / cT), zStr.push(cT), zTag.push(cTag), zRes.push(cA >= cT * 0.5)
+        // ── keep the strongest maxRefLines ZONES ────────────────────────────────
+        rankIdx = zStr.sort_indices(order.descending)
         keepN = math.min(maxRefLines, rankIdx.size())
         keepIdx = array.new<int>()
         for kk = 0 to keepN - 1
             keepIdx.push(rankIdx.get(kk))
-        // Render in PRICE order. Every label is ANCHORED TO ITS OWN LEVEL (price) and
-        // FROZEN at one far-right column (bar_index + labelOffset) — it cannot jump or
-        // drift with zoom/TF (it is pinned to (bar, price)). Overlap is prevented by
-        // SUPPRESSION, not scatter: a label within `labelGapATR` of the last one placed
-        // is hidden (its line still shows), so the visible labels stay neatly aligned.
-        ord = rpx.sort_indices(order.ascending)
+        // Render in PRICE order; labels pinned to (far-right column, their zone price),
+        // overlaps suppressed so they never collide/drift.
+        zord = zPx.sort_indices(order.ascending)
         float lastLbl = na
-        for oi = 0 to ord.size() - 1
-            i   = ord.get(oi)
-            praw = rpx.get(i)
-            // keep only the strongest N references
+        for oi = 0 to zord.size() - 1
+            i = zord.get(oi)
             if not keepIdx.includes(i)
                 continue
-            // MIN TOUCHES: hide a reference tested fewer than the threshold (0 = all).
-            // Uses the chart-independent test count, so it never affects the Power Line.
-            if minTouches > 0 and f_touchCount(praw, pATRn * touchBandK) < minTouches
+            if minTouches > 0 and zStr.get(i) < minTouches
                 continue
-            p    = f_adjust(praw, pATRn)             // drawn position (snapped); identity stays raw
-            // COLOUR BY POSITION: above current price = red, below = green (or by type)
-            col  = colorByPos ? (p >= close ? colRefRes : colRefSup) : (rres.get(i) ? colRefRes : colRefSup)
+            p   = f_adjust(zPx.get(i), pATRn)        // drawn position (snapped); zone centre stays raw
+            col = colorByPos ? (p >= close ? colRefRes : colRefSup) : (zRes.get(i) ? colRefRes : colRefSup)
             ln = line.new(bar_index - 1, p, bar_index, p, xloc = xloc.bar_index,
-                 extend = extend.both, color = col, width = rwd.get(i), style = line.style_solid)
+                 extend = extend.both, color = col, width = 2, style = line.style_solid)
             refLns.push(ln)
             crowded = labelDeclutter and not na(lastLbl) and math.abs(p - lastLbl) < pATRn * labelGapATR
             if labelMode != "Off" and not crowded
                 lastLbl := p
-                // Distinct detail: Full = tag + price · Compact = tag · Price only = price.
-                ltxt = labelMode == "Price only" ? f_px(p) : labelMode == "Compact" ? rtag.get(i) : rtag.get(i) + "  " + f_px(p)
-                // Plain COLOURED TEXT (no box) pinned to (far-right column, its level).
+                // Full = tag + price + ×strength · Compact = price + ×strength · Price only = price.
+                ltxt = labelMode == "Price only" ? f_px(p) : labelMode == "Compact" ? f_px(p) + "  ×" + str.tostring(math.round(zStr.get(i))) : zTag.get(i) + "  " + f_px(p) + "  ×" + str.tostring(math.round(zStr.get(i)))
                 lb = label.new(bar_index + labelOffset, p, ltxt, xloc = xloc.bar_index,
                      style = label.style_none, textcolor = col, size = lblSz)
                 refLbs.push(lb)
