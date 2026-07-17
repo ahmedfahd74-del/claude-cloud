@@ -31,7 +31,7 @@ indicator("Institutional Adaptive S/R Engine  [v2.1.1 · 2026-07-06]", "IA-SR", 
 // (top-left) and on the dashboard's top row, so you can always confirm the
 // running version. If this differs from the tag I quote in chat, you're on an
 // old copy — re-paste the file I attached. Keep this in sync with the title.
-BUILD = "v3.5-PERF · 2026-07-15"
+BUILD = "v3.5.1-PERF · 2026-07-15"
 
 // #############################################################################
 // # SECTION 1 — INPUTS
@@ -146,6 +146,8 @@ grpPower = "Power Line"
 // the chart shows only levels that are identical on every timeframe.
 showRefLines    = input.bool(true,  "Institutional reference lines (identical on every TF)", group = grpPower,
      tooltip = "Draws PDH/PDL, PWH/PWL, PMH/PML and the last confirmed Daily/Weekly/Monthly swings at their exact prices. Each is a single higher-timeframe value, so these lines are byte-identical on a 1m and a 1D chart — the institutional MTF reference set.")
+maxRefLines     = input.int(12, "Max Reference Lines (strongest kept)", minval = 1, maxval = 12, group = grpPower,
+     tooltip = "Caps how many reference lines are drawn, keeping only the strongest by TEST COUNT (most-touched first, then timeframe tier, then nearest price). Set to 1 to show only the single most-tested level. This is the count limit for the reference lines — 'Max Levels per Timeframe' only affects the detected book.")
 showDetectedBook = input.bool(false, "Also show detected swing book (per-chart)", group = grpPower,
      tooltip = "The auto-detected pivot levels. These depend on how much history each chart timeframe loads, so they are NOT identical across timeframes — off by default. Turn on for extra per-chart detail.")
 // PERFORMANCE: the detected-book pipeline (seed + per-bar merge scans + confluence
@@ -1982,6 +1984,19 @@ if showRefLines and barstate.islast
     f_refAdd(rpx, rtag, rres, rwd, nCDH, "CDH", true,  1)
     f_refAdd(rpx, rtag, rres, rwd, nCDL, "CDL", false, 1)
     if rpx.size() > 0
+        // STRONGEST-N: rank references by TEST COUNT (most-touched first; tie → higher
+        // timeframe tier → nearer price) and keep only the top `maxRefLines`. Set to 1
+        // to show the single most-tested level. Chart-independent (touch count is), so
+        // the kept set is identical on every TF.
+        strengths = array.new<float>()
+        for si = 0 to rpx.size() - 1
+            dd = f_div(math.abs(close - rpx.get(si)), pATRn)
+            strengths.push(f_touchCount(rpx.get(si), pATRn * touchBandK) + rwd.get(si) * 0.1 + 1.0 / (1.0 + dd) * 0.01)
+        rankIdx = strengths.sort_indices(order.descending)
+        keepN = math.min(maxRefLines, rankIdx.size())
+        keepIdx = array.new<int>()
+        for kk = 0 to keepN - 1
+            keepIdx.push(rankIdx.get(kk))
         // Render in PRICE order. Every label is ANCHORED TO ITS OWN LEVEL (price) and
         // FROZEN at one far-right column (bar_index + labelOffset) — it cannot jump or
         // drift with zoom/TF (it is pinned to (bar, price)). Overlap is prevented by
@@ -1992,6 +2007,9 @@ if showRefLines and barstate.islast
         for oi = 0 to ord.size() - 1
             i   = ord.get(oi)
             praw = rpx.get(i)
+            // keep only the strongest N references
+            if not keepIdx.includes(i)
+                continue
             // MIN TOUCHES: hide a reference tested fewer than the threshold (0 = all).
             // Uses the chart-independent test count, so it never affects the Power Line.
             if minTouches > 0 and f_touchCount(praw, pATRn * touchBandK) < minTouches
