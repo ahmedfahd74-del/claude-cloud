@@ -31,7 +31,7 @@ indicator("Institutional Adaptive S/R Engine  [v2.1.1 · 2026-07-06]", "IA-SR", 
 // (top-left) and on the dashboard's top row, so you can always confirm the
 // running version. If this differs from the tag I quote in chat, you're on an
 // old copy — re-paste the file I attached. Keep this in sync with the title.
-BUILD = "v3.7-ZONE · 2026-07-15"
+BUILD = "v3.8-ZONE · 2026-07-15"
 
 // #############################################################################
 // # SECTION 1 — INPUTS
@@ -660,6 +660,76 @@ f_adjust(float px, float atr) =>
             step = levelAdjust == "Nearest Psychological Level" ? f_psychStep(px) : mag / 100.0
             outp := step > 0 ? math.round(px / step) * step : px
     outp
+
+// Add a fixed anchor to a draw list, de-duplicated within the native Daily ATR so a
+// swing sitting on a prev-period extreme shows once. Shared by the reference display
+// and the Power's zone finder, so both cluster the SAME candidate set.
+f_refAdd(array<float> px, array<string> tag, array<bool> res, array<int> wd, float p, string t, bool r, int w) =>
+    if not na(p)
+        dup = false
+        md  = nDatr * 0.15
+        if px.size() > 0
+            for i = 0 to px.size() - 1
+                if math.abs(px.get(i) - p) <= md
+                    dup := true
+                    break
+        if not dup
+            px.push(p)
+            tag.push(t)
+            res.push(r)
+            wd.push(w)
+
+// STRONGEST ZONE — cluster the 12 native reference anchors (single-linkage by price
+// gap ≤ clusterBandATR·nDatr) and return the zone with the greatest COMBINED test
+// count: [centre price, isResistance, strength]. This is the single most institutionally
+// significant level = the Power Line's target. Chart-independent (native anchors +
+// touch + ATR) → identical on every TF. Returns na when no anchors exist.
+f_topZone() =>
+    px = array.new<float>()
+    tg = array.new<string>()
+    rs = array.new<bool>()
+    wd = array.new<int>()
+    f_refAdd(px, tg, rs, wd, nPMH, "PMH", true,  3)
+    f_refAdd(px, tg, rs, wd, nPML, "PML", false, 3)
+    f_refAdd(px, tg, rs, wd, nCMH, "CMH", true,  3)
+    f_refAdd(px, tg, rs, wd, nCML, "CML", false, 3)
+    f_refAdd(px, tg, rs, wd, nPWH, "PWH", true,  2)
+    f_refAdd(px, tg, rs, wd, nPWL, "PWL", false, 2)
+    f_refAdd(px, tg, rs, wd, nCWH, "CWH", true,  2)
+    f_refAdd(px, tg, rs, wd, nCWL, "CWL", false, 2)
+    f_refAdd(px, tg, rs, wd, nPDH, "PDH", true,  1)
+    f_refAdd(px, tg, rs, wd, nPDL, "PDL", false, 1)
+    f_refAdd(px, tg, rs, wd, nCDH, "CDH", true,  1)
+    f_refAdd(px, tg, rs, wd, nCDL, "CDL", false, 1)
+    float bestPx = na
+    bool  bestRes = false
+    float bestStr = -1.0
+    if px.size() > 0
+        ord = px.sort_indices(order.ascending)
+        band = nDatr * clusterBandATR
+        float cW = 0.0
+        float cT = 0.0
+        float cA = 0.0
+        float lastP = na
+        for oi = 0 to ord.size() - 1
+            i  = ord.get(oi)
+            pv = px.get(i)
+            tv = math.max(f_touchCount(pv, nDatr * touchBandK), 0.01)
+            if not na(lastP) and (pv - lastP) > band and cT > 0
+                if cT > bestStr
+                    bestStr := cT
+                    bestPx  := cW / cT
+                    bestRes := cA >= cT * 0.5
+                cW := 0.0, cT := 0.0, cA := 0.0
+            cW += pv * tv
+            cT += tv
+            cA += rs.get(i) ? tv : 0.0
+            lastP := pv
+        if cT > bestStr
+            bestStr := cT
+            bestPx  := cW / cT
+            bestRes := cA >= cT * 0.5
+    [bestPx, bestRes, bestStr]
 
 // --- Hold last confirmed swing per TF (verification preview for Phase 2) ----
 // Phase 3 replaces these single held values with managed, scored level arrays.
@@ -1833,9 +1903,21 @@ if barstate.islast
 // (pwrDecision / pwrCand / powerDwell are retained but inert — kept only so the
 // input and the held-rank tracking in f_powerDecision compile unchanged.)
 pwrDecision := rawP
-powerPrice = rawP
-pwrScore   = rawS
-powerIsRes = rawR
+// POWER LINE = the STRONGEST ZONE (the single most-tested institutional level, from
+// f_topZone) — the "main level" the market respects, the same one that wins the
+// reference display's top-1. Computed ONLY on the last bar (the line only draws there)
+// to avoid per-bar cost. Falls back to the raw anchor pick if no zone exists.
+var float pwrTZp = na
+var bool  pwrTZr = false
+var float pwrTZs = -1.0
+if barstate.islast
+    [tzp, tzr, tzs] = f_topZone()
+    pwrTZp := tzp
+    pwrTZr := tzr
+    pwrTZs := tzs
+powerPrice = na(pwrTZp) ? rawP : pwrTZp
+pwrScore   = na(pwrTZp) ? rawS : pwrTZs
+powerIsRes = na(pwrTZp) ? rawR : pwrTZr
 pdist      = na(powerPrice) ? na : f_div(math.abs(close - powerPrice), pATR)
 
 // ═══ POWER DECISION TRACE (temporary) — prove the decision is deterministic ══
@@ -1898,11 +1980,11 @@ pwrStatus    = na(powerPrice) ? "" :
      pwrBreaking                  ? "BREAK LIKELY" :
      pwrPressing                  ? "RESPECT EXPECTED" : "HOLDING"
 
-// The Power Line is IMMUNE to every other line setting (Level Adjustment, colour,
-// labels, min-touches, anchor). It always draws at its raw selected level and only
-// its OWN Power inputs affect it, so changing any reference-line setting never moves
-// it. (Level Adjustment applies to the reference/book lines only.)
-powerDraw = powerPrice
+// The Power Line snaps with Level Adjustment (e.g. Nearest Round Number) like the
+// reference lines, so it can sit on a clean round level. It is still immune to the
+// cosmetic settings (colour, labels, min-touches, max-lines) — only its own Power
+// inputs and the shared Level Adjustment move it.
+powerDraw = f_adjust(powerPrice, pATRn)
 var line  powerLn = na
 var label powerLb = na
 if showPowerLine and not na(powerDraw)
@@ -1935,24 +2017,6 @@ if barstate.islast
     table.cell(verT, 0, 0, BUILD, text_color = color.new(color.gray, 35), text_size = size.tiny)
 
 // ═══ INSTITUTIONAL REFERENCE LINES — cross-TF-identical MTF display ══════════
-// Add a fixed anchor to the draw list, de-duplicated (a swing sitting on a
-// prev-period extreme shows ONE clean line). Merge radius is the Daily ATR, so
-// it is chart-independent like the anchors themselves.
-f_refAdd(array<float> px, array<string> tag, array<bool> res, array<int> wd, float p, string t, bool r, int w) =>
-    if not na(p)
-        dup = false
-        md  = pATRn * 0.15
-        if px.size() > 0
-            for i = 0 to px.size() - 1
-                if math.abs(px.get(i) - p) <= md
-                    dup := true
-                    break
-        if not dup
-            px.push(p)
-            tag.push(t)
-            res.push(r)
-            wd.push(w)
-
 // Draw the fixed anchors (prev D/W/M extremes + last confirmed D/W/M swings) at
 // their CURRENT single-security values — byte-identical on every chart TF and on
 // any token, independent of the history-dependent detected book. Rebuilt on the
@@ -2039,6 +2103,9 @@ if showRefLines and barstate.islast
             if minTouches > 0 and zStr.get(i) < minTouches
                 continue
             p   = f_adjust(zPx.get(i), pATRn)        // drawn position (snapped); zone centre stays raw
+            // The strongest zone IS the Power Line — don't draw a duplicate here.
+            if showPowerLine and not na(powerDraw) and math.abs(p - powerDraw) <= pATRn * 0.1
+                continue
             col = colorByPos ? (p >= close ? colRefRes : colRefSup) : (zRes.get(i) ? colRefRes : colRefSup)
             ln = line.new(bar_index - 1, p, bar_index, p, xloc = xloc.bar_index,
                  extend = extend.both, color = col, width = 2, style = line.style_solid)
