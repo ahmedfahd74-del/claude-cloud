@@ -31,7 +31,7 @@ indicator("Institutional Adaptive S/R Engine  [v2.1.1 · 2026-07-06]", "IA-SR", 
 // (top-left) and on the dashboard's top row, so you can always confirm the
 // running version. If this differs from the tag I quote in chat, you're on an
 // old copy — re-paste the file I attached. Keep this in sync with the title.
-BUILD = "v3.8-ZONE · 2026-07-15"
+BUILD = "v3.9-LIQ · 2026-07-15"
 
 // #############################################################################
 // # SECTION 1 — INPUTS
@@ -84,6 +84,14 @@ maxRefLines  = input.int(12, "Max Reference Lines (strongest kept)", minval = 1,
      tooltip = "How many reference ZONES to draw. Nearby levels are first clustered into one zone (see Zone Cluster Width); zones are ranked by COMBINED test count and the strongest kept. Set to 1 to show only the single strongest zone.")
 clusterBandATR = input.float(0.5, "Zone Cluster Width (Daily ATR)", minval = 0.0, maxval = 3.0, step = 0.1, group = grpLvl,
      tooltip = "Reference levels closer together than this (in native Daily ATR) are merged into ONE zone, drawn at the test-weighted center, with strength = the SUM of the cluster's touches — so a dense band of repeatedly-tested levels ranks as one strong zone. 0 = no clustering (each level separate).")
+// STRUCTURE vs LIQUIDITY styling. Structural = prior-period extremes (PDH/PWH/PML…),
+// the settled levels. Liquidity = the CURRENT period's developing high/low (CDH/CDL/
+// CWH…) — where resting stops sit and price gets drawn before continuing. Default:
+// structure solid, liquidity dotted → the lean "structure + dotted liquidity" look.
+showLiq      = input.bool(true, "Show liquidity lines (current-period H/L)", group = grpLvl,
+     tooltip = "Draws the developing period's high/low as liquidity lines. Off = only the settled structural levels (leanest view).")
+styleStruct  = input.string("Solid",  "Structural line style", options = ["Solid", "Dashed", "Dotted"], group = grpLvl)
+styleLiq     = input.string("Dotted", "Liquidity line style",  options = ["Solid", "Dashed", "Dotted"], group = grpLvl)
 maxLvl       = input.int(8, "Max Levels per Timeframe (detected book only)", minval = 1, maxval = 20, group = grpLvl,
      tooltip = "Only affects the optional detected swing book (off by default). Does NOT limit the reference lines — use 'Max Reference Lines' above for those.")
 // Label clutter control (display only). Shortens label text and, for the reference
@@ -2106,9 +2114,15 @@ if showRefLines and barstate.islast
             // The strongest zone IS the Power Line — don't draw a duplicate here.
             if showPowerLine and not na(powerDraw) and math.abs(p - powerDraw) <= pATRn * 0.1
                 continue
+            // STRUCTURE vs LIQUIDITY: a zone whose dominant member is a CURRENT-period
+            // extreme (tag starts "C") is a liquidity line (dotted); prior-period is
+            // structural (solid). Liquidity lines are hidden when Show Liquidity is off.
+            isLiq = str.startswith(zTag.get(i), "C")
+            if isLiq and not showLiq
+                continue
             col = colorByPos ? (p >= close ? colRefRes : colRefSup) : (zRes.get(i) ? colRefRes : colRefSup)
             ln = line.new(bar_index - 1, p, bar_index, p, xloc = xloc.bar_index,
-                 extend = extend.both, color = col, width = 2, style = line.style_solid)
+                 extend = extend.both, color = col, width = isLiq ? 1 : 2, style = f_lstyle(isLiq ? styleLiq : styleStruct))
             refLns.push(ln)
             crowded = labelDeclutter and not na(lastLbl) and math.abs(p - lastLbl) < pATRn * labelGapATR
             if labelMode != "Off" and not crowded
