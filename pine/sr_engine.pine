@@ -31,7 +31,7 @@ indicator("Institutional Adaptive S/R Engine  [v2.1.1 · 2026-07-06]", "IA-SR", 
 // (top-left) and on the dashboard's top row, so you can always confirm the
 // running version. If this differs from the tag I quote in chat, you're on an
 // old copy — re-paste the file I attached. Keep this in sync with the title.
-BUILD = "v3.9.2-MTF · 2026-07-17"
+BUILD = "v4.0.0-UNIDATA · 2026-07-17"
 
 // #############################################################################
 // # SECTION 1 — INPUTS
@@ -551,35 +551,77 @@ f_reqtf(simple string tf) => timeframe.in_seconds(tf) < timeframe.in_seconds() ?
 [phM15, plM15, hiM15, loM15, atrM15, legM15, trM15, pHiM15, pLoM15, phtM15, pltM15, hitM15, lotM15, pxtM15] = request.security(syminfo.tickerid, f_reqtf("15"), f_htfPack(), lookahead = barmerge.lookahead_off)
 [phM5,  plM5,  hiM5,  loM5,  atrM5,  legM5,  trM5,  pHiM5,  pLoM5,  phtM5,  pltM5,  hitM5,  lotM5,  pxtM5 ] = request.security(syminfo.tickerid, f_reqtf("5"),  f_htfPack(), lookahead = barmerge.lookahead_off)
 
-// ── NATIVE INSTITUTIONAL ANCHORS (NO sub-chart clamp) — the fixed reference set.
-// bare high[1]/low[1]/high/low, prior close and ta.atr are LIGHTWEIGHT (no array
-// accumulation / swing loop), so requesting a lower TF than the chart here does NOT
-// trigger the RE10110 replay that f_reqtf guards the stateful f_htfPack from. Because
-// the TF is NOT clamped, every value below is byte-identical on EVERY chart timeframe
-// — 1m through 1M — so the Power Line and the reference lines built on them are truly
-// chart-timeframe-independent (fixes the 1W divergence: its Daily anchors, ranking
-// reference and ATR were previously clamped UP to Weekly).
-// PERFORMANCE: ONE native security call per TF now returns EVERYTHING native we need
-// — prev-period H/L, current-period H/L, the last-N extreme arrays (touch source),
-// and (Daily only) the prior close + ATR. This replaces the previous SEVEN native
-// calls with THREE, cutting the per-call security overhead that was the recent lag.
-// Still lightweight (bounded k-loop, no swing/ema), so no RE10110; still native
-// (un-clamped) so every value is identical on every chart TF.
-f_natPack(int n) =>
-    hi = array.new<float>()
-    lo = array.new<float>()
-    for k = 1 to n
+// ── SINGLE DETERMINISTIC REFERENCE DATASET — ONE Daily fetch, W/M derived ────
+// The ENTIRE institutional anchor set (prev/current Day, Week AND Month highs &
+// lows) is produced by ONE request.security to the DAILY timeframe. The Weekly /
+// Monthly extremes are AGGREGATED FROM THE DAILY BARS inside that same call — the
+// running high/low resets on each calendar week / month boundary. This is the
+// permanent cross-timeframe fix, and it matters for a concrete reason:
+//   • A Daily series is back-loaded to the SAME deep calendar history on every
+//     chart timeframe (1m → 1M). It is the resolution TradingView fills most
+//     reliably — which is exactly why "previous week/month" tools work on a 1m
+//     chart. Separate "W"/"M" requests, by contrast, are back-loaded to DIFFERENT
+//     depths on shallow intraday charts, so a prior-period Weekly/Monthly extreme
+//     could be present on a 4H chart yet missing on a 15m chart. That was the
+//     residual MTF divergence: different inputs per chart, not a downstream bug.
+//   • Deriving W/M from the one Daily dataset means EVERY timeframe reads the SAME
+//     twelve numbers. Everything downstream (clusters, zones, Power, reference
+//     lines) is a pure function of them, so the readings are identical on every
+//     TF by construction — no per-chart dataset can exist.
+//   • Lightweight (bounded k-loop + ta.change + ta.atr, no swing/ema over full
+//     history), so a sub-chart request cannot trigger RE10110; native/un-clamped,
+//     so the values do not depend on the chart TF.
+f_refData() =>
+    hiE = array.new<float>()
+    loE = array.new<float>()
+    for k = 1 to 8
         if not na(high[k])
-            hi.push(high[k])
+            hiE.push(high[k])
         if not na(low[k])
-            lo.push(low[k])
-    [high[1], low[1], high, low, hi, lo]
-f_natPackD() =>
-    [ph, pl, ch, cl, hi, lo] = f_natPack(8)
-    [ph, pl, ch, cl, hi, lo, close[1], ta.atr(14)]
-[nPDH, nPDL, nCDH, nCDL, dHiE, dLoE, nDref, nDatr] = request.security(syminfo.tickerid, "D", f_natPackD(), lookahead = barmerge.lookahead_off)
-[nPWH, nPWL, nCWH, nCWL, wHiE, wLoE] = request.security(syminfo.tickerid, "W", f_natPack(6), lookahead = barmerge.lookahead_off)
-[nPMH, nPML, nCMH, nCML, mHiE, mLoE] = request.security(syminfo.tickerid, "M", f_natPack(4), lookahead = barmerge.lookahead_off)
+            loE.push(low[k])
+    // WEEK aggregation from Daily bars — reset the running extreme on a new ISO week.
+    var float cwH = na
+    var float cwL = na
+    var float pwH = na
+    var float pwL = na
+    if ta.change(weekofyear) != 0
+        pwH := cwH
+        pwL := cwL
+        cwH := high
+        cwL := low
+    else
+        cwH := na(cwH) ? high : math.max(cwH, high)
+        cwL := na(cwL) ? low  : math.min(cwL, low)
+    // MONTH aggregation from Daily bars — reset the running extreme on a new month.
+    var float cmH = na
+    var float cmL = na
+    var float pmH = na
+    var float pmL = na
+    if ta.change(month) != 0
+        pmH := cmH
+        pmL := cmL
+        cmH := high
+        cmL := low
+    else
+        cmH := na(cmH) ? high : math.max(cmH, high)
+        cmL := na(cmL) ? low  : math.min(cmL, low)
+    [pmH, pmL, cmH, cmL, pwH, pwL, cwH, cwL, high[1], low[1], high, low, close[1], ta.atr(14), hiE, loE]
+[nPMH, nPML, nCMH, nCML, nPWH, nPWL, nCWH, nCWL, nPDH, nPDL, nCDH, nCDL, nDref, nDatr, dHiE, dLoE] = request.security(syminfo.tickerid, "D", f_refData(), lookahead = barmerge.lookahead_off)
+
+// REFERENCE DATASET FINGERPRINT — a deterministic hash of the 12 native anchors,
+// each quantised to mintick units. Because the anchors are all Daily-derived, this
+// hash is IDENTICAL on every chart timeframe. It is shown bottom-right beside the
+// BUILD so cross-TF identity is provable at a glance: put the indicator on 1m and
+// on 1D — the DS hash MUST match. If it ever differs, the dataset itself diverged,
+// which is the only thing that can move a reading across timeframes.
+f_anchorHash() =>
+    a = array.from(nPMH, nPML, nCMH, nCML, nPWH, nPWL, nCWH, nCWL, nPDH, nPDL, nCDH, nCDL)
+    int h = 17
+    for i = 0 to a.size() - 1
+        v = a.get(i)
+        k = na(v) ? 0 : int(math.round(v / syminfo.mintick))
+        h := ((h * 131 + k) % 1000000007 + 1000000007) % 1000000007
+    h
 
 // Count of recent DAILY extremes within `band` of a level. DAILY ONLY on purpose:
 // daily history loads on every chart from 1m up (a 1m chart still sees the last week+
@@ -608,19 +650,15 @@ f_bestTouch(float px, float atr) =>
     win  = atr * adjATRWin
     float bestP = px
     float bestC = f_touchCount(px, band)
+    // Candidate snap targets = the Daily extreme set (same single chart-independent
+    // source as the touch count). Weekly/Monthly context already lives in the anchor
+    // clustering; keeping this Daily-only is what guarantees an identical snap on
+    // every timeframe (a shallow chart cannot load Weekly/Monthly extreme arrays).
     all = array.new<float>()
     if not na(dHiE)
         all.concat(dHiE)
     if not na(dLoE)
         all.concat(dLoE)
-    if not na(wHiE)
-        all.concat(wHiE)
-    if not na(wLoE)
-        all.concat(wLoE)
-    if not na(mHiE)
-        all.concat(mHiE)
-    if not na(mLoE)
-        all.concat(mLoE)
     if all.size() > 0
         for i = 0 to all.size() - 1
             v = all.get(i)
@@ -2014,9 +2052,11 @@ else
 
 // Tiny always-on version marker (bottom-right) — replaces the version that used to
 // sit in the Power label, so a stale paste is still catchable at a glance.
-var table verT = table.new(position.bottom_right, 1, 1)
+var table verT = table.new(position.bottom_right, 1, 2)
 if barstate.islast
     table.cell(verT, 0, 0, BUILD, text_color = color.new(color.gray, 35), text_size = size.tiny)
+    // Cross-TF proof: this DS fingerprint must be identical on every chart timeframe.
+    table.cell(verT, 0, 1, "DS " + str.tostring(f_anchorHash()), text_color = color.new(color.gray, 45), text_size = size.tiny)
 
 // ═══ INSTITUTIONAL REFERENCE LINES — cross-TF-identical MTF display ══════════
 // Draw the fixed anchors (prev D/W/M extremes + last confirmed D/W/M swings) at
