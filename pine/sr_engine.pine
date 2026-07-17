@@ -31,7 +31,7 @@ indicator("Institutional Adaptive S/R Engine  [v2.1.1 · 2026-07-06]", "IA-SR", 
 // (top-left) and on the dashboard's top row, so you can always confirm the
 // running version. If this differs from the tag I quote in chat, you're on an
 // old copy — re-paste the file I attached. Keep this in sync with the title.
-BUILD = "v3.5.2-PERF · 2026-07-15"
+BUILD = "v3.6-MTF · 2026-07-15"
 
 // #############################################################################
 // # SECTION 1 — INPUTS
@@ -1915,8 +1915,8 @@ if showPowerLine and not na(powerDraw)
         line.set_color(powerLn, colPower)
         line.set_width(powerLn, powerWidth)
         label.set_xy(powerLb, bar_index + labelOffset, powerDraw)
-    // SHORT label to match the other lines: ⚡ price + expected state only.
-    ptxt = "⚡ " + f_px(powerDraw) + (powerShowStat and pwrStatus != "" ? "  " + pwrStatus : "")
+    // SHORT label: ⚡ price + trend arrow (▲ bull / ▼ bear) + expected state.
+    ptxt = "⚡ " + f_px(powerDraw) + (htfBull ? " ▲" : htfBear ? " ▼" : " ▬") + (powerShowStat and pwrStatus != "" ? "  " + pwrStatus : "")
     label.set_text(powerLb, ptxt)
     label.set_textcolor(powerLb, colPower)
 else
@@ -1991,7 +1991,9 @@ if showRefLines and barstate.islast
         // the kept set is identical on every TF.
         strengths = array.new<float>()
         for si = 0 to rpx.size() - 1
-            dd = f_div(math.abs(close - rpx.get(si)), pATRn)
+            // proximity tiebreak measured from the NATIVE daily close (chart-independent),
+            // NOT the chart's own close — so the kept top-N set is identical on every TF.
+            dd = f_div(math.abs(nDref - rpx.get(si)), pATRn)
             strengths.push(f_touchCount(rpx.get(si), pATRn * touchBandK) + rwd.get(si) * 0.1 + 1.0 / (1.0 + dd) * 0.01)
         rankIdx = strengths.sort_indices(order.descending)
         keepN = math.min(maxRefLines, rankIdx.size())
