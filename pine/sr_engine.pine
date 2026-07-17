@@ -31,7 +31,7 @@ indicator("Institutional Adaptive S/R Engine  [v2.1.1 · 2026-07-06]", "IA-SR", 
 // (top-left) and on the dashboard's top row, so you can always confirm the
 // running version. If this differs from the tag I quote in chat, you're on an
 // old copy — re-paste the file I attached. Keep this in sync with the title.
-BUILD = "v3.9.1-MTF · 2026-07-15"
+BUILD = "v3.9.2-MTF · 2026-07-17"
 
 // #############################################################################
 // # SECTION 1 — INPUTS
@@ -1382,7 +1382,8 @@ f_scoreAndRender(Store s, color baseCol, Store o1, Store o2, Store o3, Store o4,
                 if not na(lb)
                     if showLabel and not weak and show and labelMode != "Off"
                         grade = sc >= 90 ? "A+" : sc >= 80 ? "A" : sc >= 70 ? "B" : sc >= 55 ? "C" : "D"
-                        label.set_xy(lb, bar_index, f_anchorY(lvl, res, s.atrTF))
+                        label.set_xy(lb, bar_index + labelOffset, f_anchorY(lvl, res, s.atrTF))
+                        label.set_size(lb, lblSz)
                         wy = s.why.get(i)
                         ltxt = labelMode == "Price only" ? f_px(lvl) :
                              labelMode == "Compact" ? (res ? "R" : "S") + " " + f_px(lvl) + "  " + str.tostring(math.round(sc)) :
