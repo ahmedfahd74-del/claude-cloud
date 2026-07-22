@@ -97,24 +97,30 @@ inPrem  = close > eqLvl
 f_bias() =>
     _ph = ta.pivothigh(high, biasPiv, biasPiv)
     _pl = ta.pivotlow(low,  biasPiv, biasPiv)
-    var float _sh   = na
-    var float _sl   = na
-    var bool  _shBrk = true
-    var bool  _slBrk = true
-    var int   _b    = 0
+    var int   _dir    = 0
+    var float _lastPH = na
+    var float _lastPL = na
+    var float _upRef  = na
+    var float _dnRef  = na
     if not na(_ph)
-        _sh := _ph
-        _shBrk := false
+        _lastPH := _ph
+        if na(_upRef)
+            _upRef := _ph
     if not na(_pl)
-        _sl := _pl
-        _slBrk := false
-    if not _shBrk and not na(_sh) and close > _sh
-        _shBrk := true
-        _b := 1
-    if not _slBrk and not na(_sl) and close < _sl
-        _slBrk := true
-        _b := -1
-    _b
+        _lastPL := _pl
+        if na(_dnRef)
+            _dnRef := _pl
+    _brokeUp = not na(_upRef) and close > _upRef
+    _brokeDn = not na(_dnRef) and close < _dnRef
+    if _brokeUp
+        _dir := 1
+        _dnRef := _lastPL
+        _upRef := na
+    if _brokeDn
+        _dir := -1
+        _upRef := _lastPH
+        _dnRef := na
+    _dir
 
 // Non-repaint wrapper: bias of the last CLOSED bar of the requested TF.
 f_biasPrev() =>

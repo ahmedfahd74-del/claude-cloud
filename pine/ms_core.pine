@@ -1,19 +1,21 @@
 //@version=6
 // ═══════════════════════════════════════════════════════════════════════════
-// MS-CORE v1 — Institutional Market Structure (confirmed swings, close-based)
+// MS-CORE v1.1 — Institutional Market Structure (PROTECTED-SWING, close-based)
 //   HH / HL / LH / LL from CONFIRMED FRACTAL PIVOTS (detect on wick).
 //   BOS = continuation, CHoCH = reversal — confirmed on CLOSE, never wick.
-//   Bias flips ONLY on CHoCH.  Wick-through-then-close-back = SWEEP (not a break).
-//   MTF bias cascade  W -> D -> 4H -> 1H, deterministic & non-repainting.
-//   Standalone TEST build — validate on a live crypto chart before we merge it
-//   into the S/R (ICS) engine.  Inducement grading is v2, intentionally not here.
+//   TWO-TIER: the break level (protected swing) only moves on a CONTINUATION
+//   break, never on a counter-trend minor pivot — so a bounce can't flip the
+//   bias until it reclaims the MAJOR swing. Bias flips only on a real CHoCH.
+//   Wick-through-then-close-back = SWEEP (not a break).
+//   MTF bias cascade W→D→4H→1H, deterministic & non-repainting (confirmation
+//   applied OUTSIDE request.security via f_biasPrev()[1] + lookahead_on).
 // ═══════════════════════════════════════════════════════════════════════════
-indicator("MS-Core v1 [Market Structure]", shorttitle="MS-Core", overlay=true, max_lines_count=500, max_labels_count=500, max_bars_back=5000)
+indicator("MS-Core v1.1 [Market Structure]", shorttitle="MS-Core", overlay=true, max_lines_count=500, max_labels_count=500, max_bars_back=5000)
 
 // ── INPUTS ─────────────────────────────────────────────────────────────────
 gS = "Structure"
 swL        = input.int(5, "Swing Size (fractal L/R, bigger = major only)", minval=1, maxval=50, group=gS)
-swingSrc   = input.string("Wick (high/low)", "Swing source  [Wick = institutional]", options=["Wick (high/low)", "Candle close"], group=gS, tooltip="Wick = swings sit at the real high/low where liquidity rests (recommended). Candle close = swings sit at closes (laggier). Break is always confirmed on close either way. Use this to SEE the difference on the chart.")
+swingSrc   = input.string("Wick (high/low)", "Swing source  [Wick = institutional]", options=["Wick (high/low)", "Candle close"], group=gS, tooltip="Wick = swings sit at the real high/low where liquidity rests (recommended). Candle close = swings sit at closes (laggier). Break is always confirmed on close either way.")
 showSwings = input.bool(true, "Show HH / HL / LH / LL", group=gS)
 showStruct = input.bool(true, "Show BOS / CHoCH", group=gS)
 showSweep  = input.bool(true, "Show liquidity SWEEPS (wick + close back)", group=gS)
@@ -35,36 +37,40 @@ useClose = swingSrc == "Candle close"
 f_lsize(s) => s == "Tiny" ? size.tiny : s == "Normal" ? size.normal : size.small
 f_tpos(s)  => s == "Top Left" ? position.top_left : s == "Bottom Right" ? position.bottom_right : s == "Bottom Left" ? position.bottom_left : position.top_right
 
-// ── MTF BIAS FUNCTION ────────────────────────────────────────────────────────
-// Self-contained structure state machine returning 1 (bull) / -1 (bear) / 0.
-// NOTE: no barstate.isconfirmed in here — it does NOT work inside request.security
-// (it reads the CHART bar, not the requested TF's bar), which previously let the
-// still-forming HTF bar register a premature break. Confirmation is applied
-// OUTSIDE, via the f_biasPrev()[1] + lookahead_on wrapper below → the value comes
-// from the last CLOSED HTF bar, so history never repaints.
+// ── PROTECTED-SWING BIAS FUNCTION ────────────────────────────────────────────
+// Returns +1 bull / -1 bear / 0. The break refs (_upRef/_dnRef) only move on a
+// continuation break, so counter-trend minor pivots can't flip the bias.
+// No barstate.isconfirmed in here — it does NOT work inside request.security.
+// Confirmation is applied OUTSIDE via f_biasPrev()[1] + lookahead_on.
 f_bias() =>
     _srcH = useClose ? close : high
     _srcL = useClose ? close : low
     _ph = ta.pivothigh(_srcH, mtfSwing, mtfSwing)
     _pl = ta.pivotlow(_srcL,  mtfSwing, mtfSwing)
-    var float _sh   = na
-    var float _sl   = na
-    var bool  _shBrk = true
-    var bool  _slBrk = true
-    var int   _b    = 0
+    var int   _dir    = 0
+    var float _lastPH = na
+    var float _lastPL = na
+    var float _upRef  = na
+    var float _dnRef  = na
     if not na(_ph)
-        _sh := _ph
-        _shBrk := false
+        _lastPH := _ph
+        if na(_upRef)
+            _upRef := _ph
     if not na(_pl)
-        _sl := _pl
-        _slBrk := false
-    if not _shBrk and not na(_sh) and close > _sh
-        _shBrk := true
-        _b := 1
-    if not _slBrk and not na(_sl) and close < _sl
-        _slBrk := true
-        _b := -1
-    _b
+        _lastPL := _pl
+        if na(_dnRef)
+            _dnRef := _pl
+    _brokeUp = not na(_upRef) and close > _upRef
+    _brokeDn = not na(_dnRef) and close < _dnRef
+    if _brokeUp
+        _dir := 1
+        _dnRef := _lastPL
+        _upRef := na
+    if _brokeDn
+        _dir := -1
+        _upRef := _lastPH
+        _dnRef := na
+    _dir
 
 // Non-repaint wrapper: return the bias of the last CLOSED bar of the requested TF.
 f_biasPrev() =>
@@ -76,75 +82,84 @@ dB  = request.security(syminfo.tickerid, "D",   f_biasPrev(), lookahead=barmerge
 h4B = request.security(syminfo.tickerid, "240", f_biasPrev(), lookahead=barmerge.lookahead_on)
 h1B = request.security(syminfo.tickerid, "60",  f_biasPrev(), lookahead=barmerge.lookahead_on)
 
-// ── MAIN-CHART STRUCTURE ─────────────────────────────────────────────────────
+// ── MAIN-CHART STRUCTURE (protected-swing) ───────────────────────────────────
 srcH = useClose ? close : high
 srcL = useClose ? close : low
 ph = ta.pivothigh(srcH, swL, swL)
 pl = ta.pivotlow(srcL,  swL, swL)
 
-var float shP    = na     // active swing HIGH price (level to break for bull)
-var int   shB    = na     // its bar_index
-var bool  shBrk  = true   // has the active swing high been broken?
-var float slP    = na     // active swing LOW price (level to break for bear)
-var int   slB    = na
-var bool  slBrk  = true
-var float prevPH = na     // previous confirmed pivot high (for HH/LH)
-var float prevPL = na     // previous confirmed pivot low  (for HL/LL)
-var int   bias   = 0      // 1 bull / -1 bear / 0 none
+var float prevPH   = na    // previous pivot high (for HH/LH label)
+var float prevPL   = na
+var int   dir      = 0     // chart bias 1 / -1 / 0
+var float lastPH   = na    // most recent confirmed pivot high (minor)
+var int   lastPHb  = na
+var float lastPL   = na
+var int   lastPLb  = na
+var float upRef    = na    // protected high: break UP above = bullish event
+var int   upRefb   = na
+var float dnRef    = na    // protected low: break DOWN below = bearish event
+var int   dnRefb   = na
 
-// New confirmed pivot HIGH → label HH/LH, arm it as the active swing high
+// New confirmed pivot HIGH → HH/LH label + record as latest minor swing high
 if not na(ph)
     if showSwings
         isHH = na(prevPH) or ph > prevPH
         label.new(bar_index - swL, ph, isHH ? "HH" : "LH", xloc=xloc.bar_index, style=label.style_label_down, color=isHH ? color.new(colBull, 30) : color.new(colBear, 30), textcolor=color.white, size=f_lsize(lblSize))
     prevPH := ph
-    shP := ph
-    shB := bar_index - swL
-    shBrk := false
+    lastPH := ph
+    lastPHb := bar_index - swL
+    if na(upRef)
+        upRef := ph
+        upRefb := bar_index - swL
 
-// New confirmed pivot LOW → label HL/LL, arm it as the active swing low
+// New confirmed pivot LOW → HL/LL label + record as latest minor swing low
 if not na(pl)
     if showSwings
         isLL = na(prevPL) or pl < prevPL
         label.new(bar_index - swL, pl, isLL ? "LL" : "HL", xloc=xloc.bar_index, style=label.style_label_up, color=isLL ? color.new(colBear, 30) : color.new(colBull, 30), textcolor=color.white, size=f_lsize(lblSize))
     prevPL := pl
-    slP := pl
-    slB := bar_index - swL
-    slBrk := false
+    lastPL := pl
+    lastPLb := bar_index - swL
+    if na(dnRef)
+        dnRef := pl
+        dnRefb := bar_index - swL
 
-// SWEEP: wick beyond an active swing but CLOSE back inside = liquidity grab
-sweepUp = showSweep and barstate.isconfirmed and not shBrk and not na(shP) and high > shP and close <= shP
-sweepDn = showSweep and barstate.isconfirmed and not slBrk and not na(slP) and low  < slP and close >= slP
+// SWEEP: wick beyond the nearest swing but CLOSE back inside = liquidity grab
+sweepUp = showSweep and barstate.isconfirmed and not na(lastPH) and high > lastPH and close <= lastPH
+sweepDn = showSweep and barstate.isconfirmed and not na(lastPL) and low  < lastPL and close >= lastPL
 if sweepUp
     label.new(bar_index, high, "✕", xloc=xloc.bar_index, style=label.style_none, textcolor=colBear, size=size.small)
 if sweepDn
     label.new(bar_index, low, "✕", xloc=xloc.bar_index, style=label.style_none, textcolor=colBull, size=size.small)
 
-// BREAK: CLOSE beyond an active swing (only on confirmed bars → non-repaint)
-brokeUp = barstate.isconfirmed and not shBrk and not na(shP) and close > shP
-brokeDn = barstate.isconfirmed and not slBrk and not na(slP) and close < slP
+// BREAK on CLOSE (confirmed) — protected-swing BOS/CHoCH
+brokeUp = barstate.isconfirmed and not na(upRef) and close > upRef
+brokeDn = barstate.isconfirmed and not na(dnRef) and close < dnRef
 
 if brokeUp
-    ev = bias == 1 ? "BOS" : "CHoCH"      // break UP in a downtrend = CHoCH
-    bias := 1
-    shBrk := true
+    ev = dir == 1 ? "BOS" : "CHoCH"
+    dir := 1
     if showStruct
-        line.new(shB, shP, bar_index, shP, xloc=xloc.bar_index, color=ev == "BOS" ? colBOS : colCHoCH, width=1, style=line.style_dashed)
-        label.new(bar_index, shP, ev, xloc=xloc.bar_index, style=label.style_label_down, color=ev == "BOS" ? color.new(colBOS, 20) : color.new(colCHoCH, 10), textcolor=ev == "BOS" ? color.white : color.black, size=f_lsize(lblSize))
+        line.new(upRefb, upRef, bar_index, upRef, xloc=xloc.bar_index, color=ev == "BOS" ? colBOS : colCHoCH, width=1, style=line.style_dashed)
+        label.new(bar_index, upRef, ev, xloc=xloc.bar_index, style=label.style_label_down, color=ev == "BOS" ? color.new(colBOS, 20) : color.new(colCHoCH, 10), textcolor=ev == "BOS" ? color.white : color.black, size=f_lsize(lblSize))
+    dnRef := lastPL
+    dnRefb := lastPLb
+    upRef := na
 
 if brokeDn
-    ev = bias == -1 ? "BOS" : "CHoCH"     // break DOWN in an uptrend = CHoCH
-    bias := -1
-    slBrk := true
+    ev = dir == -1 ? "BOS" : "CHoCH"
+    dir := -1
     if showStruct
-        line.new(slB, slP, bar_index, slP, xloc=xloc.bar_index, color=ev == "BOS" ? colBOS : colCHoCH, width=1, style=line.style_dashed)
-        label.new(bar_index, slP, ev, xloc=xloc.bar_index, style=label.style_label_up, color=ev == "BOS" ? color.new(colBOS, 20) : color.new(colCHoCH, 10), textcolor=ev == "BOS" ? color.white : color.black, size=f_lsize(lblSize))
+        line.new(dnRefb, dnRef, bar_index, dnRef, xloc=xloc.bar_index, color=ev == "BOS" ? colBOS : colCHoCH, width=1, style=line.style_dashed)
+        label.new(bar_index, dnRef, ev, xloc=xloc.bar_index, style=label.style_label_up, color=ev == "BOS" ? color.new(colBOS, 20) : color.new(colCHoCH, 10), textcolor=ev == "BOS" ? color.white : color.black, size=f_lsize(lblSize))
+    upRef := lastPH
+    upRefb := lastPHb
+    dnRef := na
 
 // ── MTF BIAS TABLE ───────────────────────────────────────────────────────────
 f_txt(int b) => b == 1 ? "BULL" : b == -1 ? "BEAR" : "—"
 f_col(int b) => b == 1 ? colBull : b == -1 ? colBear : color.new(color.gray, 30)
 
-// Cascade verdict: W is the boss, D must agree to "confirm".
 alignBull = wB == 1 and dB == 1
 alignBear = wB == -1 and dB == -1
 allBull   = wB == 1 and dB == 1 and h4B == 1 and h1B == 1
@@ -165,4 +180,4 @@ if showTable and barstate.islast
     table.cell(t, 0, 4, "1H", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
     table.cell(t, 1, 4, f_txt(h1B), text_color=color.white, bgcolor=f_col(h1B), text_size=size.small)
     table.cell(t, 0, 5, "Chart", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
-    table.cell(t, 1, 5, f_txt(bias), text_color=color.white, bgcolor=f_col(bias), text_size=size.small)
+    table.cell(t, 1, 5, f_txt(dir), text_color=color.white, bgcolor=f_col(dir), text_size=size.small)
