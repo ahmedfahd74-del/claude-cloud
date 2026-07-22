@@ -88,8 +88,12 @@ inPrem  = close > eqLvl
 
 // ── MS-CORE bias: swings on WICK, break confirmed on CLOSE (matches ms_core.pine)
 // Returns +1 bull / -1 bear / 0. Scalar, so requesting W/D/4H/1H is cheap and
-// never triggers array-memory blow-up. Non-repainting: pivots are offset-confirmed
-// and bias only changes on a CONFIRMED close beyond an active swing.
+// never triggers array-memory blow-up.
+// NOTE: no barstate.isconfirmed in here — it does NOT work inside request.security
+// (it reads the CHART bar, not the requested TF's bar), which previously let the
+// still-forming HTF bar register a premature break (the "1D Bullish on a bearish
+// chart" bug). Confirmation is applied OUTSIDE via f_biasPrev()[1] + lookahead_on,
+// so the value is the last CLOSED HTF bar and history never repaints.
 f_bias() =>
     _ph = ta.pivothigh(high, biasPiv, biasPiv)
     _pl = ta.pivotlow(low,  biasPiv, biasPiv)
@@ -104,18 +108,23 @@ f_bias() =>
     if not na(_pl)
         _sl := _pl
         _slBrk := false
-    if barstate.isconfirmed and not _shBrk and not na(_sh) and close > _sh
+    if not _shBrk and not na(_sh) and close > _sh
         _shBrk := true
         _b := 1
-    if barstate.isconfirmed and not _slBrk and not na(_sl) and close < _sl
+    if not _slBrk and not na(_sl) and close < _sl
         _slBrk := true
         _b := -1
     _b
 
-wB  = request.security(syminfo.tickerid, "W",   f_bias(), lookahead = barmerge.lookahead_off)
-dB  = request.security(syminfo.tickerid, "D",   f_bias(), lookahead = barmerge.lookahead_off)
-h4B = request.security(syminfo.tickerid, "240", f_bias(), lookahead = barmerge.lookahead_off)
-h1B = request.security(syminfo.tickerid, "60",  f_bias(), lookahead = barmerge.lookahead_off)
+// Non-repaint wrapper: bias of the last CLOSED bar of the requested TF.
+f_biasPrev() =>
+    int b = f_bias()
+    b[1]
+
+wB  = request.security(syminfo.tickerid, "W",   f_biasPrev(), lookahead = barmerge.lookahead_on)
+dB  = request.security(syminfo.tickerid, "D",   f_biasPrev(), lookahead = barmerge.lookahead_on)
+h4B = request.security(syminfo.tickerid, "240", f_biasPrev(), lookahead = barmerge.lookahead_on)
+h1B = request.security(syminfo.tickerid, "60",  f_biasPrev(), lookahead = barmerge.lookahead_on)
 f_biasTxt(int b) => b > 0 ? "Bullish" : b < 0 ? "Bearish" : "Neutral"
 
 // Weighted HTF bias score (W is the boss) in [-1, 1], with a neutral deadband.
