@@ -53,6 +53,20 @@ showPanel = input.bool(true, "Show Decision Panel", group=gM)
 dimVs     = input.bool(true, "Dim levels that fight the bias", group=gM)
 showAct   = input.bool(true, "Mark the actionable level (★)", group=gM)
 
+gL = "DOL Liquidity (Sphinx)"
+showDOL     = input.bool(true, "Show DOL liquidity levels (prior D/W/M)", group=gL)
+dolDay      = input.bool(true, "Prior Day H/L (PDH/PDL)", group=gL)
+dolWeek     = input.bool(true, "Prior Week H/L (PWH/PWL)", group=gL)
+dolMonth    = input.bool(true, "Prior Month H/L (PMH/PML)", group=gL)
+dolEQ       = input.bool(true, "Weekly / Monthly Equilibrium (50%)", group=gL)
+dolBandPct  = input.float(1.0, "Confluence band (% of price)", minval=0.1, maxval=5.0, step=0.1, group=gL)
+dolBoost    = input.float(15.0, "DOL confluence ICS boost (per level)", minval=0.0, maxval=50.0, step=5.0, group=gL)
+nakedBoost  = input.float(8.0, "Extra boost if DOL is naked (untested)", minval=0.0, maxval=30.0, step=2.0, group=gL)
+dolSnap     = input.bool(true, "Snap confluent S/R line to exact DOL price", group=gL)
+dolEmph     = input.bool(true, "Emphasize ceiling (bear) / floor (bull)", group=gL)
+colCeil     = input.color(#ef5350, "Ceiling (above price)", group=gL)
+colFloor    = input.color(#26a69a, "Floor (below price)", group=gL)
+
 f_size(s) => s == "Tiny" ? size.tiny : s == "Normal" ? size.normal : s == "Large" ? size.large : size.small
 
 // A level and its full memory.
@@ -136,6 +150,88 @@ f_biasTxt(int b) => b > 0 ? "Bullish" : b < 0 ? "Bearish" : "Neutral"
 // Weighted HTF bias score (W is the boss) in [-1, 1], with a neutral deadband.
 biasScore = wB * 0.40 + dB * 0.30 + h4B * 0.20 + h1B * 0.10
 bDir = biasScore > 0.15 ? 1 : biasScore < -0.15 ? -1 : 0
+
+// ── DOL LIQUIDITY: prior D/W/M pools (Sphinx), non-repainting ─────────────────
+// [1] + lookahead_on = the last CLOSED period's high/low (prior day/week/month).
+pdH = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+pdL = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_on)
+pwH = request.security(syminfo.tickerid, "W", high[1], lookahead=barmerge.lookahead_on)
+pwL = request.security(syminfo.tickerid, "W", low[1],  lookahead=barmerge.lookahead_on)
+pmH = request.security(syminfo.tickerid, "M", high[1], lookahead=barmerge.lookahead_on)
+pmL = request.security(syminfo.tickerid, "M", low[1],  lookahead=barmerge.lookahead_on)
+wEQ = (na(pwH) or na(pwL)) ? na : (pwH + pwL) / 2.0
+mEQ = (na(pmH) or na(pmL)) ? na : (pmH + pmL) / 2.0
+
+// naked tracking: a pool is "naked" until price trades through it in the new period
+var bool pdHn = true
+var bool pdLn = true
+var bool pwHn = true
+var bool pwLn = true
+var bool pmHn = true
+var bool pmLn = true
+if pdH != pdH[1]
+    pdHn := true
+if pdL != pdL[1]
+    pdLn := true
+if pwH != pwH[1]
+    pwHn := true
+if pwL != pwL[1]
+    pwLn := true
+if pmH != pmH[1]
+    pmHn := true
+if pmL != pmL[1]
+    pmLn := true
+if not na(pdH) and high >= pdH
+    pdHn := false
+if not na(pdL) and low <= pdL
+    pdLn := false
+if not na(pwH) and high >= pwH
+    pwHn := false
+if not na(pwL) and low <= pwL
+    pwLn := false
+if not na(pmH) and high >= pmH
+    pmHn := false
+if not na(pmL) and low <= pmL
+    pmLn := false
+
+var array<float>  dolPx  = array.new<float>()
+var array<string> dolTag = array.new<string>()
+var array<bool>   dolNk  = array.new<bool>()
+var array<float>  snapUsed = array.new<float>()
+
+f_addDol(bool en, float px, string tag, bool nk) =>
+    if en and showDOL and not na(px)
+        array.push(dolPx, px)
+        array.push(dolTag, tag)
+        array.push(dolNk, nk)
+
+// ICS boost from every DOL level within the confluence band (stacking rewarded).
+f_dolBoost(float px) =>
+    band = px * dolBandPct / 100.0
+    float bst = 0.0
+    if showDOL and array.size(dolPx) > 0
+        for i = 0 to array.size(dolPx) - 1
+            if math.abs(array.get(dolPx, i) - px) <= band
+                bst := bst + dolBoost + (array.get(dolNk, i) ? nakedBoost : 0.0)
+    bst
+
+// Nearest DOL to a price → [snapped price (exact DOL), combined tag, count].
+f_dolInfo(float px) =>
+    band = px * dolBandPct / 100.0
+    float snapPx = px
+    float bestD = band
+    string tag = ""
+    int cnt = 0
+    if showDOL and array.size(dolPx) > 0
+        for i = 0 to array.size(dolPx) - 1
+            d = math.abs(array.get(dolPx, i) - px)
+            if d <= band
+                cnt := cnt + 1
+                tag := tag + (tag == "" ? "" : "+") + array.get(dolTag, i)
+                if d < bestD
+                    bestD := d
+                    snapPx := dolSnap ? array.get(dolPx, i) : px
+    [snapPx, tag, cnt]
 
 ph = ta.pivothigh(high, pivLen, pivLen)
 pl = ta.pivotlow(low, pivLen, pivLen)
@@ -266,13 +362,26 @@ if barstate.islast
         label.delete(array.pop(dLab))
     while array.size(dBox) > 0
         box.delete(array.pop(dBox))
+    // rebuild the DOL set for this bar
+    array.clear(dolPx)
+    array.clear(dolTag)
+    array.clear(dolNk)
+    array.clear(snapUsed)
+    f_addDol(dolDay,   pdH, "PDH", pdHn)
+    f_addDol(dolDay,   pdL, "PDL", pdLn)
+    f_addDol(dolWeek,  pwH, "PWH", pwHn)
+    f_addDol(dolWeek,  pwL, "PWL", pwLn)
+    f_addDol(dolMonth, pmH, "PMH", pmHn)
+    f_addDol(dolMonth, pmL, "PML", pmLn)
+    f_addDol(dolEQ,    wEQ, "wEQ", false)
+    f_addDol(dolEQ,    mEQ, "mEQ", false)
     float railUp = na
     float railDn = na
     n = array.size(book)
     if n > 0
         scores = array.new_float(n, 0.0)
         for i = 0 to n - 1
-            array.set(scores, i, f_ics(array.get(book, i), biasScore, close))
+            array.set(scores, i, math.min(100.0, f_ics(array.get(book, i), biasScore, close) + f_dolBoost(array.get(book, i).price)))
         used = array.new_bool(n, false)
         sel  = array.new_int()
         for _s = 0 to n - 1
@@ -326,11 +435,16 @@ if barstate.islast
                 aligned = f_aligned(L, close, bDir)
                 fights  = bDir != 0 and not aligned
                 isAct   = showAct and i == actIdx
-                col = L.price > close ? resCol : supCol
-                if L.price > close
-                    railUp := na(railUp) ? L.price : math.min(railUp, L.price)
-                if L.price < close
-                    railDn := na(railDn) ? L.price : math.max(railDn, L.price)
+                // DOL confluence: snap the drawn line to the exact institutional price
+                [snapPx, dtag, dcnt] = f_dolInfo(L.price)
+                drawPx = snapPx
+                if dcnt > 0
+                    array.push(snapUsed, snapPx)
+                col = drawPx > close ? resCol : supCol
+                if drawPx > close
+                    railUp := na(railUp) ? drawPx : math.min(railUp, drawPx)
+                if drawPx < close
+                    railDn := na(railDn) ? drawPx : math.max(railDn, drawPx)
                 bnd = L.price * zoneBandPct / 100.0
                 tested = high >= L.price - bnd and low <= L.price + bnd
                 if tested
@@ -338,19 +452,41 @@ if barstate.islast
                     zBot = (showExc and not na(L.testLo)) ? math.min(L.testLo, L.price - bnd) : L.price - bnd
                     array.push(dBox, box.new(x1, zTop, x2, zBot, border_color=color.new(zoneCol, 40), border_width=1, bgcolor=color.new(zoneCol, 80)))
                 else
-                    lw = isAct ? lineWidth + 2 : (flipThick and flip ? lineWidth + 1 : lineWidth)
+                    lw = isAct ? lineWidth + 2 : (dcnt > 0 ? lineWidth + 1 : (flipThick and flip ? lineWidth + 1 : lineWidth))
                     lstyle = (dimVs and fights) ? line.style_dashed : line.style_solid
                     lcol = (dimVs and fights) ? color.new(col, 65) : col
-                    array.push(dLine, line.new(x1, L.price, x2, L.price, color=lcol, width=lw, extend=extend.left, style=lstyle))
+                    array.push(dLine, line.new(x1, drawPx, x2, drawPx, color=lcol, width=lw, extend=extend.left, style=lstyle))
                 if showLbl
                     tot = L.bounce + L.brk
                     wintxt = tot > 0 ? "win " + str.tostring(math.round(L.bounce / tot * 100)) + "%" : "new"
-                    loc = L.price > eqLvl ? "PREM" : "DISC"
+                    loc = drawPx > eqLvl ? "PREM" : "DISC"
                     stag = isAct ? "★ TRADE" : aligned ? "✓struct" : fights ? "✗vs bias" : "—"
+                    dolt = dcnt > 0 ? "  ⚡" + dtag : ""
                     lblTxtCol = (dimVs and fights) ? color.new(color.white, 45) : color.white
                     lblBgCol  = isAct ? color.new(#26c281, 10) : (dimVs and fights) ? color.new(col, 55) : color.new(col, 20)
-                    txt = str.tostring(L.price, format.mintick) + "  ICS " + str.tostring(math.round(ics)) + (flip ? "  ⇄FLIP" : "") + "  " + stag + "\n×" + str.tostring(L.touch) + " · " + wintxt + " · " + f_expect(L) + "\nlast5 " + f_form(L) + "  ·  " + loc
-                    array.push(dLab, label.new(x2, L.price, txt, xloc=xloc.bar_index, style=label.style_label_left, color=lblBgCol, textcolor=lblTxtCol, size=f_size(lblSizeS)))
+                    txt = str.tostring(drawPx, format.mintick) + "  ICS " + str.tostring(math.round(ics)) + (flip ? "  ⇄FLIP" : "") + dolt + "  " + stag + "\n×" + str.tostring(L.touch) + " · " + wintxt + " · " + f_expect(L) + "\nlast5 " + f_form(L) + "  ·  " + loc
+                    array.push(dLab, label.new(x2, drawPx, txt, xloc=xloc.bar_index, style=label.style_label_left, color=lblBgCol, textcolor=lblTxtCol, size=f_size(lblSizeS)))
+        // draw standalone DOL levels (those not already represented by a snapped S/R line)
+        if showDOL and array.size(dolPx) > 0
+            for di = 0 to array.size(dolPx) - 1
+                dpx = array.get(dolPx, di)
+                repD = false
+                if array.size(snapUsed) > 0
+                    for u = 0 to array.size(snapUsed) - 1
+                        if array.get(snapUsed, u) == dpx
+                            repD := true
+                            break
+                if not repD
+                    above = dpx > close
+                    barrier = dolEmph and ((bDir < 0 and above) or (bDir > 0 and not above))
+                    dcol = above ? colCeil : colFloor
+                    dlw = barrier ? 2 : 1
+                    dstyle = barrier ? line.style_solid : line.style_dotted
+                    array.push(dLine, line.new(x1, dpx, x2, dpx, color=color.new(dcol, barrier ? 0 : 40), width=dlw, extend=extend.left, style=dstyle))
+                    if showLbl
+                        btag = barrier ? (above ? "🔒CEIL " : "🛡FLOOR ") : ""
+                        ntag = array.get(dolNk, di) ? " (naked)" : ""
+                        array.push(dLab, label.new(x2, dpx, btag + array.get(dolTag, di) + " " + str.tostring(dpx, format.mintick) + ntag, xloc=xloc.bar_index, style=label.style_label_left, color=color.new(dcol, 35), textcolor=color.white, size=f_size(lblSizeS)))
 
     if showPanel
         act = (bDir > 0 and not inPrem) ? "BUY zone" : (bDir < 0 and inPrem) ? "SELL zone" : (bDir > 0 and inPrem) ? "BUY (wait pullback)" : (bDir < 0 and not inPrem) ? "SELL (wait pop)" : "WAIT / no bias"
