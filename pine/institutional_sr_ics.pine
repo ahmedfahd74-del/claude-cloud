@@ -79,6 +79,10 @@ londonSess = input.session("0800-1600", "London window", group=gSe)
 useNY      = input.bool(true, "New York session", group=gSe)
 nySess     = input.session("1300-2100", "New York window", group=gSe)
 
+gN = "Manual Nudge (ticks)"
+nudge1 = input.int(0, "Nudge strongest line (± ticks)", minval=-100, maxval=100, group=gN, tooltip="Shift the #1 (highest-ICS) line up/down by this many ticks to sit it on a wick instead of through a body.")
+nudge2 = input.int(0, "Nudge 2nd line (± ticks)", minval=-100, maxval=100, group=gN)
+
 f_size(s) => s == "Tiny" ? size.tiny : s == "Normal" ? size.normal : s == "Large" ? size.large : size.small
 
 // A level and its full memory.
@@ -531,9 +535,11 @@ if barstate.islast
                 isAct   = showAct and i == actIdx
                 // DOL confluence: snap the drawn line to the exact institutional price
                 [snapPx, dtag, dcnt] = f_dolInfo(L.price)
-                drawPx = snapPx
                 if dcnt > 0
-                    array.push(snapUsed, snapPx)
+                    array.push(snapUsed, snapPx)   // dedup uses the un-nudged cluster price
+                // manual tick nudge for the top two (rank-ordered by ICS)
+                nudgeT = k == 0 ? nudge1 : k == 1 ? nudge2 : 0
+                drawPx = snapPx + nudgeT * syminfo.mintick
                 col = drawPx > close ? resCol : supCol
                 if drawPx > close
                     railUp := na(railUp) ? drawPx : math.min(railUp, drawPx)
