@@ -554,10 +554,11 @@ if barstate.islast
                     tot = L.bounce + L.brk
                     wintxt = tot > 0 ? "win " + str.tostring(math.round(L.bounce / tot * 100)) + "%" : "new"
                     loc = drawPx > eqLvl ? "PREM" : "DISC"
-                    stag = isAct ? "★ TRADE" : aligned ? "✓struct" : fights ? "✗vs bias" : "—"
+                    stag = isAct ? (bDir < 0 ? "★ SELL" : "★ BUY") : aligned ? "✓struct" : fights ? "✗vs bias" : "—"
                     dolt = dcnt > 0 ? "  ⚡" + dtag : ""
                     lblTxtCol = (dimVs and fights) ? color.new(color.white, 45) : color.white
-                    lblBgCol  = isAct ? color.new(#26c281, 10) : (dimVs and fights) ? color.new(col, 55) : color.new(col, 20)
+                    actBg = bDir < 0 ? color.new(#ff5252, 10) : color.new(#26c281, 10)
+                    lblBgCol  = isAct ? actBg : (dimVs and fights) ? color.new(col, 55) : color.new(col, 20)
                     txt = str.tostring(drawPx, format.mintick) + "  ICS " + str.tostring(math.round(ics)) + (flip ? "  ⇄FLIP" : "") + dolt + "  " + stag + "\n×" + str.tostring(L.touch) + " · " + wintxt + " · " + f_expect(L) + "\nlast5 " + f_form(L) + "  ·  " + loc
                     array.push(dLab, label.new(x2, drawPx, txt, xloc=xloc.bar_index, style=label.style_label_left, color=lblBgCol, textcolor=lblTxtCol, size=f_size(lblSizeS)))
         // draw DOL confluence CLUSTERS — one clean line/label each, deduped vs snapped S/R
