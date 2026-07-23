@@ -68,6 +68,17 @@ dolEmph     = input.bool(true, "Emphasize ceiling (bear) / floor (bull)", group=
 colCeil     = input.color(#ef5350, "Ceiling (above price)", group=gL)
 colFloor    = input.color(#26a69a, "Floor (below price)", group=gL)
 
+gSe = "DOL Sessions (intraday H/L)"
+showSess   = input.bool(true, "Show session highs/lows (Asia/London/NY)", group=gSe)
+sessRes    = input.timeframe("60", "Intraday resolution for sessions", options=["15", "30", "60", "120", "240"], group=gSe, tooltip="Lower = more precise session H/L but heavier. If a big chart (1W) ever times out, raise this to 240.")
+sessTz     = input.string("GMT+0", "Session timezone", options=["GMT+0", "America/New_York", "GMT+1", "GMT+2", "GMT+3", "Asia/Tokyo"], group=gSe, tooltip="Standard crypto is UTC (GMT+0). Switch to America/New_York for classic ICT kill-zone times.")
+useAsia    = input.bool(true, "Asia session", group=gSe)
+asiaSess   = input.session("0000-0800", "Asia window", group=gSe)
+useLondon  = input.bool(true, "London session", group=gSe)
+londonSess = input.session("0800-1600", "London window", group=gSe)
+useNY      = input.bool(true, "New York session", group=gSe)
+nySess     = input.session("1300-2100", "New York window", group=gSe)
+
 f_size(s) => s == "Tiny" ? size.tiny : s == "Normal" ? size.normal : s == "Large" ? size.large : size.small
 
 // A level and its full memory.
@@ -166,6 +177,40 @@ mEQ = (na(pmH) or na(pmL)) ? na : (pmH + pmL) / 2.0
 dOpen = request.security(syminfo.tickerid, "D", open, lookahead=barmerge.lookahead_off)
 wOpen = request.security(syminfo.tickerid, "W", open, lookahead=barmerge.lookahead_off)
 mOpen = request.security(syminfo.tickerid, "M", open, lookahead=barmerge.lookahead_off)
+
+// Session H/L: accumulate high/low inside a session, LATCH the completed session's
+// values (prior session = non-repainting), and track naked (untested since latch).
+// Returns [priorHigh, priorLow, nakedHigh, nakedLow]. Evaluated at an intraday res
+// via request.security so it works on any chart TF (incl. 1D/1W).
+f_sess(simple string sess, simple string tz) =>
+    var float h  = na
+    var float l  = na
+    var float pH = na
+    var float pL = na
+    var bool  nH = false
+    var bool  nL = false
+    ins = not na(time(timeframe.period, sess, tz))
+    ns  = ins and not ins[1]
+    if ns
+        h := high
+        l := low
+    else if ins
+        h := math.max(h, high)
+        l := math.min(l, low)
+    if ins[1] and not ins
+        pH := h
+        pL := l
+        nH := true
+        nL := true
+    if not na(pH) and high >= pH
+        nH := false
+    if not na(pL) and low <= pL
+        nL := false
+    [pH, pL, nH, nL]
+
+[asiaH, asiaL, asiaHn, asiaLn]   = request.security(syminfo.tickerid, sessRes, f_sess(asiaSess, sessTz),   lookahead=barmerge.lookahead_off)
+[lonH,  lonL,  lonHn,  lonLn]    = request.security(syminfo.tickerid, sessRes, f_sess(londonSess, sessTz), lookahead=barmerge.lookahead_off)
+[nyH,   nyL,   nyHn,   nyLn]     = request.security(syminfo.tickerid, sessRes, f_sess(nySess, sessTz),     lookahead=barmerge.lookahead_off)
 
 // naked tracking: a pool is "naked" until price trades through it in the new period
 var bool pdHn = true
@@ -386,6 +431,12 @@ if barstate.islast
     f_addDol(dolOpens, dOpen, "midEQ", false)
     f_addDol(dolOpens, wOpen, "wOpen", false)
     f_addDol(dolOpens, mOpen, "mOpen", false)
+    f_addDol(showSess and useAsia,   asiaH, "AsH", asiaHn)
+    f_addDol(showSess and useAsia,   asiaL, "AsL", asiaLn)
+    f_addDol(showSess and useLondon, lonH,  "LOH", lonHn)
+    f_addDol(showSess and useLondon, lonL,  "LOL", lonLn)
+    f_addDol(showSess and useNY,     nyH,   "NYH", nyHn)
+    f_addDol(showSess and useNY,     nyL,   "NYL", nyLn)
     // greedy-cluster raw pools within the band into single confluence zones
     array.clear(clPx)
     array.clear(clTag)
