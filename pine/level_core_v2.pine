@@ -1,0 +1,237 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+// LEVEL CORE v2 — Multi-degree, CROSS-TIMEFRAME (Module 1, frozen foundation)
+//
+//  Levels are sourced from FIXED timeframes (1H / 4H / 1D / 1W) via
+//  request.security — NEVER from the chart's own candles. Consequences:
+//   • SAME level prices on every chart TF (1m … 1W) — identical, by construction.
+//   • Each level's interactions are counted on ITS OWN degree's bars, so its
+//     event log & stats are identical no matter which chart you view.
+//   • Only degrees ≥ the chart TF are shown (keeps the HTF data complete).
+//  Inherits the v1 event engine (validated): immutable anchors, event-sourced
+//  stats, closed-bar-only detection (no repaint), zone-while-interacting.
+// ═══════════════════════════════════════════════════════════════════════════
+indicator("Level Core v2 [multi-degree cross-TF]", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500, max_bars_back=5000)
+
+gD = "Detection"
+pivLen  = input.int(5, "Swing size (pivot L/R, per degree)", minval=2, maxval=50, group=gD)
+bandPct = input.float(0.40, "Level band (% of price)", minval=0.02, maxval=5.0, step=0.02, group=gD)
+maxLvls = input.int(60, "Max levels tracked (centered on price)", minval=8, maxval=120, group=gD)
+maxEv   = input.int(40, "Timeline length (events per level)", minval=5, maxval=80, group=gD)
+minShow = input.int(1, "Min interactions to show (LIVE always shows)", minval=0, maxval=20, group=gD)
+
+gG = "Degrees"
+use1H = input.bool(true, "1H levels", group=gG)
+use4H = input.bool(true, "4H levels", group=gG)
+use1D = input.bool(true, "1D levels", group=gG)
+use1W = input.bool(true, "1W levels", group=gG)
+
+gS = "Style"
+resCol  = input.color(#ef5350, "Resistance", group=gS)
+supCol  = input.color(#26a69a, "Support", group=gS)
+zoneCol = input.color(#ffd24a, "Active zone", group=gS)
+extR    = input.int(30, "Extend right (bars)", minval=0, maxval=200, group=gS)
+showLbl = input.bool(true, "Show labels", group=gS)
+lblSize = input.string("Small", "Label size", options=["Tiny", "Small", "Normal"], group=gS)
+
+f_sz(s) => s == "Tiny" ? size.tiny : s == "Normal" ? size.normal : size.small
+f_degTxt(int d) => d == 0 ? "1H" : d == 1 ? "4H" : d == 2 ? "1D" : "1W"
+
+// a degree is active only if its timeframe is ≥ the chart timeframe
+chartSec = timeframe.in_seconds(timeframe.period)
+a1H = use1H and timeframe.in_seconds("60")  >= chartSec
+a4H = use4H and timeframe.in_seconds("240") >= chartSec
+a1D = use1D and timeframe.in_seconds("D")   >= chartSec
+a1W = use1W and timeframe.in_seconds("W")   >= chartSec
+
+type Ev
+    int   bar
+    int   t
+    int   kind        // 1 touch, 2 held, 3 break, 4 retest
+    float react       // measured: degree-bar excursion vs level, in band-units
+
+type Lvl
+    float anchor
+    int   deg
+    bool  inside
+    int   entSide
+    float testHi
+    float testLo
+    bool  brokenLast
+    array<Ev> log
+
+var array<Lvl> book = array.new<Lvl>()
+
+f_log(Lvl L, int kind, int bar, int t, float react) =>
+    array.push(L.log, Ev.new(bar, t, kind, react))
+    if array.size(L.log) > maxEv
+        array.shift(L.log)
+
+f_count(Lvl L, int kind) =>
+    int c = 0
+    if array.size(L.log) > 0
+        for i = 0 to array.size(L.log) - 1
+            if array.get(L.log, i).kind == kind
+                c += 1
+    c
+
+f_create(float px, int deg, int bar, int t) =>
+    L = Lvl.new(px, deg, false, 0, na, na, false, array.new<Ev>())
+    array.push(L.log, Ev.new(bar, t, 2, 0.0))     // founding rejection (held)
+    array.push(book, L)
+
+// found a level of a given degree; anchor immutable; keep book centered on price
+f_found(float px, int deg, int bar, int t) =>
+    if not na(px)
+        band = px * bandPct / 100.0
+        exists = false
+        if array.size(book) > 0
+            for i = 0 to array.size(book) - 1
+                if array.get(book, i).deg == deg and math.abs(array.get(book, i).anchor - px) <= band
+                    exists := true
+                    break
+        if not exists
+            if array.size(book) < maxLvls
+                f_create(px, deg, bar, t)
+            else
+                int far = -1
+                float fard = math.abs(px - close)
+                for i = 0 to array.size(book) - 1
+                    d = math.abs(array.get(book, i).anchor - close)
+                    if d > fard
+                        fard := d
+                        far := i
+                if far >= 0
+                    array.remove(book, far)
+                    f_create(px, deg, bar, t)
+
+// run interaction detection for one degree using ITS closed-bar OHLC (identical on any chart TF)
+f_interact(int deg, bool newBar, int bar, int t, float dh, float dl, float dc, float dpc) =>
+    if newBar and array.size(book) > 0
+        for i = 0 to array.size(book) - 1
+            L = array.get(book, i)
+            if L.deg == deg
+                band = L.anchor * bandPct / 100.0
+                top = L.anchor + band
+                bot = L.anchor - band
+                nowIn = dh >= bot and dl <= top
+                rct = band <= 0 ? 0.0 : math.max(math.abs(dh - L.anchor), math.abs(dl - L.anchor)) / band
+                if nowIn and not L.inside
+                    L.entSide := dpc >= L.anchor ? 1 : -1
+                    L.testHi := dh
+                    L.testLo := dl
+                    f_log(L, L.brokenLast ? 4 : 1, bar, t, rct)
+                    L.inside := true
+                else if nowIn and L.inside
+                    L.testHi := math.max(L.testHi, dh)
+                    L.testLo := math.min(L.testLo, dl)
+                else if (not nowIn) and L.inside
+                    exitSide = dc > top ? 1 : dc < bot ? -1 : L.entSide
+                    if exitSide == L.entSide
+                        f_log(L, 2, bar, t, rct)
+                        L.brokenLast := false
+                    else
+                        f_log(L, 3, bar, t, rct)
+                        L.brokenLast := true
+                    L.inside := false
+                    L.testHi := na
+                    L.testLo := na
+
+// ── per-degree HTF data (prior CLOSED bar → non-repainting) ──────────────────
+[ph1, pl1] = request.security(syminfo.tickerid, "60",  [ta.pivothigh(high, pivLen, pivLen), ta.pivotlow(low, pivLen, pivLen)], lookahead=barmerge.lookahead_off)
+[h1, l1, c1, pc1] = request.security(syminfo.tickerid, "60",  [high[1], low[1], close[1], close[2]], lookahead=barmerge.lookahead_on)
+[ph4, pl4] = request.security(syminfo.tickerid, "240", [ta.pivothigh(high, pivLen, pivLen), ta.pivotlow(low, pivLen, pivLen)], lookahead=barmerge.lookahead_off)
+[h4, l4, c4, pc4] = request.security(syminfo.tickerid, "240", [high[1], low[1], close[1], close[2]], lookahead=barmerge.lookahead_on)
+[phd, pld] = request.security(syminfo.tickerid, "D",   [ta.pivothigh(high, pivLen, pivLen), ta.pivotlow(low, pivLen, pivLen)], lookahead=barmerge.lookahead_off)
+[hd, ld, cd, pcd] = request.security(syminfo.tickerid, "D",   [high[1], low[1], close[1], close[2]], lookahead=barmerge.lookahead_on)
+[phw, plw] = request.security(syminfo.tickerid, "W",   [ta.pivothigh(high, pivLen, pivLen), ta.pivotlow(low, pivLen, pivLen)], lookahead=barmerge.lookahead_off)
+[hw, lw, cw, pcw] = request.security(syminfo.tickerid, "W",   [high[1], low[1], close[1], close[2]], lookahead=barmerge.lookahead_on)
+
+n1 = ta.change(time("60"))  != 0
+n4 = ta.change(time("240")) != 0
+nd = ta.change(time("D"))   != 0
+nw = ta.change(time("W"))   != 0
+
+// found anchors from each active degree's confirmed pivots
+if a1H
+    f_found(ph1, 0, bar_index, time)
+    f_found(pl1, 0, bar_index, time)
+if a4H
+    f_found(ph4, 1, bar_index, time)
+    f_found(pl4, 1, bar_index, time)
+if a1D
+    f_found(phd, 2, bar_index, time)
+    f_found(pld, 2, bar_index, time)
+if a1W
+    f_found(phw, 3, bar_index, time)
+    f_found(plw, 3, bar_index, time)
+
+// interactions on each active degree's closed bars
+if a1H
+    f_interact(0, n1, bar_index, time, h1, l1, c1, pc1)
+if a4H
+    f_interact(1, n4, bar_index, time, h4, l4, c4, pc4)
+if a1D
+    f_interact(2, nd, bar_index, time, hd, ld, cd, pcd)
+if a1W
+    f_interact(3, nw, bar_index, time, hw, lw, cw, pcw)
+
+// ── RENDER ───────────────────────────────────────────────────────────────────
+var array<line>  dLine = array.new<line>()
+var array<label> dLab  = array.new<label>()
+var array<box>   dBox  = array.new<box>()
+f_kindTxt(int k) => k == 2 ? "✓ held" : k == 3 ? "✗ break" : k == 4 ? "↻ retest" : "• touch"
+
+if barstate.islast
+    while array.size(dLine) > 0
+        line.delete(array.pop(dLine))
+    while array.size(dLab) > 0
+        label.delete(array.pop(dLab))
+    while array.size(dBox) > 0
+        box.delete(array.pop(dBox))
+    x1 = bar_index - math.min(400, bar_index)
+    x2 = bar_index + extR
+    int naIdx = -1
+    float naD = 1.0e20
+    int nbIdx = -1
+    float nbD = 1.0e20
+    if array.size(book) > 0
+        for i = 0 to array.size(book) - 1
+            a = array.get(book, i).anchor
+            if a >= close and (a - close) < naD
+                naD := a - close
+                naIdx := i
+            if a < close and (close - a) < nbD
+                nbD := close - a
+                nbIdx := i
+    if array.size(book) > 0
+        for i = 0 to array.size(book) - 1
+            L = array.get(book, i)
+            bounces = f_count(L, 2)
+            breaks  = f_count(L, 3)
+            retests = f_count(L, 4)
+            events  = array.size(L.log)
+            live = i == naIdx or i == nbIdx
+            if events >= minShow or live
+                isRes = L.anchor > close
+                col = isRes ? resCol : supCol
+                decided = bounces + breaks
+                band = L.anchor * bandPct / 100.0
+                if L.inside
+                    zt = na(L.testHi) ? L.anchor + band : math.max(L.testHi, L.anchor + band)
+                    zb = na(L.testLo) ? L.anchor - band : math.min(L.testLo, L.anchor - band)
+                    array.push(dBox, box.new(x1, zt, x2, zb, border_color=color.new(zoneCol, 40), bgcolor=color.new(zoneCol, 85), border_width=1))
+                else
+                    array.push(dLine, line.new(x1, L.anchor, x2, L.anchor, color=col, width=live ? 3 : 1, extend=extend.left))
+                if showLbl
+                    bornT = array.size(L.log) > 0 ? array.get(L.log, 0).t : time
+                    string tl = "LEVEL " + str.tostring(L.anchor, format.mintick) + "  [" + f_degTxt(L.deg) + " degree]\n" + (isRes ? "resistance" : "support") + " · born " + str.format_time(bornT, "yyyy-MM-dd") + "\n———————————————\n"
+                    st = math.max(0, array.size(L.log) - 15)
+                    if array.size(L.log) > 0
+                        for e = st to array.size(L.log) - 1
+                            ev = array.get(L.log, e)
+                            tl := tl + str.format_time(ev.t, "yy-MM-dd HH:mm") + "  " + f_kindTxt(ev.kind) + "  (" + str.tostring(ev.react, "#.0") + "×)\n"
+                    wrtxt = decided > 0 ? str.tostring(math.round(bounces / decided * 100)) + "%" : "n/a"
+                    ltag = live ? "◄ LIVE  " : ""
+                    head = ltag + str.tostring(L.anchor, format.mintick) + "  " + f_degTxt(L.deg) + " " + (isRes ? "RES" : "SUP") + "\n" + str.tostring(events) + " ev · " + str.tostring(bounces) + "✓/" + str.tostring(breaks) + "✗ · win " + wrtxt + (retests > 0 ? " · " + str.tostring(retests) + "↻" : "")
+                    array.push(dLab, label.new(x2, L.anchor, head, xloc=xloc.bar_index, style=label.style_label_left, color=color.new(col, live ? 0 : 25), textcolor=color.white, size=f_sz(lblSize), tooltip=tl))
