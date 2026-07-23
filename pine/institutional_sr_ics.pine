@@ -80,8 +80,8 @@ useNY      = input.bool(true, "New York session", group=gSe)
 nySess     = input.session("1300-2100", "New York window", group=gSe)
 
 gN = "Manual Nudge"
-nudgeUp = input.float(0.0, "Nudge nearest line ABOVE price (% )", minval=-3.0, maxval=3.0, step=0.02, group=gN, tooltip="Shifts the closest S/R line above price (the resistance you'd sell into). + moves up, − moves down. % of price so a small notch (0.02–0.10%) visibly lands it on a wick on any instrument.")
-nudgeDn = input.float(0.0, "Nudge nearest line BELOW price (% )", minval=-3.0, maxval=3.0, step=0.02, group=gN, tooltip="Shifts the closest S/R line below price (the support you'd buy at).")
+nudgePrice = input.float(0.0, "Line to nudge — type its price (0 = off)", group=gN, tooltip="Read the price off the line's own label and type it here. The closest line — S/R OR liquidity (⚡) — gets moved. Set back to 0 to disable.")
+nudgeAmt   = input.float(0.0, "Nudge amount (% of price, + up / − down)", minval=-3.0, maxval=3.0, step=0.02, group=gN, tooltip="How far to move that line. Small steps (0.02–0.10%) usually land it on the wick.")
 
 f_size(s) => s == "Tiny" ? size.tiny : s == "Normal" ? size.normal : s == "Large" ? size.large : size.small
 
@@ -522,21 +522,25 @@ if barstate.islast
                     if d < actDist
                         actDist := d
                         actIdx := i
-        // nudge targets: the closest selected line above / below price (what the eye sees)
-        int nUpIdx = -1
-        float nUpD = 1.0e20
-        int nDnIdx = -1
-        float nDnD = 1.0e20
-        if array.size(sel) > 0
+        // nudge target: the single drawn line (S/R snapped OR liquidity cluster) whose
+        // price is closest to the typed nudgePrice. Its exact price is nudgeHitPx.
+        float nudgeHitPx = na
+        if nudgePrice > 0
+            float bd = 1.0e20
             for k = 0 to array.size(sel) - 1
                 i = array.get(sel, k)
-                p = array.get(book, i).price
-                if p > close and (p - close) < nUpD
-                    nUpD := p - close
-                    nUpIdx := i
-                if p < close and (close - p) < nDnD
-                    nDnD := close - p
-                    nDnIdx := i
+                [sp, spt, spc] = f_dolInfo(array.get(book, i).price)
+                d = math.abs(sp - nudgePrice)
+                if d < bd
+                    bd := d
+                    nudgeHitPx := sp
+            if array.size(clPx) > 0
+                for di = 0 to array.size(clPx) - 1
+                    dcp = array.get(clPx, di)
+                    d2 = math.abs(dcp - nudgePrice)
+                    if d2 < bd
+                        bd := d2
+                        nudgeHitPx := dcp
         x1 = bar_index - math.min(400, bar_index)
         x2 = bar_index + extendR
         if array.size(sel) > 0
@@ -552,9 +556,9 @@ if barstate.islast
                 [snapPx, dtag, dcnt] = f_dolInfo(L.price)
                 if dcnt > 0
                     array.push(snapUsed, snapPx)   // dedup uses the un-nudged cluster price
-                // manual % nudge — targets the nearest line above/below price; applies to line AND zone
-                nudgePct = i == nUpIdx ? nudgeUp : i == nDnIdx ? nudgeDn : 0.0
-                off = snapPx * nudgePct / 100.0
+                // manual % nudge — applies only to the line matching the typed price; line AND zone
+                matchN = not na(nudgeHitPx) and snapPx == nudgeHitPx
+                off = matchN ? snapPx * nudgeAmt / 100.0 : 0.0
                 drawPx = snapPx + off
                 col = drawPx > close ? resCol : supCol
                 if drawPx > close
@@ -594,18 +598,21 @@ if barstate.islast
                             repD := true
                             break
                 if not repD
-                    above = dpx > close
+                    // manual nudge if THIS liquidity line matches the typed price
+                    dmatch = not na(nudgeHitPx) and dpx == nudgeHitPx
+                    dDraw = dpx + (dmatch ? dpx * nudgeAmt / 100.0 : 0.0)
+                    above = dDraw > close
                     barrier = dolEmph and ((bDir < 0 and above) or (bDir > 0 and not above))
                     dcol = above ? colCeil : colFloor
                     ccnt = array.get(clCnt, di)
                     dlw = barrier ? 2 : 1
                     dstyle = barrier ? line.style_solid : line.style_dotted
-                    array.push(dLine, line.new(x1, dpx, x2, dpx, color=color.new(dcol, barrier ? 0 : 45), width=dlw, extend=extend.left, style=dstyle))
+                    array.push(dLine, line.new(x1, dDraw, x2, dDraw, color=color.new(dcol, barrier ? 0 : 45), width=dlw, extend=extend.left, style=dstyle))
                     if showLbl
                         btag = barrier ? (above ? "🔒 " : "🛡 ") : ""
                         xtag = ccnt > 1 ? "×" + str.tostring(ccnt) + " " : ""
                         ntag = array.get(clNk, di) ? " (naked)" : ""
-                        array.push(dLab, label.new(x2, dpx, btag + "⚡" + xtag + array.get(clTag, di) + " " + str.tostring(dpx, format.mintick) + ntag, xloc=xloc.bar_index, style=label.style_label_left, color=color.new(dcol, 35), textcolor=color.white, size=f_size(lblSizeS)))
+                        array.push(dLab, label.new(x2, dDraw, btag + "⚡" + xtag + array.get(clTag, di) + " " + str.tostring(dDraw, format.mintick) + ntag, xloc=xloc.bar_index, style=label.style_label_left, color=color.new(dcol, 35), textcolor=color.white, size=f_size(lblSizeS)))
 
     if showPanel
         act = (bDir > 0 and not inPrem) ? "BUY zone" : (bDir < 0 and inPrem) ? "SELL zone" : (bDir > 0 and inPrem) ? "BUY (wait pullback)" : (bDir < 0 and not inPrem) ? "SELL (wait pop)" : "WAIT / no bias"
