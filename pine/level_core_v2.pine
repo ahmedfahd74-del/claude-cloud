@@ -29,6 +29,7 @@ use1W = input.bool(true, "1W levels", group=gG)
 gC = "Confidence Scoring (institutional)"
 minConf   = input.float(0.0, "Min confidence to show (LIVE always shows)", minval=0.0, maxval=100.0, step=5.0, group=gC)
 topN      = input.int(3, "★ Star the strongest N levels", minval=0, maxval=20, group=gC)
+showAudit = input.bool(true, "Show confidence AUDIT breakdown (★ levels, on hover)", group=gC)
 decayBars = input.float(150.0, "Strength half-life (bars) — older interactions fade", minval=10.0, maxval=5000.0, group=gC)
 sepNorm   = input.float(20.0, "Touch separation norm (bars) — clustered = penalised", minval=1.0, maxval=500.0, group=gC)
 dispNorm  = input.float(2.0, "ATR displacement for full credit (band-units)", minval=0.5, maxval=10.0, step=0.5, group=gC)
@@ -170,18 +171,27 @@ f_separation(Lvl L) =>
         s := math.min(avgGap / sepNorm, 1.0)
     s
 
-// institutional confidence 0..100: recency-decayed blend of win rate, rejection
-// quality, ATR displacement, sweep, separation, evidence — × degree/proximity weight
-f_confidence(Lvl L) =>
+// SINGLE SOURCE of the score AND its audit breakdown. Returns:
+// [conf, winF, rejF, dispF, sweepF, sepF, evidF, degW, nEv, avgW, held, brk]
+// avgW = average recency weight (the decay indicator: 1 = all fresh, →0 = old).
+f_audit(Lvl L) =>
     n = array.size(L.log)
     float conf = 0.0
+    float winF = 0.5
+    float rejF = 0.0
+    float dispF = 0.0
+    float sweepF = 0.0
+    float sepF = 1.0
+    float evidF = 0.0
+    float avgW = 0.0
+    int held = 0
+    int brk = 0
+    float degW = L.deg == 3 ? 1.0 : L.deg == 2 ? 0.85 : L.deg == 1 ? 0.70 : 0.55
     if n > 0
         float wsum = 0.0
         float rejW = 0.0
         float dispW = 0.0
         float sweepW = 0.0
-        int held = 0
-        int brk = 0
         for i = 0 to n - 1
             ev = array.get(L.log, i)
             age = math.max(0, bar_index - ev.bar)
@@ -195,17 +205,25 @@ f_confidence(Lvl L) =>
                 held := held + 1
             if ev.kind == 3
                 brk := brk + 1
-        winF   = (held + brk) > 0 ? held / (held + brk) : 0.5
-        rejF   = wsum > 0 ? rejW / wsum : 0.0
-        dispF  = wsum > 0 ? dispW / wsum : 0.0
-        sweepF = wsum > 0 ? math.min(sweepW / wsum * 2.0, 1.0) : 0.0
-        sepF   = f_separation(L)
-        evidF  = math.min(wsum / evidNorm, 1.0)
-        degW   = L.deg == 3 ? 1.0 : L.deg == 2 ? 0.85 : L.deg == 1 ? 0.70 : 0.55
+        winF   := (held + brk) > 0 ? held / (held + brk) : 0.5
+        rejF   := wsum > 0 ? rejW / wsum : 0.0
+        dispF  := wsum > 0 ? dispW / wsum : 0.0
+        sweepF := wsum > 0 ? math.min(sweepW / wsum * 2.0, 1.0) : 0.0
+        sepF   := f_separation(L)
+        evidF  := math.min(wsum / evidNorm, 1.0)
+        avgW   := wsum / n
         wtot   = wWin + wRej + wDisp + wSweep + wSep + wEvid
         raw    = wtot > 0 ? (winF*wWin + rejF*wRej + dispF*wDisp + sweepF*wSweep + sepF*wSep + evidF*wEvid) / wtot : 0.0
-        conf := math.min(math.max(raw * degW * 100.0, 0.0), 100.0)
-    conf
+        conf   := math.min(math.max(raw * degW * 100.0, 0.0), 100.0)
+    [conf, winF, rejF, dispF, sweepF, sepF, evidF, degW, n, avgW, held, brk]
+
+// score only (thin wrapper over the single source)
+f_conf(Lvl L) =>
+    [cf, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11] = f_audit(L)
+    cf
+
+// point-contribution of one component to the final confidence (they sum to CONF)
+f_pts(float f, float w, float wtot, float dg) => wtot > 0 ? f * w / wtot * dg * 100.0 : 0.0
 
 // ── per-degree HTF data (prior CLOSED bar → non-repainting) ──────────────────
 [ph1, pl1] = request.security(syminfo.tickerid, "60",  [ta.pivothigh(high, pivLen, pivLen), ta.pivotlow(low, pivLen, pivLen)], lookahead=barmerge.lookahead_off)
@@ -279,7 +297,7 @@ if barstate.islast
     if topN > 0 and array.size(book) > 0
         confs = array.new_float()
         for i = 0 to array.size(book) - 1
-            array.push(confs, f_confidence(array.get(book, i)))
+            array.push(confs, f_conf(array.get(book, i)))
         array.sort(confs, order.descending)
         idx = math.min(topN, array.size(confs)) - 1
         if idx >= 0
@@ -292,7 +310,7 @@ if barstate.islast
             retests = f_count(L, 4)
             events  = array.size(L.log)
             live = i == naIdx or i == nbIdx
-            conf = f_confidence(L)
+            [conf, winF, rejF, dispF, sweepF, sepF, evidF, degW, nEv, avgW, held, brk] = f_audit(L)
             starred = topN > 0 and conf >= starThr
             if (conf >= minConf or live) and (events >= minShow or live)
                 isRes = L.anchor > close
@@ -314,6 +332,20 @@ if barstate.islast
                             ev = array.get(L.log, e)
                             tl := tl + str.format_time(ev.t, "yy-MM-dd HH:mm") + "  " + f_kindTxt(ev.kind) + "  (" + str.tostring(ev.react, "#.0") + "×)\n"
                     wrtxt = decided > 0 ? str.tostring(math.round(bounces / decided * 100)) + "%" : "n/a"
+                    // AUDIT breakdown (★ levels): every component's point-contribution, summing to CONF
+                    if showAudit and starred
+                        wtot = wWin + wRej + wDisp + wSweep + wSep + wEvid
+                        qual = math.round(nEv * sepF)
+                        tl := tl + "———— AUDIT · CONF " + str.tostring(math.round(conf)) + " ————\n"
+                        tl := tl + "qualified touches: " + str.tostring(qual) + " of " + str.tostring(nEv) + "  (sep ×" + str.tostring(sepF, "#.00") + ")\n"
+                        tl := tl + "win rate      " + str.tostring(math.round(winF * 100)) + "%  → +" + str.tostring(f_pts(winF, wWin, wtot, degW), "#.0") + "\n"
+                        tl := tl + "rejection     " + str.tostring(rejF, "#.00") + "  → +" + str.tostring(f_pts(rejF, wRej, wtot, degW), "#.0") + "\n"
+                        tl := tl + "displacement  " + str.tostring(dispF, "#.00") + "  → +" + str.tostring(f_pts(dispF, wDisp, wtot, degW), "#.0") + "\n"
+                        tl := tl + "sweep         " + str.tostring(sweepF, "#.00") + "  → +" + str.tostring(f_pts(sweepF, wSweep, wtot, degW), "#.0") + "\n"
+                        tl := tl + "separation    " + str.tostring(sepF, "#.00") + "  → +" + str.tostring(f_pts(sepF, wSep, wtot, degW), "#.0") + "\n"
+                        tl := tl + "evidence      " + str.tostring(evidF, "#.00") + "  → +" + str.tostring(f_pts(evidF, wEvid, wtot, degW), "#.0") + "\n"
+                        tl := tl + "decay avg-weight " + str.tostring(avgW, "#.00") + " (older events discounted)\n"
+                        tl := tl + "timeframe " + f_degTxt(L.deg) + "  × " + str.tostring(degW, "#.00") + "\n"
                     ltag = (starred ? "★ " : "") + (live ? "◄ LIVE  " : "")
                     head = ltag + str.tostring(L.anchor, format.mintick) + "  " + f_degTxt(L.deg) + " " + (isRes ? "RES" : "SUP") + "  ·  CONF " + str.tostring(math.round(conf)) + "\n" + str.tostring(events) + " ev · " + str.tostring(bounces) + "✓/" + str.tostring(breaks) + "✗ · win " + wrtxt + (retests > 0 ? " · " + str.tostring(retests) + "↻" : "")
                     array.push(dLab, label.new(x2, L.anchor, head, xloc=xloc.bar_index, style=label.style_label_left, color=color.new(col, live ? 0 : 25), textcolor=color.white, size=f_sz(lblSize), tooltip=tl))
