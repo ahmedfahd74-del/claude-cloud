@@ -157,6 +157,7 @@ f_interact(int deg, bool newBar, int bar, int t, float dh, float dl, float dc, f
                     L.inside := false
                     L.testHi := na
                     L.testLo := na
+                array.set(book, i, L)   // void terminator: keeps the branchy if in statement position (avoids CE10235)
 
 // ── SCORING LAYER — every factor is a pure reduction over the event log ──────
 // touch separation: reward interactions spread over time, penalise clustered ones
