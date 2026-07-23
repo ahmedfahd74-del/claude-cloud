@@ -1,30 +1,33 @@
 #!/usr/bin/env python3
-"""Merge-module validator for level_core_v2.pine. Reproduces the greedy confluence
-clustering and proves: deterministic, no level lost, strength reducible from members."""
+"""Merge validator for level_core_v2.pine (inline rule, crash-proof — no parallel arrays).
+A level is ABSORBED if a stronger candidate sits within the merge band; otherwise it is
+the cluster's representative line. Strength = conf + bonus*(neighbours-1)."""
 mergeBandPct=0.80; conflBonus=6.0
-def cluster(anchors, confs):
-    n=len(anchors); cid=[-1]*n; nid=0
+def render(anchors, confs):
+    n=len(anchors); shown=[]
     for i in range(n):
-        if cid[i]==-1:
-            seed=anchors[i]; mb=seed*mergeBandPct/100; cid[i]=nid
-            for j in range(i+1,n):
-                if cid[j]==-1 and abs(anchors[j]-seed)<=mb: cid[j]=nid
-            nid+=1
-    cl={}
-    for id in range(nid):
-        mem=[i for i in range(n) if cid[i]==id]; rep=max(mem,key=lambda i:confs[i])
-        cl[id]={'members':mem,'rep':rep,'n':len(mem),
-                'top':max(anchors[i] for i in mem),'bot':min(anchors[i] for i in mem),
-                'str':min(100,confs[rep]+conflBonus*(len(mem)-1))}
-    return cid,cl
+        band=anchors[i]*mergeBandPct/100; cl=1; merged=False
+        for k in range(n):
+            if k!=i and abs(anchors[k]-anchors[i])<=band:
+                cl+=1
+                if confs[k]>confs[i] or (confs[k]==confs[i] and k<i):
+                    merged=True
+        if not merged:
+            shown.append((anchors[i], min(100,confs[i]+conflBonus*(cl-1)), cl))
+    return shown
 if __name__=="__main__":
-    anchors=[201.0,200.4,199.8,197.0,183.0,182.4,168.0]; confs=[62,58,70,40,66,30,45]
-    cid,cl=cluster(anchors,confs)
-    allmem=sorted(sum((c['members'] for c in cl.values()),[]))
-    assert allmem==list(range(len(anchors)))              # no level lost / double-counted
-    assert cluster(anchors,confs)[0]==cid                  # deterministic
-    for c in cl.values():
-        assert abs(c['str']-min(100,confs[c['rep']]+conflBonus*(c['n']-1)))<1e-9  # reducible
-    big=[c for c in cl.values() if c['n']>=3][0]
-    print(f"200-stack -> 1 zone {big['bot']}-{big['top']} STR {big['str']}; {len(cl)} clusters total")
-    print("MERGE VALIDATED: deterministic, every level in one cluster, strength reducible from members")
+    anchors=[201.0,200.4,199.8,197.0,183.0,182.4,168.0]
+    confs  =[62,   58,   70,   40,   66,   30,   45]
+    shown=render(anchors,confs)
+    print("shown lines (anchor, STR, clustered):")
+    for a,s,c in shown: print(f"  {a}  STR {s}  ×{c}")
+    # 200-stack (201/200.4/199.8) -> only the strongest (199.8, conf70) survives as a line
+    stack=[s for s in shown if abs(s[0]-200)<1.5]
+    assert len(stack)==1 and stack[0][0]==199.8, "200-stack should collapse to the strongest line"
+    assert stack[0][1]==70+conflBonus*2, "strength = strongest + bonus*(n-1)"
+    # deterministic
+    assert render(anchors,confs)==shown
+    # isolated 197 still shows on its own
+    assert any(abs(a-197)<0.01 for a,_,_ in shown)
+    print("\nMERGE (inline) VALIDATED: 200-stack -> 1 strongest line (STR", stack[0][1],
+          "), isolated levels kept, deterministic, no parallel arrays (crash-proof)")
