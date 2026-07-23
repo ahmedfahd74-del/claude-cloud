@@ -70,6 +70,13 @@ showStats  = input.bool(true, "Show event stats line", group=gLb)
 showDegTag = input.bool(true, "Show degree tag", group=gLb)
 lblOp      = input.int(20, "Label background transparency", minval=0, maxval=100, group=gLb)
 
+gM = "Confluence Merge (liquidity zones)"
+mergeOn      = input.bool(true, "Merge clustered levels into one zone", group=gM, tooltip="OFF = every level shows as its own line. ON = nearby levels (a liquidity shelf) collapse into a single zone with combined strength. Underlying levels & memory are preserved.")
+mergeBandPct = input.float(0.80, "Merge band (% of price)", minval=0.05, maxval=10.0, step=0.05, group=gM)
+conflBonus   = input.float(6.0, "Confluence bonus per extra level (strength)", minval=0.0, maxval=30.0, step=1.0, group=gM)
+mergeCol     = input.color(#ff9800, "Liquidity-zone fill", group=gM)
+mergeOp      = input.int(80, "Liquidity-zone transparency", minval=0, maxval=100, group=gM)
+
 f_sz(s) => s == "Tiny" ? size.tiny : s == "Normal" ? size.normal : size.small
 f_degTxt(int d) => d == 0 ? "1H" : d == 1 ? "4H" : d == 2 ? "1D" : "1W"
 f_lstyle(s) => s == "Dashed" ? line.style_dashed : s == "Dotted" ? line.style_dotted : line.style_solid
@@ -326,8 +333,74 @@ if barstate.islast
         idx = math.min(topN, array.size(confs)) - 1
         if idx >= 0
             starThr := array.get(confs, idx)
+    // ── CONFLUENCE MERGE pre-pass: cluster candidate levels by price proximity ──
+    n = array.size(book)
+    cid      = array.new_int(n, -1)     // cluster id per level (-1 = not a candidate)
+    absorbed = array.new_bool(n, false) // non-representative member of a merged cluster
+    isRep    = array.new_bool(n, false) // representative (strongest) of a >1 cluster
+    cluTop   = array.new_float(n, na)
+    cluBot   = array.new_float(n, na)
+    cluN     = array.new_int(n, 1)
+    cluStr   = array.new_float(n, 0.0)
+    cluHeld  = array.new_int(n, 0)
+    cluBrk   = array.new_int(n, 0)
+    cluTouch = array.new_int(n, 0)
+    if mergeOn and n > 0
+        candc = array.new_float(n, na)
+        for i = 0 to n - 1
+            L = array.get(book, i)
+            ci = f_conf(L)
+            livei = i == naIdx or i == nbIdx
+            if (ci >= minConf or livei) and (array.size(L.log) >= minShow or livei)
+                array.set(candc, i, ci)
+        nid = 0
+        for i = 0 to n - 1
+            if not na(array.get(candc, i)) and array.get(cid, i) == -1
+                seed = array.get(book, i).anchor
+                mb = seed * mergeBandPct / 100.0
+                array.set(cid, i, nid)
+                for j = i + 1 to n - 1
+                    if not na(array.get(candc, j)) and array.get(cid, j) == -1 and math.abs(array.get(book, j).anchor - seed) <= mb
+                        array.set(cid, j, nid)
+                nid := nid + 1
+        for id = 0 to nid - 1
+            int rep = -1
+            float bestc = -1.0
+            float top = na
+            float bot = na
+            int cnt = 0
+            int hh = 0
+            int bb = 0
+            int tt = 0
+            for i = 0 to n - 1
+                if array.get(cid, i) == id
+                    cnt := cnt + 1
+                    a = array.get(book, i).anchor
+                    top := na(top) ? a : math.max(top, a)
+                    bot := na(bot) ? a : math.min(bot, a)
+                    ci = array.get(candc, i)
+                    if ci > bestc
+                        bestc := ci
+                        rep := i
+                    hh := hh + f_count(array.get(book, i), 2)
+                    bb := bb + f_count(array.get(book, i), 3)
+                    tt := tt + f_count(array.get(book, i), 1) + f_count(array.get(book, i), 4)
+            if rep >= 0 and cnt > 1
+                array.set(isRep, rep, true)
+                array.set(cluTop, rep, top)
+                array.set(cluBot, rep, bot)
+                array.set(cluN, rep, cnt)
+                array.set(cluStr, rep, math.min(100.0, bestc + conflBonus * (cnt - 1)))
+                array.set(cluHeld, rep, hh)
+                array.set(cluBrk, rep, bb)
+                array.set(cluTouch, rep, tt)
+                for i = 0 to n - 1
+                    if array.get(cid, i) == id and i != rep
+                        array.set(absorbed, i, true)
     if array.size(book) > 0
         for i = 0 to array.size(book) - 1
+            if mergeOn and array.get(absorbed, i)
+                continue
             L = array.get(book, i)
             bounces = f_count(L, 2)
             breaks  = f_count(L, 3)
@@ -337,6 +410,30 @@ if barstate.islast
             [conf, winF, rejF, dispF, sweepF, sepF, evidF, degW, nEv, avgW, held, brk] = f_audit(L)
             starred = topN > 0 and conf >= starThr
             if (conf >= minConf or live) and (events >= minShow or live)
+                // MERGED liquidity zone (representative of a >1 cluster)
+                if mergeOn and array.get(isRep, i)
+                    ztop = array.get(cluTop, i)
+                    zbot = array.get(cluBot, i)
+                    ccnt = array.get(cluN, i)
+                    strg = array.get(cluStr, i)
+                    hh = array.get(cluHeld, i)
+                    bb = array.get(cluBrk, i)
+                    tt = array.get(cluTouch, i)
+                    wr = (hh + bb) > 0 ? math.round(hh / (hh + bb) * 100) : -1
+                    array.push(dBox, box.new(x1, ztop, x2, zbot, border_color=color.new(mergeCol, 30), bgcolor=color.new(mergeCol, mergeOp), border_width=1))
+                    if showLbl
+                        string mtl = "⧉ CONFLUENCE ZONE — " + str.tostring(ccnt) + " levels merged\n" + str.tostring(zbot, format.mintick) + " – " + str.tostring(ztop, format.mintick) + "\n———————————————\n"
+                        for j = 0 to n - 1
+                            if array.get(cid, j) == array.get(cid, i)
+                                Lj = array.get(book, j)
+                                mtl := mtl + str.tostring(Lj.anchor, format.mintick) + "  " + f_degTxt(Lj.deg) + " · CONF " + str.tostring(math.round(f_conf(Lj))) + " · " + str.tostring(array.size(Lj.log)) + " ev\n"
+                        mtl := mtl + "———————————————\nSTR " + str.tostring(math.round(strg)) + " = strongest + " + str.tostring(conflBonus, "#.0") + "×" + str.tostring(ccnt - 1) + " confluence"
+                        mConfPart = showConf ? "  · STR " + str.tostring(math.round(strg)) : ""
+                        mhead = "⧉ ZONE " + str.tostring(zbot, format.mintick) + "–" + str.tostring(ztop, format.mintick) + mConfPart + "\n" + str.tostring(ccnt) + " levels · " + str.tostring(tt) + " touch · win " + (wr < 0 ? "n/a" : str.tostring(wr) + "%")
+                        mlblX = lblSide == "Left" ? x1 : x2
+                        mlblStyle = lblSide == "Left" ? label.style_label_right : label.style_label_left
+                        array.push(dLab, label.new(mlblX, (ztop + zbot) / 2.0, mhead, xloc=xloc.bar_index, style=mlblStyle, color=color.new(mergeCol, lblOp), textcolor=color.white, size=f_sz(lblSize), tooltip=mtl))
+                    continue
                 isRes = L.anchor > close
                 col = colByDeg ? f_degCol(L.deg) : (isRes ? resCol : supCol)
                 decided = bounces + breaks
