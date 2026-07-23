@@ -80,8 +80,8 @@ useNY      = input.bool(true, "New York session", group=gSe)
 nySess     = input.session("1300-2100", "New York window", group=gSe)
 
 gN = "Manual Nudge"
-nudge1 = input.float(0.0, "Nudge strongest line (% of price)", minval=-3.0, maxval=3.0, step=0.02, group=gN, tooltip="Shift the #1 (highest-ICS) line up/down by this % of price to sit it on a wick instead of through a body. Small steps (0.02–0.10%) are usually enough. % is used (not raw ticks) so a notch actually moves visibly on any instrument.")
-nudge2 = input.float(0.0, "Nudge 2nd line (% of price)", minval=-3.0, maxval=3.0, step=0.02, group=gN)
+nudgeUp = input.float(0.0, "Nudge nearest line ABOVE price (% )", minval=-3.0, maxval=3.0, step=0.02, group=gN, tooltip="Shifts the closest S/R line above price (the resistance you'd sell into). + moves up, − moves down. % of price so a small notch (0.02–0.10%) visibly lands it on a wick on any instrument.")
+nudgeDn = input.float(0.0, "Nudge nearest line BELOW price (% )", minval=-3.0, maxval=3.0, step=0.02, group=gN, tooltip="Shifts the closest S/R line below price (the support you'd buy at).")
 
 f_size(s) => s == "Tiny" ? size.tiny : s == "Normal" ? size.normal : s == "Large" ? size.large : size.small
 
@@ -522,6 +522,21 @@ if barstate.islast
                     if d < actDist
                         actDist := d
                         actIdx := i
+        // nudge targets: the closest selected line above / below price (what the eye sees)
+        int nUpIdx = -1
+        float nUpD = 1.0e20
+        int nDnIdx = -1
+        float nDnD = 1.0e20
+        if array.size(sel) > 0
+            for k = 0 to array.size(sel) - 1
+                i = array.get(sel, k)
+                p = array.get(book, i).price
+                if p > close and (p - close) < nUpD
+                    nUpD := p - close
+                    nUpIdx := i
+                if p < close and (close - p) < nDnD
+                    nDnD := close - p
+                    nDnIdx := i
         x1 = bar_index - math.min(400, bar_index)
         x2 = bar_index + extendR
         if array.size(sel) > 0
@@ -537,8 +552,8 @@ if barstate.islast
                 [snapPx, dtag, dcnt] = f_dolInfo(L.price)
                 if dcnt > 0
                     array.push(snapUsed, snapPx)   // dedup uses the un-nudged cluster price
-                // manual % nudge for the top two (rank-ordered by ICS); applies to line AND zone
-                nudgePct = k == 0 ? nudge1 : k == 1 ? nudge2 : 0.0
+                // manual % nudge — targets the nearest line above/below price; applies to line AND zone
+                nudgePct = i == nUpIdx ? nudgeUp : i == nDnIdx ? nudgeDn : 0.0
                 off = snapPx * nudgePct / 100.0
                 drawPx = snapPx + off
                 col = drawPx > close ? resCol : supCol
