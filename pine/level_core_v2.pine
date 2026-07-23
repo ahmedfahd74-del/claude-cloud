@@ -41,16 +41,40 @@ wSweep = input.float(0.12, "Weight: liquidity sweep before reaction", minval=0.0
 wSep   = input.float(0.12, "Weight: touch separation (anti-cluster)", minval=0.0, maxval=1.0, step=0.02, group=gC)
 wEvid  = input.float(0.12, "Weight: evidence (# recent interactions)", minval=0.0, maxval=1.0, step=0.02, group=gC)
 
-gS = "Style"
-resCol  = input.color(#ef5350, "Resistance", group=gS)
-supCol  = input.color(#26a69a, "Support", group=gS)
-zoneCol = input.color(#ffd24a, "Active zone", group=gS)
-extR    = input.int(30, "Extend right (bars)", minval=0, maxval=200, group=gS)
-showLbl = input.bool(true, "Show labels", group=gS)
-lblSize = input.string("Small", "Label size", options=["Tiny", "Small", "Normal"], group=gS)
+gLn = "Appearance — Lines"
+lineStyleIn = input.string("Solid", "Line style", options=["Solid", "Dashed", "Dotted"], group=gLn)
+lineWidth   = input.int(1, "Line width", minval=1, maxval=6, group=gLn)
+emphWidth   = input.int(3, "LIVE / ★ line width", minval=1, maxval=8, group=gLn)
+colByDeg    = input.bool(false, "Color lines by degree (TF) instead of R/S", group=gLn)
+resCol  = input.color(#ef5350, "Resistance", group=gLn)
+supCol  = input.color(#26a69a, "Support", group=gLn)
+c1Hcol  = input.color(#787b86, "1H colour (degree mode)", group=gLn)
+c4Hcol  = input.color(#42bda8, "4H colour (degree mode)", group=gLn)
+c1Dcol  = input.color(#5b9cf6, "1D colour (degree mode)", group=gLn)
+c1Wcol  = input.color(#c07cff, "1W colour (degree mode)", group=gLn)
+extMode = input.string("Left", "Extend", options=["Left", "Right", "Both", "None"], group=gLn)
+extR    = input.int(30, "Extend right (bars)", minval=0, maxval=200, group=gLn)
+
+gZ = "Appearance — Active Zone"
+showActiveZone = input.bool(true, "Active zone ON  (OFF → show the line instead)", group=gZ, tooltip="When a level is being touched it expands into a zone. Turn OFF to keep it as a plain regional line at all times.")
+zoneCol  = input.color(#ffd24a, "Zone fill", group=gZ)
+zoneOp   = input.int(85, "Zone fill transparency", minval=0, maxval=100, group=gZ)
+zoneBord = input.int(1, "Zone border width", minval=0, maxval=4, group=gZ)
+
+gLb = "Appearance — Labels"
+showLbl    = input.bool(true, "Show labels", group=gLb)
+lblSize    = input.string("Small", "Label size", options=["Tiny", "Small", "Normal"], group=gLb)
+lblSide    = input.string("Right", "Label side", options=["Right", "Left"], group=gLb)
+showConf   = input.bool(true, "Show CONF in label", group=gLb)
+showStats  = input.bool(true, "Show event stats line", group=gLb)
+showDegTag = input.bool(true, "Show degree tag", group=gLb)
+lblOp      = input.int(20, "Label background transparency", minval=0, maxval=100, group=gLb)
 
 f_sz(s) => s == "Tiny" ? size.tiny : s == "Normal" ? size.normal : size.small
 f_degTxt(int d) => d == 0 ? "1H" : d == 1 ? "4H" : d == 2 ? "1D" : "1W"
+f_lstyle(s) => s == "Dashed" ? line.style_dashed : s == "Dotted" ? line.style_dotted : line.style_solid
+f_ext(s) => s == "Right" ? extend.right : s == "Both" ? extend.both : s == "None" ? extend.none : extend.left
+f_degCol(int d) => d == 0 ? c1Hcol : d == 1 ? c4Hcol : d == 2 ? c1Dcol : c1Wcol
 
 // a degree is active only if its timeframe is ≥ the chart timeframe
 chartSec = timeframe.in_seconds(timeframe.period)
@@ -314,15 +338,16 @@ if barstate.islast
             starred = topN > 0 and conf >= starThr
             if (conf >= minConf or live) and (events >= minShow or live)
                 isRes = L.anchor > close
-                col = isRes ? resCol : supCol
+                col = colByDeg ? f_degCol(L.deg) : (isRes ? resCol : supCol)
                 decided = bounces + breaks
                 band = L.anchor * bandPct / 100.0
-                if L.inside
+                lw = (live or starred) ? emphWidth : lineWidth
+                if L.inside and showActiveZone
                     zt = na(L.testHi) ? L.anchor + band : math.max(L.testHi, L.anchor + band)
                     zb = na(L.testLo) ? L.anchor - band : math.min(L.testLo, L.anchor - band)
-                    array.push(dBox, box.new(x1, zt, x2, zb, border_color=color.new(zoneCol, 40), bgcolor=color.new(zoneCol, 85), border_width=1))
+                    array.push(dBox, box.new(x1, zt, x2, zb, border_color=zoneBord > 0 ? color.new(zoneCol, 40) : color.new(zoneCol, 100), bgcolor=color.new(zoneCol, zoneOp), border_width=zoneBord))
                 else
-                    array.push(dLine, line.new(x1, L.anchor, x2, L.anchor, color=col, width=(live or starred) ? 3 : 1, extend=extend.left))
+                    array.push(dLine, line.new(x1, L.anchor, x2, L.anchor, color=col, width=lw, extend=f_ext(extMode), style=f_lstyle(lineStyleIn)))
                 if showLbl
                     bornT = array.size(L.log) > 0 ? array.get(L.log, 0).t : time
                     string tl = "LEVEL " + str.tostring(L.anchor, format.mintick) + "  [" + f_degTxt(L.deg) + " degree]\n" + (isRes ? "resistance" : "support") + " · born " + str.format_time(bornT, "yyyy-MM-dd") + "\n———————————————\n"
@@ -347,5 +372,10 @@ if barstate.islast
                         tl := tl + "decay avg-weight " + str.tostring(avgW, "#.00") + " (older events discounted)\n"
                         tl := tl + "timeframe " + f_degTxt(L.deg) + "  × " + str.tostring(degW, "#.00") + "\n"
                     ltag = (starred ? "★ " : "") + (live ? "◄ LIVE  " : "")
-                    head = ltag + str.tostring(L.anchor, format.mintick) + "  " + f_degTxt(L.deg) + " " + (isRes ? "RES" : "SUP") + "  ·  CONF " + str.tostring(math.round(conf)) + "\n" + str.tostring(events) + " ev · " + str.tostring(bounces) + "✓/" + str.tostring(breaks) + "✗ · win " + wrtxt + (retests > 0 ? " · " + str.tostring(retests) + "↻" : "")
-                    array.push(dLab, label.new(x2, L.anchor, head, xloc=xloc.bar_index, style=label.style_label_left, color=color.new(col, live ? 0 : 25), textcolor=color.white, size=f_sz(lblSize), tooltip=tl))
+                    degPart  = showDegTag ? "  " + f_degTxt(L.deg) : ""
+                    confPart = showConf ? "  ·  CONF " + str.tostring(math.round(conf)) : ""
+                    statLine = showStats ? "\n" + str.tostring(events) + " ev · " + str.tostring(bounces) + "✓/" + str.tostring(breaks) + "✗ · win " + wrtxt + (retests > 0 ? " · " + str.tostring(retests) + "↻" : "") : ""
+                    head = ltag + str.tostring(L.anchor, format.mintick) + degPart + " " + (isRes ? "RES" : "SUP") + confPart + statLine
+                    lblX = lblSide == "Left" ? x1 : x2
+                    lblStyle = lblSide == "Left" ? label.style_label_right : label.style_label_left
+                    array.push(dLab, label.new(lblX, L.anchor, head, xloc=xloc.bar_index, style=lblStyle, color=color.new(col, live ? 0 : lblOp), textcolor=color.white, size=f_sz(lblSize), tooltip=tl))
