@@ -14,7 +14,7 @@ indicator("MS-Core v1.1 [Market Structure]", shorttitle="MS-Core", overlay=true,
 
 // ── INPUTS ─────────────────────────────────────────────────────────────────
 gS = "Structure"
-swL        = input.int(5, "Swing Size (fractal L/R, bigger = major only)", minval=1, maxval=50, group=gS)
+swL        = input.int(5, "Label Swing Size (HH/HL/LH/LL + BOS/CHoCH visuals only — NEVER affects bias)", minval=1, maxval=50, group=gS)
 swingSrc   = input.string("Wick (high/low)", "Swing source  [Wick = institutional]", options=["Wick (high/low)", "Candle close"], group=gS, tooltip="Wick = swings sit at the real high/low where liquidity rests (recommended). Candle close = swings sit at closes (laggier). Break is always confirmed on close either way.")
 showSwings = input.bool(true, "Show HH / HL / LH / LL", group=gS)
 showStruct = input.bool(true, "Show BOS / CHoCH", group=gS)
@@ -23,7 +23,7 @@ lblSize    = input.string("Small", "Label size", options=["Tiny", "Small", "Norm
 
 gM = "MTF Bias Cascade"
 showTable  = input.bool(true, "Show bias table (W / D / 4H / 1H)", group=gM)
-mtfSwing   = input.int(5, "MTF Swing Size (per-TF fractal L/R)", minval=1, maxval=50, group=gM)
+mtfSwing   = input.int(5, "Bias Swing Size (shared by Chart + ALL MTF bias rows)", minval=1, maxval=50, group=gM, tooltip="One swing size drives every bias reading (Chart, 1W, 1D, 4H, 1H) so they can never disagree with each other. Label Swing Size (Structure group) controls the drawn labels only and does NOT affect bias.")
 tblPos     = input.string("Top Right", "Table position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=gM)
 
 gC = "Colors"
@@ -76,6 +76,9 @@ f_structPrev() =>
 [dB,  dPH,  dPL,  dHC,  dLC ] = request.security(syminfo.tickerid, "D",   f_structPrev(), lookahead=barmerge.lookahead_on)
 [h4B, h4PH, h4PL, h4HC, h4LC] = request.security(syminfo.tickerid, "240", f_structPrev(), lookahead=barmerge.lookahead_on)
 [h1B, h1PH, h1PL, h1HC, h1LC] = request.security(syminfo.tickerid, "60",  f_structPrev(), lookahead=barmerge.lookahead_on)
+// Chart row = SAME shared classifier on the chart's own timeframe → on any TF it is
+// byte-identical to that TF's MTF row (both use Bias Swing Size, both non-repaint).
+[cB,  cPH,  cPL,  cHC,  cLC ] = request.security(syminfo.tickerid, timeframe.period, f_structPrev(), lookahead=barmerge.lookahead_on)
 
 f_hiTxt(int hc) => hc == 1 ? "HH" : hc == -1 ? "LH" : "—"
 f_loTxt(int lc) => lc == 1 ? "HL" : lc == -1 ? "LL" : "—"
@@ -102,15 +105,12 @@ var int   upRefb   = na
 var float dnRef    = na    // protected low: break DOWN below = bearish event
 var int   dnRefb   = na
 
-// chart-TF label classes — the ONE source both the drawn labels and the table's
-// "Chart" row read from (classification always runs, labels are just its display)
-var int chHiCls = 0    // 1 = HH, -1 = LH
-var int chLoCls = 0    // 1 = HL, -1 = LL
+// Labels below use LABEL Swing Size and are DISPLAY ONLY — they never feed bias.
+// (The Chart bias row is the cB reading from the shared Bias Swing Size classifier.)
 
-// New confirmed pivot HIGH → classify HH/LH (label = display of that class)
+// New confirmed pivot HIGH → HH/LH label (display only)
 if not na(ph)
     isHH = na(prevPH) or ph > prevPH
-    chHiCls := isHH ? 1 : -1
     if showSwings
         label.new(bar_index - swL, ph, isHH ? "HH" : "LH", xloc=xloc.bar_index, style=label.style_label_down, color=isHH ? color.new(colBull, 30) : color.new(colBear, 30), textcolor=color.white, size=f_lsize(lblSize))
     prevPH := ph
@@ -120,10 +120,9 @@ if not na(ph)
         upRef := ph
         upRefb := bar_index - swL
 
-// New confirmed pivot LOW → classify HL/LL (label = display of that class)
+// New confirmed pivot LOW → HL/LL label (display only)
 if not na(pl)
     isLL = na(prevPL) or pl < prevPL
-    chLoCls := isLL ? -1 : 1
     if showSwings
         label.new(bar_index - swL, pl, isLL ? "LL" : "HL", xloc=xloc.bar_index, style=label.style_label_up, color=isLL ? color.new(colBear, 30) : color.new(colBull, 30), textcolor=color.white, size=f_lsize(lblSize))
     prevPL := pl
@@ -133,8 +132,7 @@ if not na(pl)
         dnRef := pl
         dnRefb := bar_index - swL
 
-// Chart row bias = SAME sequence rule as every dashboard row (HH+HL / LH+LL / mixed)
-chB = chHiCls == 1 and chLoCls == 1 ? 1 : chHiCls == -1 and chLoCls == -1 ? -1 : 0
+// Chart row bias comes from cB (shared Bias Swing Size classifier), computed above.
 
 // SWEEP: wick beyond the nearest swing but CLOSE back inside = liquidity grab
 sweepUp = showSweep and barstate.isconfirmed and not na(lastPH) and high > lastPH and close <= lastPH
@@ -202,5 +200,5 @@ if showTable and barstate.islast
     table.cell(t, 1, 4, f_txt(h1B), text_color=color.white, bgcolor=f_col(h1B), text_size=size.small, tooltip=f_auditTxt(h1PH, h1PL, h1HC, h1LC))
     table.cell(t, 2, 4, f_seq(h1HC, h1LC), text_color=color.white, bgcolor=rowBg, text_size=size.small, tooltip=f_auditTxt(h1PH, h1PL, h1HC, h1LC))
     table.cell(t, 0, 5, "Chart", text_color=color.white, bgcolor=rowBg, text_size=size.small)
-    table.cell(t, 1, 5, f_txt(chB), text_color=color.white, bgcolor=f_col(chB), text_size=size.small, tooltip=f_auditTxt(lastPH, lastPL, chHiCls, chLoCls))
-    table.cell(t, 2, 5, f_seq(chHiCls, chLoCls), text_color=color.white, bgcolor=rowBg, text_size=size.small, tooltip=f_auditTxt(lastPH, lastPL, chHiCls, chLoCls))
+    table.cell(t, 1, 5, f_txt(cB), text_color=color.white, bgcolor=f_col(cB), text_size=size.small, tooltip=f_auditTxt(cPH, cPL, cHC, cLC))
+    table.cell(t, 2, 5, f_seq(cHC, cLC), text_color=color.white, bgcolor=rowBg, text_size=size.small, tooltip=f_auditTxt(cPH, cPL, cHC, cLC))
