@@ -37,50 +37,52 @@ useClose = swingSrc == "Candle close"
 f_lsize(s) => s == "Tiny" ? size.tiny : s == "Normal" ? size.normal : size.small
 f_tpos(s)  => s == "Top Left" ? position.top_left : s == "Bottom Right" ? position.bottom_right : s == "Bottom Left" ? position.bottom_left : position.top_right
 
-// ── PROTECTED-SWING BIAS FUNCTION ────────────────────────────────────────────
-// Returns +1 bull / -1 bear / 0. The break refs (_upRef/_dnRef) only move on a
-// continuation break, so counter-trend minor pivots can't flip the bias.
-// No barstate.isconfirmed in here — it does NOT work inside request.security.
-// Confirmation is applied OUTSIDE via f_biasPrev()[1] + lookahead_on.
-f_bias() =>
+// ── STRUCTURE-SEQUENCE BIAS (same source as the chart's HH/HL/LH/LL labels) ──
+// Classification is IDENTICAL to the chart label logic: a new pivot high is HH if
+// it exceeds the previous pivot high (first = HH), a new pivot low is LL if it
+// undercuts the previous pivot low (first = LL). Bias follows the confirmed
+// label sequence — NOT candle direction, NOT EMAs, NOT the break engine:
+//   BULLISH = last high is HH and last low is HL
+//   BEARISH = last high is LH and last low is LL
+//   MIXED   = conflicting labels (or structure not yet formed)
+// Returns [bias, lastSwingHigh, lastSwingLow, hiClass, loClass]
+//   hiClass: 1 = HH, -1 = LH, 0 = none · loClass: 1 = HL, -1 = LL, 0 = none
+// No barstate in here (doesn't work inside request.security); confirmation is
+// applied OUTSIDE via f_structPrev() [1] + lookahead_on = last CLOSED HTF bar.
+f_struct() =>
     _srcH = useClose ? close : high
     _srcL = useClose ? close : low
     _ph = ta.pivothigh(_srcH, mtfSwing, mtfSwing)
     _pl = ta.pivotlow(_srcL,  mtfSwing, mtfSwing)
-    var int   _dir    = 0
     var float _lastPH = na
     var float _lastPL = na
-    var float _upRef  = na
-    var float _dnRef  = na
+    var int   _hiCls  = 0
+    var int   _loCls  = 0
     if not na(_ph)
+        _hiCls := (na(_lastPH) or _ph > _lastPH) ? 1 : -1
         _lastPH := _ph
-        if na(_upRef)
-            _upRef := _ph
     if not na(_pl)
+        _loCls := (na(_lastPL) or _pl < _lastPL) ? -1 : 1
         _lastPL := _pl
-        if na(_dnRef)
-            _dnRef := _pl
-    _brokeUp = not na(_upRef) and close > _upRef
-    _brokeDn = not na(_dnRef) and close < _dnRef
-    if _brokeUp
-        _dir := 1
-        _dnRef := _lastPL
-        _upRef := na
-    if _brokeDn
-        _dir := -1
-        _upRef := _lastPH
-        _dnRef := na
-    _dir
+    _b = _hiCls == 1 and _loCls == 1 ? 1 : _hiCls == -1 and _loCls == -1 ? -1 : 0
+    [_b, _lastPH, _lastPL, _hiCls, _loCls]
 
-// Non-repaint wrapper: return the bias of the last CLOSED bar of the requested TF.
-f_biasPrev() =>
-    int b = f_bias()
-    b[1]
+// Non-repaint wrapper: state as of the last CLOSED bar of the requested TF.
+f_structPrev() =>
+    [_b, _h, _l, _hc, _lc] = f_struct()
+    [_b[1], _h[1], _l[1], _hc[1], _lc[1]]
 
-wB  = request.security(syminfo.tickerid, "W",   f_biasPrev(), lookahead=barmerge.lookahead_on)
-dB  = request.security(syminfo.tickerid, "D",   f_biasPrev(), lookahead=barmerge.lookahead_on)
-h4B = request.security(syminfo.tickerid, "240", f_biasPrev(), lookahead=barmerge.lookahead_on)
-h1B = request.security(syminfo.tickerid, "60",  f_biasPrev(), lookahead=barmerge.lookahead_on)
+[wB,  wPH,  wPL,  wHC,  wLC ] = request.security(syminfo.tickerid, "W",   f_structPrev(), lookahead=barmerge.lookahead_on)
+[dB,  dPH,  dPL,  dHC,  dLC ] = request.security(syminfo.tickerid, "D",   f_structPrev(), lookahead=barmerge.lookahead_on)
+[h4B, h4PH, h4PL, h4HC, h4LC] = request.security(syminfo.tickerid, "240", f_structPrev(), lookahead=barmerge.lookahead_on)
+[h1B, h1PH, h1PL, h1HC, h1LC] = request.security(syminfo.tickerid, "60",  f_structPrev(), lookahead=barmerge.lookahead_on)
+
+f_hiTxt(int hc) => hc == 1 ? "HH" : hc == -1 ? "LH" : "—"
+f_loTxt(int lc) => lc == 1 ? "HL" : lc == -1 ? "LL" : "—"
+f_reason(int hc, int lc) => hc == 1 and lc == 1 ? "HH+HL → BULLISH" : hc == -1 and lc == -1 ? "LH+LL → BEARISH" : "conflicting → MIXED"
+// full audit line for a TF row: last confirmed swings + state + decision reason
+f_auditTxt(float hP, float lP, int hc, int lc) =>
+    "last swing HIGH: " + (na(hP) ? "—" : str.tostring(hP, format.mintick)) + " (" + f_hiTxt(hc) + ")\nlast swing LOW:  " + (na(lP) ? "—" : str.tostring(lP, format.mintick)) + " (" + f_loTxt(lc) + ")\nstructure state: " + f_hiTxt(hc) + "+" + f_loTxt(lc) + "\ndecision: " + f_reason(hc, lc)
 
 // ── MAIN-CHART STRUCTURE (protected-swing) ───────────────────────────────────
 srcH = useClose ? close : high
@@ -100,10 +102,16 @@ var int   upRefb   = na
 var float dnRef    = na    // protected low: break DOWN below = bearish event
 var int   dnRefb   = na
 
-// New confirmed pivot HIGH → HH/LH label + record as latest minor swing high
+// chart-TF label classes — the ONE source both the drawn labels and the table's
+// "Chart" row read from (classification always runs, labels are just its display)
+var int chHiCls = 0    // 1 = HH, -1 = LH
+var int chLoCls = 0    // 1 = HL, -1 = LL
+
+// New confirmed pivot HIGH → classify HH/LH (label = display of that class)
 if not na(ph)
+    isHH = na(prevPH) or ph > prevPH
+    chHiCls := isHH ? 1 : -1
     if showSwings
-        isHH = na(prevPH) or ph > prevPH
         label.new(bar_index - swL, ph, isHH ? "HH" : "LH", xloc=xloc.bar_index, style=label.style_label_down, color=isHH ? color.new(colBull, 30) : color.new(colBear, 30), textcolor=color.white, size=f_lsize(lblSize))
     prevPH := ph
     lastPH := ph
@@ -112,10 +120,11 @@ if not na(ph)
         upRef := ph
         upRefb := bar_index - swL
 
-// New confirmed pivot LOW → HL/LL label + record as latest minor swing low
+// New confirmed pivot LOW → classify HL/LL (label = display of that class)
 if not na(pl)
+    isLL = na(prevPL) or pl < prevPL
+    chLoCls := isLL ? -1 : 1
     if showSwings
-        isLL = na(prevPL) or pl < prevPL
         label.new(bar_index - swL, pl, isLL ? "LL" : "HL", xloc=xloc.bar_index, style=label.style_label_up, color=isLL ? color.new(colBear, 30) : color.new(colBull, 30), textcolor=color.white, size=f_lsize(lblSize))
     prevPL := pl
     lastPL := pl
@@ -123,6 +132,9 @@ if not na(pl)
     if na(dnRef)
         dnRef := pl
         dnRefb := bar_index - swL
+
+// Chart row bias = SAME sequence rule as every dashboard row (HH+HL / LH+LL / mixed)
+chB = chHiCls == 1 and chLoCls == 1 ? 1 : chHiCls == -1 and chLoCls == -1 ? -1 : 0
 
 // SWEEP: wick beyond the nearest swing but CLOSE back inside = liquidity grab
 sweepUp = showSweep and barstate.isconfirmed and not na(lastPH) and high > lastPH and close <= lastPH
@@ -156,9 +168,12 @@ if brokeDn
     upRefb := lastPHb
     dnRef := na
 
-// ── MTF BIAS TABLE ───────────────────────────────────────────────────────────
-f_txt(int b) => b == 1 ? "BULL" : b == -1 ? "BEAR" : "—"
+// ── MTF BIAS TABLE — reads the SAME structure source as the chart labels ─────
+// Columns: TF | bias | structure (HH+HL etc). Hover a bias cell = full audit:
+// last confirmed swing high/low, structure state, and the decision reason.
+f_txt(int b) => b == 1 ? "BULL" : b == -1 ? "BEAR" : "MIXED"
 f_col(int b) => b == 1 ? colBull : b == -1 ? colBear : color.new(color.gray, 30)
+f_seq(int hc, int lc) => f_hiTxt(hc) + "+" + f_loTxt(lc)
 
 alignBull = wB == 1 and dB == 1
 alignBear = wB == -1 and dB == -1
@@ -167,17 +182,25 @@ allBear   = wB == -1 and dB == -1 and h4B == -1 and h1B == -1
 verdict = allBull ? "STRONG BULL" : allBear ? "STRONG BEAR" : alignBull ? "BULL (W+D)" : alignBear ? "BEAR (W+D)" : "MIXED"
 vCol    = allBull or alignBull ? colBull : allBear or alignBear ? colBear : color.new(color.gray, 20)
 
-var table t = table.new(f_tpos(tblPos), 2, 6, border_width=1)
+var table t = table.new(f_tpos(tblPos), 3, 6, border_width=1)
 if showTable and barstate.islast
-    table.cell(t, 0, 0, "MS-CORE BIAS", text_color=color.white, bgcolor=color.new(color.black, 20), text_size=size.small)
-    table.cell(t, 1, 0, verdict,        text_color=color.white, bgcolor=vCol, text_size=size.small)
-    table.cell(t, 0, 1, "1W", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
-    table.cell(t, 1, 1, f_txt(wB),  text_color=color.white, bgcolor=f_col(wB),  text_size=size.small)
-    table.cell(t, 0, 2, "1D", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
-    table.cell(t, 1, 2, f_txt(dB),  text_color=color.white, bgcolor=f_col(dB),  text_size=size.small)
-    table.cell(t, 0, 3, "4H", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
-    table.cell(t, 1, 3, f_txt(h4B), text_color=color.white, bgcolor=f_col(h4B), text_size=size.small)
-    table.cell(t, 0, 4, "1H", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
-    table.cell(t, 1, 4, f_txt(h1B), text_color=color.white, bgcolor=f_col(h1B), text_size=size.small)
-    table.cell(t, 0, 5, "Chart", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
-    table.cell(t, 1, 5, f_txt(dir), text_color=color.white, bgcolor=f_col(dir), text_size=size.small)
+    hdrBg = color.new(color.black, 20)
+    rowBg = color.new(color.black, 40)
+    table.cell(t, 0, 0, "MS-CORE BIAS", text_color=color.white, bgcolor=hdrBg, text_size=size.small)
+    table.cell(t, 1, 0, verdict, text_color=color.white, bgcolor=vCol, text_size=size.small)
+    table.cell(t, 2, 0, "struct", text_color=color.gray, bgcolor=hdrBg, text_size=size.small)
+    table.cell(t, 0, 1, "1W", text_color=color.white, bgcolor=rowBg, text_size=size.small)
+    table.cell(t, 1, 1, f_txt(wB), text_color=color.white, bgcolor=f_col(wB), text_size=size.small, tooltip=f_auditTxt(wPH, wPL, wHC, wLC))
+    table.cell(t, 2, 1, f_seq(wHC, wLC), text_color=color.white, bgcolor=rowBg, text_size=size.small, tooltip=f_auditTxt(wPH, wPL, wHC, wLC))
+    table.cell(t, 0, 2, "1D", text_color=color.white, bgcolor=rowBg, text_size=size.small)
+    table.cell(t, 1, 2, f_txt(dB), text_color=color.white, bgcolor=f_col(dB), text_size=size.small, tooltip=f_auditTxt(dPH, dPL, dHC, dLC))
+    table.cell(t, 2, 2, f_seq(dHC, dLC), text_color=color.white, bgcolor=rowBg, text_size=size.small, tooltip=f_auditTxt(dPH, dPL, dHC, dLC))
+    table.cell(t, 0, 3, "4H", text_color=color.white, bgcolor=rowBg, text_size=size.small)
+    table.cell(t, 1, 3, f_txt(h4B), text_color=color.white, bgcolor=f_col(h4B), text_size=size.small, tooltip=f_auditTxt(h4PH, h4PL, h4HC, h4LC))
+    table.cell(t, 2, 3, f_seq(h4HC, h4LC), text_color=color.white, bgcolor=rowBg, text_size=size.small, tooltip=f_auditTxt(h4PH, h4PL, h4HC, h4LC))
+    table.cell(t, 0, 4, "1H", text_color=color.white, bgcolor=rowBg, text_size=size.small)
+    table.cell(t, 1, 4, f_txt(h1B), text_color=color.white, bgcolor=f_col(h1B), text_size=size.small, tooltip=f_auditTxt(h1PH, h1PL, h1HC, h1LC))
+    table.cell(t, 2, 4, f_seq(h1HC, h1LC), text_color=color.white, bgcolor=rowBg, text_size=size.small, tooltip=f_auditTxt(h1PH, h1PL, h1HC, h1LC))
+    table.cell(t, 0, 5, "Chart", text_color=color.white, bgcolor=rowBg, text_size=size.small)
+    table.cell(t, 1, 5, f_txt(chB), text_color=color.white, bgcolor=f_col(chB), text_size=size.small, tooltip=f_auditTxt(lastPH, lastPL, chHiCls, chLoCls))
+    table.cell(t, 2, 5, f_seq(chHiCls, chLoCls), text_color=color.white, bgcolor=rowBg, text_size=size.small, tooltip=f_auditTxt(lastPH, lastPL, chHiCls, chLoCls))

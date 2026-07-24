@@ -202,6 +202,21 @@ f_separation(Lvl L) =>
         s := math.min(avgGap / sepNorm, 1.0)
     s
 
+// REAL qualified-interaction count from the event log (no estimates): an event
+// qualifies if it is the first, or sits >= sepNorm bars after the last QUALIFIED
+// one — i.e. a genuinely separate visit, not a clustered re-hit. Greedy, deterministic.
+f_qualified(Lvl L) =>
+    n = array.size(L.log)
+    int q = 0
+    int lastQ = -2147483647
+    if n > 0
+        for i = 0 to n - 1
+            b = array.get(L.log, i).bar
+            if q == 0 or (b - lastQ) >= sepNorm
+                q += 1
+                lastQ := b
+    q
+
 // SINGLE SOURCE of the score AND its audit breakdown. Returns:
 // [conf, winF, rejF, dispF, sweepF, sepF, evidF, degW, nEv, avgW, held, brk]
 // avgW = average recency weight (the decay indicator: 1 = all fresh, →0 = old).
@@ -387,17 +402,21 @@ if barstate.islast
                     // AUDIT breakdown (★ levels): every component's point-contribution, summing to CONF
                     if showAudit and starred
                         wtot = wWin + wRej + wDisp + wSweep + wSep + wEvid
-                        qual = math.round(nEv * sepF)
-                        tl := tl + "———— AUDIT · CONF " + str.tostring(math.round(conf)) + " ————\n"
-                        tl := tl + "qualified touches: " + str.tostring(qual) + " of " + str.tostring(nEv) + "  (sep ×" + str.tostring(sepF, "#.00") + ")\n"
-                        tl := tl + "win rate      " + str.tostring(math.round(winF * 100)) + "%  → +" + str.tostring(f_pts(winF, wWin, wtot, degW), "#.0") + "\n"
-                        tl := tl + "rejection     " + str.tostring(rejF, "#.00") + "  → +" + str.tostring(f_pts(rejF, wRej, wtot, degW), "#.0") + "\n"
-                        tl := tl + "displacement  " + str.tostring(dispF, "#.00") + "  → +" + str.tostring(f_pts(dispF, wDisp, wtot, degW), "#.0") + "\n"
-                        tl := tl + "sweep         " + str.tostring(sweepF, "#.00") + "  → +" + str.tostring(f_pts(sweepF, wSweep, wtot, degW), "#.0") + "\n"
-                        tl := tl + "separation    " + str.tostring(sepF, "#.00") + "  → +" + str.tostring(f_pts(sepF, wSep, wtot, degW), "#.0") + "\n"
-                        tl := tl + "evidence      " + str.tostring(evidF, "#.00") + "  → +" + str.tostring(f_pts(evidF, wEvid, wtot, degW), "#.0") + "\n"
-                        tl := tl + "decay avg-weight " + str.tostring(avgW, "#.00") + " (older events discounted)\n"
-                        tl := tl + "timeframe " + f_degTxt(L.deg) + "  × " + str.tostring(degW, "#.00") + "\n"
+                        qual = f_qualified(L)
+                        sub = f_pts(winF, wWin, wtot, 1.0) + f_pts(rejF, wRej, wtot, 1.0) + f_pts(dispF, wDisp, wtot, 1.0) + f_pts(sweepF, wSweep, wtot, 1.0) + f_pts(sepF, wSep, wtot, 1.0) + f_pts(evidF, wEvid, wtot, 1.0)
+                        tfPts = sub * (degW - 1.0)
+                        tl := tl + "———— AUDIT (calculation order) ————\n"
+                        tl := tl + "1 interactions  " + str.tostring(nEv) + " ev · qualified " + str.tostring(qual) + "  (≥" + str.tostring(sepNorm, "#") + " bars apart)\n"
+                        tl := tl + "2 decay         avg-weight " + str.tostring(avgW, "#.00") + "  (older discounted)\n"
+                        tl := tl + "3 rejection     " + str.tostring(rejF, "#.00") + "  → +" + str.tostring(f_pts(rejF, wRej, wtot, 1.0), "#.0") + "\n"
+                        tl := tl + "4 displacement  " + str.tostring(dispF, "#.00") + "  → +" + str.tostring(f_pts(dispF, wDisp, wtot, 1.0), "#.0") + "\n"
+                        tl := tl + "5 sweep         " + str.tostring(sweepF, "#.00") + "  → +" + str.tostring(f_pts(sweepF, wSweep, wtot, 1.0), "#.0") + "\n"
+                        tl := tl + "6 win rate      " + str.tostring(math.round(winF * 100)) + "%  → +" + str.tostring(f_pts(winF, wWin, wtot, 1.0), "#.0") + "\n"
+                        tl := tl + "7 separation    " + str.tostring(sepF, "#.00") + "  → +" + str.tostring(f_pts(sepF, wSep, wtot, 1.0), "#.0") + "\n"
+                        tl := tl + "8 evidence      " + str.tostring(evidF, "#.00") + "  → +" + str.tostring(f_pts(evidF, wEvid, wtot, 1.0), "#.0") + "\n"
+                        tl := tl + "  subtotal      " + str.tostring(sub, "#.0") + " pts\n"
+                        tl := tl + "9 timeframe " + f_degTxt(L.deg) + "  ×" + str.tostring(degW, "#.00") + "  → " + (tfPts >= 0 ? "+" : "") + str.tostring(tfPts, "#.0") + " pts\n"
+                        tl := tl + "10 FINAL CONF   " + str.tostring(math.round(conf)) + "  (= subtotal " + (tfPts >= 0 ? "+ " : "− ") + str.tostring(math.abs(tfPts), "#.0") + ")\n"
                     if isCluster
                         tl := tl + "———— ⧉ MERGED CLUSTER · STR " + str.tostring(math.round(clStr)) + " ————\n" + str.tostring(clCount) + " levels within " + str.tostring(mergeBandPct, "#.00") + "% of price:\n"
                         for k = 0 to array.size(book) - 1
