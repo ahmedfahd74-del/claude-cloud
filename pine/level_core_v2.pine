@@ -77,6 +77,10 @@ conflBonus   = input.float(6.0, "Confluence bonus per extra level (strength)", m
 mergeCol     = input.color(#ff9800, "Liquidity-zone fill", group=gM)
 mergeOp      = input.int(80, "Liquidity-zone transparency", minval=0, maxval=100, group=gM)
 
+gNz = "Manual Nudge (LIVE floor / ceiling)"
+nudgeCeil  = input.float(0.0, "Nudge nearest RESISTANCE / ceiling (% of price)", minval=-2.0, maxval=2.0, step=0.01, group=gNz, tooltip="Presentation only. Shift the nearest level ABOVE price (the ceiling price is about to hit) up/down a hair to sit it on the exact wick. Does not change the level, its memory, or its score.")
+nudgeFloor = input.float(0.0, "Nudge nearest SUPPORT / floor (% of price)", minval=-2.0, maxval=2.0, step=0.01, group=gNz, tooltip="Presentation only. Shift the nearest level BELOW price (the floor price is about to hit).")
+
 f_sz(s) => s == "Tiny" ? size.tiny : s == "Normal" ? size.normal : size.small
 f_degTxt(int d) => d == 0 ? "1H" : d == 1 ? "4H" : d == 2 ? "1D" : "1W"
 f_lstyle(s) => s == "Dashed" ? line.style_dashed : s == "Dotted" ? line.style_dotted : line.style_solid
@@ -384,12 +388,15 @@ if barstate.islast
                 decided = bounces + breaks
                 band = L.anchor * bandPct / 100.0
                 lw = (live or starred or isCluster) ? emphWidth : lineWidth
+                // manual nudge — presentation only, applies to the LIVE ceiling / floor
+                nOff = (i == naIdx ? nudgeCeil : i == nbIdx ? nudgeFloor : 0.0) * L.anchor / 100.0
+                drawA = L.anchor + nOff
                 if L.inside and showActiveZone
-                    zt = na(L.testHi) ? L.anchor + band : math.max(L.testHi, L.anchor + band)
-                    zb = na(L.testLo) ? L.anchor - band : math.min(L.testLo, L.anchor - band)
+                    zt = (na(L.testHi) ? L.anchor + band : math.max(L.testHi, L.anchor + band)) + nOff
+                    zb = (na(L.testLo) ? L.anchor - band : math.min(L.testLo, L.anchor - band)) + nOff
                     array.push(dBox, box.new(x1, zt, x2, zb, border_color=zoneBord > 0 ? color.new(zoneCol, 40) : color.new(zoneCol, 100), bgcolor=color.new(zoneCol, zoneOp), border_width=zoneBord))
                 else
-                    array.push(dLine, line.new(x1, L.anchor, x2, L.anchor, color=col, width=lw, extend=f_ext(extMode), style=f_lstyle(lineStyleIn)))
+                    array.push(dLine, line.new(x1, drawA, x2, drawA, color=col, width=lw, extend=f_ext(extMode), style=f_lstyle(lineStyleIn)))
                 if showLbl
                     bornT = array.size(L.log) > 0 ? array.get(L.log, 0).t : time
                     string tl = "LEVEL " + str.tostring(L.anchor, format.mintick) + "  [" + f_degTxt(L.deg) + " degree]\n" + (isRes ? "resistance" : "support") + " · born " + str.format_time(bornT, "yyyy-MM-dd") + "\n———————————————\n"
@@ -430,4 +437,4 @@ if barstate.islast
                     head = ltag + str.tostring(L.anchor, format.mintick) + degPart + " " + (isRes ? "RES" : "SUP") + confPart + statLine
                     lblX = lblSide == "Left" ? x1 : x2
                     lblStyle = lblSide == "Left" ? label.style_label_right : label.style_label_left
-                    array.push(dLab, label.new(lblX, L.anchor, head, xloc=xloc.bar_index, style=lblStyle, color=color.new(col, live ? 0 : lblOp), textcolor=color.white, size=f_sz(lblSize), tooltip=tl))
+                    array.push(dLab, label.new(lblX, drawA, head, xloc=xloc.bar_index, style=lblStyle, color=color.new(col, live ? 0 : lblOp), textcolor=color.white, size=f_sz(lblSize), tooltip=tl))
