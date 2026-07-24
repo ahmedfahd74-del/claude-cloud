@@ -95,29 +95,39 @@ NOTE: these validate the LOGIC, not compiled Pine — the real compile check is 
 Top-down authorization, bottom-up execution. Higher layer grants permission + direction;
 lower layer only refines timing/price. A signal is valid only when all active layers agree;
 a lower layer can NEVER create or override higher-layer bias.
-- **POSITION LAYER** (BUILT — see below): HTF bias {bull/bear/neutral} + regime {trend/range}.
+- **POSITION LAYER** (BUILT — see below): HTF market-state engine (TREND/PULLBACK/TRANSITION/
+  DISTRIBUTION/ACCUMULATION/RANGE) → bias derived from state, 2/3 HTF agreement confirms.
 - **INTRADAY LAYER** (next): AOI/liquidity setup validation → setup-quality score, SL from
   invalidation, TP from opposing liquidity, break&retest. Gates execution.
 - **EXECUTION LAYER** = M4 v3 (built), now bias-free — consumes Position bias only. Next: optional
   EMA50 reaction filter, wire the setup-quality gate. Timing only: sweep→internal BOS/CHoCH→entry.
 
-## POSITION LAYER — HTF bias + regime — BUILT + VALIDATED, **NOT frozen**
+## POSITION LAYER — HTF MARKET-STATE ENGINE — BUILT + VALIDATED, **NOT frozen**
 - Lives in `level_core_v2.pine`, group "Position Layer (HTF bias + regime)". Module 1 untouched.
-- **Bias**: HH+HL / LH+LL structure per **1W / 1D / 4H** (`f_seqBias`, `entryBiasSw` swing), each TF's
-  vote **confirmed by momentum** (`f_momPrev`, price vs EMA `posMomLen`=50) — momentum that OPPOSES
-  structure vetoes that TF to 0 (`f_vote`). **≥2 of 3 HTFs must agree → directional; else NEUTRAL.**
-  `posDir` (=`entryDir` the execution layer reads) · `posAgree` (2 or 3). No single TF can force a call.
-- **Regime**: Daily **Kaufman efficiency ratio** (`f_erPrev`, `erLen`=20) ≥ `erTrend`(0.35) → TRENDING
-  else RANGING. Independent of structure = genuine second opinion. `regTrend`.
-- **Execution layer is now bias-free**: deleted M4's own weighted W/D/4H/1H score+deadband; `entryDir`
-  is assigned from `posDir`. M4 timing/gates unchanged (all 13 entry scenarios still PASS).
-- **Panel** (bottom-right, now 2×5): HTF BIAS (n/3, hover = per-TF struct·mom·vote) · REGIME
-  (hover = efficiency ratio vs threshold) · STATE · SIGNALS · REJECTED.
-- Validator: `pine/position_layer_validate.py` — 6 claims (vote veto truth table, 2/3 rule, no single-TF
-  force, momentum only REMOVES calls [194/729, never adds], selectivity 14 vs old 20 over 27 states,
-  regime threshold, determinism) PASS.
-- **Freeze blockers**: user compile + observe that NEUTRAL correctly suppresses trades in chop and the
-  bias matches the visible 1W/1D/4H structure. Tune posMomLen / erLen / erTrend from observation.
+- **Market STATE per HTF (1W/1D/4H)** — `f_state` classifies one of six from HH/HL/LH/LL progression
+  (last two highs/lows), swing expansion (broadening vs contracting), momentum (price vs EMA `posMomLen`),
+  and volatility (Kaufman efficiency ratio, `erLen`):
+  **0 RANGE · 1 TRENDING · 2 PULLBACK · 3 TRANSITION · 4 DISTRIBUTION · 5 ACCUMULATION.**
+  Clean HH+HL/LH+LL → TREND (momentum with) or PULLBACK (momentum against, direction kept); broadening
+  (HH&LL) → TRANSITION; coil (LH&HL) after an up/down trend with low efficiency → DISTRIBUTION/ACCUMULATION,
+  else TRANSITION; nothing two-sided → RANGE. `erChop`(0.12) volatility gate downgrades a dead-grind
+  "trend" to RANGE; `erTrend`(0.35) is the churn cutoff for topping/bottoming.
+- **Bias is DERIVED from state**: a directional vote (`bv` ±1) arises **only in TREND/PULLBACK**;
+  TRANSITION/DISTRIBUTION/ACCUMULATION/RANGE never vote directionally (D/A carry a neutral lean only).
+- **2/3 agreement is the CONFIRMATION** (not the primary decision): `posDir` = ±1 iff ≥2 HTFs vote the
+  same side, else 0. `sysState` = system market state (TREND if ≥2 agreeing HTFs are TREND else PULLBACK
+  when confirmed; conflict→TRANSITION; else surface DISTRIBUTION/ACCUMULATION; else RANGE). `sysLean`, `erSys`.
+- **Execution layer stays bias-free**: `entryDir = posDir` (state-derived, confirmed). M4 timing/gates
+  unchanged (all 13 entry scenarios still PASS). Counter-state trades are now impossible — M4 can only fire
+  when the system is in a confirmed TREND/PULLBACK.
+- **Panel** (bottom-right, 2×5): HTF BIAS (n/3, hover = per-TF state·vote·efficiency) · MARKET STATE
+  (name + ▲/▼ lean, hover = definitions + system efficiency) · EXEC · SIGNALS · REJECTED.
+- Validator: `pine/position_layer_validate.py` — 7 claims (six-state classification, volatility gate,
+  directional vote only in TREND/PULLBACK, PULLBACK keeps trend dir, 2/3 confirmation + system precedence,
+  selectivity/no counter-state false signals [160 confirmed combos all backed by ≥2 clean votes],
+  determinism) PASS.
+- **Freeze blockers**: user compile + observe MARKET STATE matches the visible 1W/1D/4H picture (trend vs
+  pullback vs topping) and NEUTRAL suppresses chop. Tune posMomLen / erLen / erTrend / erChop / entryBiasSw.
 
 ## OPEN / NON-BLOCKING FOLLOW-UPS
 - (polish) print FINAL CONF to 1 decimal to kill the display-rounding optic.
