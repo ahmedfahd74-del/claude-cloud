@@ -59,28 +59,37 @@ NOTE: these validate the LOGIC, not compiled Pine — the real compile check is 
 · 4 Insufficient pivots PASS (→ MIXED / "—") · 5 Tests PARTIAL (logic solid; compile risk remains).
 **Recommended: FREEZE (conditional on user's clean compile of both files).**
 
-## M4 — ENTRY ENGINE (liquidity-first) — BUILT + LOGIC-VALIDATED, **NOT frozen**
+## M4 — ENTRY ENGINE (liquidity-first) — v3 BUILT + LOGIC-VALIDATED, **NOT frozen**
 - Lives inside `level_core_v2.pine`, group "Entry Engine (liquidity-first) — M4". Read-only over the
-  frozen book — no detection/scoring changes (all prior validators re-run and pass).
-- **Pipeline (v2)**: HTF bias → target liquidity → sweep → rejection → LTF structure → entry.
+  frozen book — no detection/scoring changes (all prior validators re-run and pass). **Module 1 untouched.**
+- **Pipeline (v3)**: HTF bias → target a STRONG level in the right location → QUALIFIED sweep →
+  internal BOS/CHoCH break → entry toward opposing liquidity.
 - **Bias**: sequence classifier (HH+HL/LH+LL) on W/D/4H/1H closed bars, weights .40/.30/.20/.10,
-  deadband ±0.15 → +1/−1/0. **MIXED = no signals.** Input `entryBiasSw` (default 5).
+  deadband ±0.15 → +1/−1/0. **MIXED = no signals.** Input `entryBiasSw` (default 5). *(unchanged from v2)*
 - **Execution-TF guard**: engine idle above `maxExecTF` (default "5" = 5m). Execution is 1m–5m only.
-- **Arm gates (logged if failed, never silent)**: sweep of the LIVE ceiling/floor in bias direction
-  (wick through, close back) AND level strength = f_conf + conflBonus×neighbours-in-merge-band ≥
-  `entryMinCnf`(40) AND sweep-bar rejection quality (short: (high−close)/range; long mirror) ≥ `rejMin`(0.5).
-- **Structure sequence (closed bars, `ltfPiv`=2 micro-pivots)**: SHORT = sweep high → LH pivot below the
-  sweep high → close < the intervening low (LL). LONG mirror = sweep low → HL → close > intervening high (HH).
-  All within `seqWindow`(20 bars). Resets logged: bias flip · window expiry · close beyond sweep extreme ·
-  pivot violating the sequence (HH/LL against the setup).
-- **Signal**: label with sweep→LH/HL→LL/HH trail, stop = sweep wick, target = opposing LIVE level, R:R;
-  entry/stop/target lines; cooldown `coolBars`(10). Alerts "M4 LONG/SHORT (liquidity-first)".
+- **Arm gates (v3, logged if failed, never silent), in order**: (1) **ATR sweep depth** — wick must
+  pierce the level by ≥ `minSweepATR`(0.25)×ATR(`atrLen`14); kills micro-pokes. (2) **premium/discount
+  location** (`useLocFilter`, range `locLookback`50) — SHORT only if swept level ≥ range-mid (premium),
+  LONG only if ≤ mid (discount); blocks longs at range highs. (3) **level strength** = f_conf +
+  conflBonus×neighbours-in-merge-band ≥ `entryMinCnf`(40). (4) **sweep-bar rejection quality**
+  (short (high−close)/range; long mirror) ≥ `rejMin`(0.5).
+- **Confirmation (v3 = REAL internal BOS/CHoCH, replaced the LTF LH/HL pivot sequence)**: a global
+  internal-structure tracker keeps the last confirmed internal swing hi/lo (pivots of size `internalPiv`=3)
+  and fires a **one-shot** break flag when a CLOSE crosses one; classifies CHoCH (flips internal trend)
+  vs BOS (continuation). SHORT confirms on `brokeLoNow` after the sweep bar; LONG on `brokeHiNow`.
+  Within `seqWindow`(20). Resets logged: bias flip · window expiry · close beyond sweep extreme.
+- **Signal**: label "sweep → internal CHoCH/BOS <level>", stop = sweep wick, **target = opposing
+  liquidity** (`f_oppLiq`: nearest opposing level with strength ≥ entryMinCnf = draw on liquidity;
+  fallback = range extreme = the SSL/BSL pool), R:R; entry/stop/target lines; cooldown `coolBars`(10).
+  Alerts "M4 LONG/SHORT (liquidity-first)".
 - **Rejected-setups log**: rolling 30 with timestamps + reasons; panel row REJECTED (count) — hover = full log.
-  Panel (bottom-right): ENTRY BIAS(score) / STATE (per-phase, bars left) / SIGNALS / REJECTED.
-- Validator: `pine/level_core_v2_entry_validate.py` — 11 scenarios (full short & long pipelines, strength
-  gate, rejection gate, expiry, invalidation, bias flip, MIXED, exec-TF guard, no-repaint, determinism) PASS.
-- **Freeze blockers**: user compile + forward-test on 1m/5m crypto (fires only on real swept setups?);
-  tune entryMinCnf / rejMin / ltfPiv / seqWindow from observation. Backtest before real money.
+  Panel (bottom-right): ENTRY BIAS(score) / STATE (SWEPT await break, bars left) / SIGNALS / REJECTED.
+- Validator: `pine/level_core_v2_entry_validate.py` — 13 scenarios (full short & long pipelines, ATR-depth
+  gate, location gate, strength gate, rejection gate, expiry, invalidation, bias flip, MIXED, exec-TF guard,
+  no-repaint, opposing-liquidity target, determinism) PASS.
+- **Freeze blockers**: user compile + forward-test on 1m/5m crypto (fires only on real swept setups now?);
+  tune minSweepATR / useLocFilter / entryMinCnf / rejMin / internalPiv / seqWindow from observation.
+  Backtest before real money.
 
 ## OPEN / NON-BLOCKING FOLLOW-UPS
 - (polish) print FINAL CONF to 1 decimal to kill the display-rounding optic.

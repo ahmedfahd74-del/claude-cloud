@@ -87,8 +87,12 @@ entryBiasSw = input.int(5, "Bias Swing Size (W/D/4H/1H sequence classifier)", mi
 maxExecTF   = input.timeframe("5", "Max execution timeframe (engine off above this)", group=gE, tooltip="Execution belongs on 1m–5m. On any chart TF above this the engine stays idle (levels/bias still display).")
 entryMinCnf = input.float(40.0, "Min level strength to arm (CONF + confluence)", minval=0.0, maxval=100.0, step=5.0, group=gE, tooltip="The swept level's confidence plus its confluence bonus (neighbours within the merge band) must reach this. Weak levels never arm — they get logged as rejected setups.")
 rejMin      = input.float(0.5, "Min rejection quality of the sweep bar (0-1)", minval=0.0, maxval=1.0, step=0.05, group=gE, tooltip="SHORT: (high−close)/range · LONG: (close−low)/range of the sweep bar. Same wick/body measure the event engine logs. Low-quality rejections are logged, not armed.")
-ltfPiv      = input.int(2, "LTF pivot size for LH / HL (bars each side)", minval=1, maxval=10, group=gE)
-seqWindow   = input.int(20, "Max bars from sweep to entry", minval=3, maxval=100, group=gE)
+minSweepATR = input.float(0.25, "Min sweep depth beyond level (× ATR)", minval=0.0, maxval=5.0, step=0.05, group=gE, tooltip="The wick must pierce the swept level by at least this many ATRs before it counts as a real liquidity grab. Filters the micro-pokes that produced too many signals.")
+atrLen      = input.int(14, "ATR length (sweep-depth normalization)", minval=2, maxval=100, group=gE)
+internalPiv = input.int(3, "Internal structure pivot (BOS / CHoCH size)", minval=1, maxval=10, group=gE, tooltip="Confirmation is a real internal break: after the sweep, price must CLOSE through the last internal swing (a pivot of this size) in the bias direction — a bearish break for shorts, a bullish break for longs.")
+useLocFilter = input.bool(true, "Require premium / discount location", group=gE, tooltip="SHORT only when the swept level sits in the PREMIUM (upper half) of the recent range; LONG only in the DISCOUNT (lower half). Blocks longs at range highs and shorts at range lows.")
+locLookback = input.int(50, "Premium / discount range lookback (bars)", minval=10, maxval=500, group=gE)
+seqWindow   = input.int(20, "Max bars from sweep to structure break", minval=3, maxval=100, group=gE)
 coolBars    = input.int(10, "Cooldown after a signal (bars)", minval=0, maxval=200, group=gE)
 showSwpMark = input.bool(true, "Mark armed sweeps (✕)", group=gE)
 showTrdLn   = input.bool(true, "Draw entry / stop / target lines on signal", group=gE)
@@ -394,26 +398,70 @@ f_logRej(string why) =>
         array.shift(rejLog)
     array.set(rejTot, 0, array.get(rejTot, 0) + 1)
 
-// LTF micro-pivots for the structure sequence (LH / HL)
-phL = ta.pivothigh(high, ltfPiv, ltfPiv)
-plL = ta.pivotlow(low,  ltfPiv, ltfPiv)
+// ── internal market structure (chart / execution TF) — real BOS / CHoCH ──────
+// Track the last confirmed internal swing high & low; a CLOSE beyond one is an
+// internal structure break (fired once per swing). Non-repainting: the pivots
+// confirm internalPiv bars late and are only read after they confirm.
+iPH = ta.pivothigh(high, internalPiv, internalPiv)
+iPL = ta.pivotlow(low,  internalPiv, internalPiv)
+var float iSwHi   = na
+var float iSwLo   = na
+var bool  iHiUsed = true
+var bool  iLoUsed = true
+var int   iTrend  = 0
+if not na(iPH)
+    iSwHi   := iPH
+    iHiUsed := false
+if not na(iPL)
+    iSwLo   := iPL
+    iLoUsed := false
+brokeHiNow = not na(iSwHi) and not iHiUsed and close > iSwHi
+brokeLoNow = not na(iSwLo) and not iLoUsed and close < iSwLo
+// classify the break: CHoCH (flips internal trend) vs BOS (continuation)
+bool chochUp = false
+bool chochDn = false
+if brokeHiNow
+    chochUp := iTrend <= 0
+    iTrend  := 1
+    iHiUsed := true
+if brokeLoNow
+    chochDn := iTrend >= 0
+    iTrend  := -1
+    iLoUsed := true
+
+// ATR (sweep-depth threshold) + premium / discount range on the execution TF
+atrE  = ta.atr(atrLen)
+rngHi = ta.highest(high, locLookback)
+rngLo = ta.lowest(low,  locLookback)
+eqM   = (rngHi + rngLo) / 2.0
+
+// opposing-liquidity target (draw on liquidity): nearest STRONG opposing level;
+// fall back to the range extreme (the sell-/buy-side pool) when none qualifies.
+f_oppLiq(int dir, float fromPx) =>
+    float best = na
+    if array.size(book) > 0
+        for i = 0 to array.size(book) - 1
+            a = array.get(book, i).anchor
+            if dir == -1 and a < fromPx and f_lvlStrength(i) >= entryMinCnf and (na(best) or a > best)
+                best := a
+            if dir == 1 and a > fromPx and f_lvlStrength(i) >= entryMinCnf and (na(best) or a < best)
+                best := a
+    na(best) ? (dir == -1 ? rngLo : rngHi) : best
 
 // execution-TF guard: engine runs only on execution timeframes (default ≤ 5m)
 execOK = chartSec <= timeframe.in_seconds(maxExecTF)
 
-// state machine: 0 IDLE · 1 SWEPT (await LH/HL) · 2 STRUCT (await LL/HH break)
-var int   eSt       = 0
-var int   eDirL     = 0      // -1 short / +1 long
-var float eAnchor   = na     // swept level
-var float eSwHi     = na     // sweep bar extremes
-var float eSwLo     = na
-var int   eSwBar    = 0
-var float eSeqLo    = na     // running extremes since the sweep
-var float eSeqHi    = na
-var float eStructRef = na    // frozen break level once LH/HL confirms
-var float eLHval    = na     // the LH/HL pivot (panel display)
-var int   eCool     = 0
-var int   eSigCnt   = 0
+// state machine: 0 IDLE · 1 SWEPT (await internal BOS/CHoCH in bias direction)
+var int   eSt        = 0
+var int   eDirL      = 0     // -1 short / +1 long
+var float eAnchor    = na    // swept level
+var float eSwHi      = na    // sweep bar extremes
+var float eSwLo      = na
+var int   eSwBar     = 0
+var float eStructRef = na    // the internal swing that was broken (display)
+var string eBreakK   = ""    // "CHoCH" / "BOS" (display)
+var int   eCool      = 0
+var int   eSigCnt    = 0
 bool sigLong  = false
 bool sigShort = false
 float sigStop = na
@@ -423,18 +471,14 @@ if useEntry and execOK and barstate.isconfirmed
     [iUp, iDn] = f_nearestIdx()
     float nUp = iUp >= 0 ? array.get(book, iUp).anchor : na
     float nDn = iDn >= 0 ? array.get(book, iDn).anchor : na
-    // running extremes while a setup is live
-    if eSt > 0
-        eSeqLo := math.min(eSeqLo, low)
-        eSeqHi := math.max(eSeqHi, high)
-    // global resets for any live setup: bias flip, window expiry, sweep-extreme reclaim
-    if eSt > 0
+    // resets for a live setup: bias flip, window expiry, sweep-extreme reclaim
+    if eSt == 1
         dTag = eDirL == -1 ? "SHORT" : "LONG"
         if entryDir != eDirL
             f_logRej(dTag + " @" + str.tostring(eAnchor, format.mintick) + " — bias flipped")
             eSt := 0
         else if bar_index - eSwBar > seqWindow
-            f_logRej(dTag + " @" + str.tostring(eAnchor, format.mintick) + (eSt == 1 ? " — no LH/HL in window" : " — no break in window"))
+            f_logRej(dTag + " @" + str.tostring(eAnchor, format.mintick) + " — no internal break in window")
             eSt := 0
         else if eDirL == -1 and close > eSwHi
             f_logRej(dTag + " @" + str.tostring(eAnchor, format.mintick) + " — invalidated: close above sweep high")
@@ -442,36 +486,22 @@ if useEntry and execOK and barstate.isconfirmed
         else if eDirL == 1 and close < eSwLo
             f_logRej(dTag + " @" + str.tostring(eAnchor, format.mintick) + " — invalidated: close below sweep low")
             eSt := 0
-    // STATE 1 → LH (short) / HL (long) micro-pivot must confirm AFTER the sweep bar
-    if eSt == 1
-        if eDirL == -1 and not na(phL) and (bar_index - ltfPiv) > eSwBar
-            if phL < eSwHi
-                eLHval := phL
-                eStructRef := eSeqLo
-                eSt := 2
-            else
-                f_logRej("SHORT @" + str.tostring(eAnchor, format.mintick) + " — structure failed: pivot ≥ sweep high")
-                eSt := 0
-        else if eDirL == 1 and not na(plL) and (bar_index - ltfPiv) > eSwBar
-            if plL > eSwLo
-                eLHval := plL
-                eStructRef := eSeqHi
-                eSt := 2
-            else
-                f_logRej("LONG @" + str.tostring(eAnchor, format.mintick) + " — structure failed: pivot ≤ sweep low")
-                eSt := 0
-    // STATE 2 → LL (short) / HH (long): close through the frozen structure level
-    if eSt == 2
-        if eDirL == -1 and close < eStructRef
+    // CONFIRM: a real internal BOS/CHoCH in the bias direction, after the sweep bar
+    if eSt == 1 and bar_index > eSwBar
+        if eDirL == -1 and brokeLoNow
             sigShort := true
-        else if eDirL == 1 and close > eStructRef
+            eStructRef := iSwLo
+            eBreakK := chochDn ? "CHoCH" : "BOS"
+        else if eDirL == 1 and brokeHiNow
             sigLong := true
-    // SIGNAL: draw + cooldown
+            eStructRef := iSwHi
+            eBreakK := chochUp ? "CHoCH" : "BOS"
+    // SIGNAL: draw + cooldown. Target = opposing liquidity (draw), not nearest level.
     if sigShort or sigLong
         sigStop := sigShort ? eSwHi : eSwLo
-        sigTgt  := sigShort ? nDn : nUp
+        sigTgt  := f_oppLiq(eDirL, close)
         rr = na(sigTgt) or math.abs(sigStop - close) == 0 ? na : math.abs(close - sigTgt) / math.abs(sigStop - close)
-        txt = (sigShort ? "▼ SHORT" : "▲ LONG") + "  @" + str.tostring(close, format.mintick) + "\nsweep " + str.tostring(eAnchor, format.mintick) + " → " + (sigShort ? "LH " : "HL ") + str.tostring(eLHval, format.mintick) + " → " + (sigShort ? "LL" : "HH") + "\nstop " + str.tostring(sigStop, format.mintick) + (na(sigTgt) ? "" : " · tgt " + str.tostring(sigTgt, format.mintick)) + (na(rr) ? "" : " · R " + str.tostring(rr, "#.0"))
+        txt = (sigShort ? "▼ SHORT" : "▲ LONG") + "  @" + str.tostring(close, format.mintick) + "\nsweep " + str.tostring(eAnchor, format.mintick) + " → internal " + eBreakK + " " + str.tostring(eStructRef, format.mintick) + "\nstop " + str.tostring(sigStop, format.mintick) + (na(sigTgt) ? "" : " · tgt " + str.tostring(sigTgt, format.mintick)) + (na(rr) ? "" : " · R " + str.tostring(rr, "#.0"))
         label.new(bar_index, sigShort ? high : low, txt, xloc=xloc.bar_index, style=sigShort ? label.style_label_down : label.style_label_up, color=sigShort ? color.new(#ef5350, 10) : color.new(#26a69a, 10), textcolor=color.white, size=size.small)
         if showTrdLn
             line.new(bar_index, close, bar_index + 12, close, xloc=xloc.bar_index, color=color.gray, width=1, style=line.style_solid)
@@ -481,14 +511,20 @@ if useEntry and execOK and barstate.isconfirmed
         eSigCnt := eSigCnt + 1
         eCool := bar_index + coolBars
         eSt := 0
-    // IDLE: watch for a sweep of the LIVE level in the bias direction — with
-    // strength + rejection-quality gates (skips are logged, never silently dropped)
+    // IDLE: watch for a QUALIFIED sweep of the LIVE level in the bias direction.
+    // Gates (each failure logged, never silent): ATR sweep depth · premium/discount
+    // location · level strength · sweep-bar rejection quality.
     if eSt == 0 and not (sigShort or sigLong) and bar_index >= eCool and entryDir != 0
         rng = high - low
         if entryDir == -1 and iUp >= 0 and high > nUp and close <= nUp
+            depth = high - nUp
             strengthS = f_lvlStrength(iUp)
             rqS = rng <= 0 ? 0.0 : (high - close) / rng
-            if strengthS < entryMinCnf
+            if depth < minSweepATR * atrE
+                f_logRej("SHORT sweep @" + str.tostring(nUp, format.mintick) + " skipped — shallow (" + str.tostring(atrE > 0 ? depth / atrE : 0.0, "#.00") + " < " + str.tostring(minSweepATR, "#.00") + " ATR)")
+            else if useLocFilter and nUp < eqM
+                f_logRej("SHORT sweep @" + str.tostring(nUp, format.mintick) + " skipped — not in premium (below range mid)")
+            else if strengthS < entryMinCnf
                 f_logRej("SHORT sweep @" + str.tostring(nUp, format.mintick) + " skipped — weak level (STR " + str.tostring(math.round(strengthS)) + " < " + str.tostring(math.round(entryMinCnf)) + ")")
             else if rqS < rejMin
                 f_logRej("SHORT sweep @" + str.tostring(nUp, format.mintick) + " skipped — weak rejection (" + str.tostring(rqS, "#.00") + " < " + str.tostring(rejMin, "#.00") + ")")
@@ -499,14 +535,17 @@ if useEntry and execOK and barstate.isconfirmed
                 eSwHi := high
                 eSwLo := low
                 eSwBar := bar_index
-                eSeqLo := low
-                eSeqHi := high
                 if showSwpMark
                     label.new(bar_index, high, "✕", xloc=xloc.bar_index, style=label.style_none, textcolor=#ef5350, size=size.small)
         else if entryDir == 1 and iDn >= 0 and low < nDn and close >= nDn
+            depth = nDn - low
             strengthL = f_lvlStrength(iDn)
             rqL = rng <= 0 ? 0.0 : (close - low) / rng
-            if strengthL < entryMinCnf
+            if depth < minSweepATR * atrE
+                f_logRej("LONG sweep @" + str.tostring(nDn, format.mintick) + " skipped — shallow (" + str.tostring(atrE > 0 ? depth / atrE : 0.0, "#.00") + " < " + str.tostring(minSweepATR, "#.00") + " ATR)")
+            else if useLocFilter and nDn > eqM
+                f_logRej("LONG sweep @" + str.tostring(nDn, format.mintick) + " skipped — not in discount (above range mid)")
+            else if strengthL < entryMinCnf
                 f_logRej("LONG sweep @" + str.tostring(nDn, format.mintick) + " skipped — weak level (STR " + str.tostring(math.round(strengthL)) + " < " + str.tostring(math.round(entryMinCnf)) + ")")
             else if rqL < rejMin
                 f_logRej("LONG sweep @" + str.tostring(nDn, format.mintick) + " skipped — weak rejection (" + str.tostring(rqL, "#.00") + " < " + str.tostring(rejMin, "#.00") + ")")
@@ -517,8 +556,6 @@ if useEntry and execOK and barstate.isconfirmed
                 eSwHi := high
                 eSwLo := low
                 eSwBar := bar_index
-                eSeqLo := low
-                eSeqHi := high
                 if showSwpMark
                     label.new(bar_index, low, "✕", xloc=xloc.bar_index, style=label.style_none, textcolor=#26a69a, size=size.small)
 
@@ -530,7 +567,7 @@ if useEntry and showEPanel and barstate.islast
     ebTxt = entryDir == 1 ? "BULL" : entryDir == -1 ? "BEAR" : "MIXED"
     ebCol = entryDir == 1 ? #26a69a : entryDir == -1 ? #ef5350 : color.new(color.gray, 20)
     left = seqWindow - (bar_index - eSwBar)
-    stTxt = not execOK ? "OFF — chart TF > " + maxExecTF + "m limit" : eSt == 1 ? (eDirL == -1 ? "SWEPT ▼ await LH (" : "SWEPT ▲ await HL (") + str.tostring(left) + ")" : eSt == 2 ? (eDirL == -1 ? "LH ✓ await LL < " : "HL ✓ await HH > ") + str.tostring(eStructRef, format.mintick) + " (" + str.tostring(left) + ")" : bar_index < eCool ? "COOLDOWN " + str.tostring(eCool - bar_index) : "IDLE — watching"
+    stTxt = not execOK ? "OFF — chart TF > " + maxExecTF + "m limit" : eSt == 1 ? (eDirL == -1 ? "SWEPT ▼ await bearish break (" : "SWEPT ▲ await bullish break (") + str.tostring(left) + ")" : bar_index < eCool ? "COOLDOWN " + str.tostring(eCool - bar_index) : "IDLE — watching"
     string rejTip = "REJECTED SETUPS (latest first not guaranteed — chronological):\n"
     if array.size(rejLog) > 0
         for ri = 0 to array.size(rejLog) - 1
