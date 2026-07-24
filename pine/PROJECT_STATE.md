@@ -45,6 +45,16 @@ sr_engine.pine, sr_poc.pine, level_core.pine (v1), setup_engine.pine, sr_fusion.
   degree-bars not `.bar`. `nowRef` = 1H-aligned epoch ms. Result: membership + confidence + star rank are
   byte-identical on 1m/5m/15m/1H (proven by `parity_audit.py` before/after). `decayBars`/`sepNorm` now mean
   the level's OWN degree-bars. `ev.bar` is retained but no longer read by any scoring reduction.
+- **REACH FIX (the real "levels missing on 1m/5m" cause, distinct from the above):** the book was
+  ACCUMULATED over CHART bars, so a low TF only created the HTF pivots inside its own bar-window
+  (1m≈3.5d, 5m≈17d, 15m≈52d, 1h≈208d) — older 4H/1D levels never appeared on 1m/5m. Fix: anchors are now
+  sourced INSIDE each degree's own context — `f_degAnchors()` (dedup accumulator via `f_pushUniq`) is run
+  through `request.security(<deg>, …, lookahead_off)` returning `array<float>` `aVals1/4/D/W`; `f_seed`
+  feeds them into `f_found` on the chart. Driven by the degree's OWN history → the complete set appears on
+  every chart TF. Proven by `reach_audit.py` (OLD 1m=2/5m=6/15m=9/1h=19; NEW 19 on every TF). **Known
+  follow-up:** event COUNT/CONF are still tallied by chart-side `f_interact`, so older levels read lower ev
+  on very low TFs — the LINES + distances (the engine's job) are complete/identical; HTF-sourcing the event
+  log is the next step. **COMPILE-TEST PENDING** (array-return-from-security is a new construct in this file).
 
 ## MS-CORE v1.1 — independent market-structure panel (freeze candidate)
 - **REVERTED to v1.1 (independent) on user's call** after the v1.2 state-engine upgrade "didn't look
