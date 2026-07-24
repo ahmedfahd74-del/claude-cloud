@@ -81,6 +81,11 @@ gNz = "Manual Nudge (LIVE floor / ceiling)"
 nudgeCeil  = input.float(0.0, "Nudge nearest RESISTANCE / ceiling (% of price)", minval=-2.0, maxval=2.0, step=0.01, group=gNz, tooltip="Presentation only. Shift the nearest level ABOVE price (the ceiling price is about to hit) up/down a hair to sit it on the exact wick. Does not change the level, its memory, or its score.")
 nudgeFloor = input.float(0.0, "Nudge nearest SUPPORT / floor (% of price)", minval=-2.0, maxval=2.0, step=0.01, group=gNz, tooltip="Presentation only. Shift the nearest level BELOW price (the floor price is about to hit).")
 
+gP = "Position Layer (HTF bias + regime)"
+posMomLen = input.int(50, "HTF momentum EMA length (per 1W/1D/4H)", minval=5, maxval=400, group=gP, tooltip="Each HTF votes its HH/HL/LH/LL structure ONLY if momentum agrees: price above this EMA = bullish momentum, below = bearish. Momentum that OPPOSES the structure vetoes that timeframe's vote.")
+erLen     = input.int(20, "Regime efficiency-ratio lookback (Daily bars)", minval=5, maxval=200, group=gP)
+erTrend   = input.float(0.35, "Trending threshold (Daily efficiency ratio 0–1)", minval=0.05, maxval=0.95, step=0.05, group=gP, tooltip="Kaufman efficiency ratio on the Daily = |net move| / |sum of bar moves|. At or above this = TRENDING; below = RANGING. Independent of the HH/HL structure, so it is a genuine second opinion.")
+
 gE = "Entry Engine (liquidity-first) — M4"
 useEntry    = input.bool(true, "Enable liquidity-first entry signals", group=gE, tooltip="Flow: HTF bias → target liquidity → SWEEP of a strong LIVE level → quality rejection → LTF structure sequence (SHORT: LH then LL · LONG: HL then HH) → signal toward the opposing level. Signals are visual/alerts only — paper trading.")
 entryBiasSw = input.int(5, "Bias Swing Size (W/D/4H/1H sequence classifier)", minval=2, maxval=30, group=gE, tooltip="Same HH+HL / LH+LL sequence rule as MS-Core, weighted W .40 D .30 4H .20 1H .10 with a ±0.15 deadband. MIXED bias = no signals.")
@@ -331,9 +336,12 @@ if a1D
 if a1W
     f_interact(3, nw, bar_index, time, hw, lw, cw, pcw)
 
-// ── M4: ENTRY ENGINE (liquidity-first) — read-only over the frozen level book ─
-// Bias: same HH+HL / LH+LL sequence classifier as MS-Core, on W/D/4H/1H closed
-// bars, weighted W .40 D .30 4H .20 1H .10, deadband ±0.15 → +1 / -1 / 0(MIXED).
+// ══ POSITION LAYER — HTF market bias + regime (governs the whole system) ══════
+// Bias: HH+HL / LH+LL structure per HTF (1W / 1D / 4H). Each timeframe's vote is
+// CONFIRMED by momentum (price vs EMA) — momentum that OPPOSES structure vetoes
+// that TF's vote. Require >= 2 of 3 HTFs to agree → directional bias; otherwise
+// NEUTRAL (range). This is the ONLY source of directional bias in the system:
+// the execution layer consumes it and can never create or override it.
 f_seqBias() =>
     _ph = ta.pivothigh(high, entryBiasSw, entryBiasSw)
     _pl = ta.pivotlow(low,  entryBiasSw, entryBiasSw)
@@ -353,12 +361,42 @@ f_seqBiasPrev() =>
     int _b = f_seqBias()
     _b[1]
 
-ebW = request.security(syminfo.tickerid, "W",   f_seqBiasPrev(), lookahead=barmerge.lookahead_on)
-ebD = request.security(syminfo.tickerid, "D",   f_seqBiasPrev(), lookahead=barmerge.lookahead_on)
-eb4 = request.security(syminfo.tickerid, "240", f_seqBiasPrev(), lookahead=barmerge.lookahead_on)
-eb1 = request.security(syminfo.tickerid, "60",  f_seqBiasPrev(), lookahead=barmerge.lookahead_on)
-entryScore = ebW * 0.40 + ebD * 0.30 + eb4 * 0.20 + eb1 * 0.10
-entryDir   = entryScore > 0.15 ? 1 : entryScore < -0.15 ? -1 : 0
+// momentum sign on the prior CLOSED bar (non-repainting): +1 above EMA, -1 below
+f_momPrev() =>
+    int _m = close > ta.ema(close, posMomLen) ? 1 : close < ta.ema(close, posMomLen) ? -1 : 0
+    _m[1]
+
+// Kaufman efficiency ratio on the prior CLOSED bar → regime (trend vs range)
+f_erPrev() =>
+    float _dir = math.abs(close - close[erLen])
+    float _vol = math.sum(math.abs(close - close[1]), erLen)
+    float _er  = _vol == 0 ? 0.0 : _dir / _vol
+    _er[1]
+
+// structure per HTF (1W / 1D / 4H)
+sbW = request.security(syminfo.tickerid, "W",   f_seqBiasPrev(), lookahead=barmerge.lookahead_on)
+sbD = request.security(syminfo.tickerid, "D",   f_seqBiasPrev(), lookahead=barmerge.lookahead_on)
+sb4 = request.security(syminfo.tickerid, "240", f_seqBiasPrev(), lookahead=barmerge.lookahead_on)
+// momentum per HTF (1W / 1D / 4H)
+moW = request.security(syminfo.tickerid, "W",   f_momPrev(), lookahead=barmerge.lookahead_on)
+moD = request.security(syminfo.tickerid, "D",   f_momPrev(), lookahead=barmerge.lookahead_on)
+mo4 = request.security(syminfo.tickerid, "240", f_momPrev(), lookahead=barmerge.lookahead_on)
+// regime from the Daily efficiency ratio (independent of structure)
+erD = request.security(syminfo.tickerid, "D",   f_erPrev(), lookahead=barmerge.lookahead_on)
+
+// each HTF votes its structure direction unless momentum directly opposes it
+f_vote(int s, int m) => s == 0 ? 0 : (m == -s ? 0 : s)
+vW = f_vote(sbW, moW)
+vD = f_vote(sbD, moD)
+v4 = f_vote(sb4, mo4)
+bulls = (vW == 1 ? 1 : 0) + (vD == 1 ? 1 : 0) + (v4 == 1 ? 1 : 0)
+bears = (vW == -1 ? 1 : 0) + (vD == -1 ? 1 : 0) + (v4 == -1 ? 1 : 0)
+posDir   = bulls >= 2 ? 1 : bears >= 2 ? -1 : 0   // 2/3 HTF agreement, else neutral
+posAgree = math.max(bulls, bears)                 // how many HTFs agree (0..3)
+regTrend = erD >= erTrend                          // Daily efficiency ratio → trending
+
+// the execution layer reads ONLY this bias — it does not compute its own
+entryDir = posDir
 
 // nearest level INDICES above / below price (true anchors — nudge never touches this)
 f_nearestIdx() =>
@@ -562,10 +600,12 @@ if useEntry and execOK and barstate.isconfirmed
 alertcondition(sigLong,  "M4 LONG (liquidity-first)",  "Liquidity-first LONG: floor swept + HL→HH structure confirmed")
 alertcondition(sigShort, "M4 SHORT (liquidity-first)", "Liquidity-first SHORT: ceiling swept + LH→LL structure confirmed")
 
-var table eT = table.new(position.bottom_right, 2, 4, border_width=1)
+var table eT = table.new(position.bottom_right, 2, 5, border_width=1)
 if useEntry and showEPanel and barstate.islast
-    ebTxt = entryDir == 1 ? "BULL" : entryDir == -1 ? "BEAR" : "MIXED"
-    ebCol = entryDir == 1 ? #26a69a : entryDir == -1 ? #ef5350 : color.new(color.gray, 20)
+    ebTxt = posDir == 1 ? "BULL" : posDir == -1 ? "BEAR" : "NEUTRAL"
+    ebCol = posDir == 1 ? #26a69a : posDir == -1 ? #ef5350 : color.new(color.gray, 20)
+    string biasTip = "POSITION LAYER — 2/3 HTF agreement (structure confirmed by momentum)\n1W  struct " + str.tostring(sbW) + " · mom " + str.tostring(moW) + " → vote " + str.tostring(vW) + "\n1D  struct " + str.tostring(sbD) + " · mom " + str.tostring(moD) + " → vote " + str.tostring(vD) + "\n4H  struct " + str.tostring(sb4) + " · mom " + str.tostring(mo4) + " → vote " + str.tostring(v4) + "\n→ " + ebTxt + "  (" + str.tostring(posAgree) + "/3 agree)  ·  a TF where momentum opposes structure is vetoed to 0"
+    regTip = "REGIME — Daily efficiency ratio " + str.tostring(erD, "#.00") + (regTrend ? " ≥ " : " < ") + str.tostring(erTrend, "#.00") + " → " + (regTrend ? "TRENDING (continuation setups favoured)" : "RANGING (expect fakeouts / mean reversion)")
     left = seqWindow - (bar_index - eSwBar)
     stTxt = not execOK ? "OFF — chart TF > " + maxExecTF + "m limit" : eSt == 1 ? (eDirL == -1 ? "SWEPT ▼ await bearish break (" : "SWEPT ▲ await bullish break (") + str.tostring(left) + ")" : bar_index < eCool ? "COOLDOWN " + str.tostring(eCool - bar_index) : "IDLE — watching"
     string rejTip = "REJECTED SETUPS (latest first not guaranteed — chronological):\n"
@@ -574,14 +614,16 @@ if useEntry and showEPanel and barstate.islast
             rejTip := rejTip + array.get(rejLog, ri) + "\n"
     else
         rejTip := rejTip + "none yet"
-    table.cell(eT, 0, 0, "ENTRY BIAS", text_color=color.white, bgcolor=color.new(color.black, 20), text_size=size.small)
-    table.cell(eT, 1, 0, ebTxt + " (" + str.tostring(entryScore, "#.00") + ")", text_color=color.white, bgcolor=ebCol, text_size=size.small)
-    table.cell(eT, 0, 1, "STATE", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
-    table.cell(eT, 1, 1, stTxt, text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
-    table.cell(eT, 0, 2, "SIGNALS", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
-    table.cell(eT, 1, 2, str.tostring(eSigCnt), text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
-    table.cell(eT, 0, 3, "REJECTED", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small, tooltip=rejTip)
-    table.cell(eT, 1, 3, str.tostring(array.get(rejTot, 0)), text_color=color.orange, bgcolor=color.new(color.black, 40), text_size=size.small, tooltip=rejTip)
+    table.cell(eT, 0, 0, "HTF BIAS", text_color=color.white, bgcolor=color.new(color.black, 20), text_size=size.small, tooltip=biasTip)
+    table.cell(eT, 1, 0, ebTxt + "  " + str.tostring(posAgree) + "/3", text_color=color.white, bgcolor=ebCol, text_size=size.small, tooltip=biasTip)
+    table.cell(eT, 0, 1, "REGIME", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small, tooltip=regTip)
+    table.cell(eT, 1, 1, regTrend ? "TRENDING" : "RANGING", text_color=regTrend ? #26a69a : color.orange, bgcolor=color.new(color.black, 40), text_size=size.small, tooltip=regTip)
+    table.cell(eT, 0, 2, "STATE", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
+    table.cell(eT, 1, 2, stTxt, text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
+    table.cell(eT, 0, 3, "SIGNALS", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
+    table.cell(eT, 1, 3, str.tostring(eSigCnt), text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
+    table.cell(eT, 0, 4, "REJECTED", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small, tooltip=rejTip)
+    table.cell(eT, 1, 4, str.tostring(array.get(rejTot, 0)), text_color=color.orange, bgcolor=color.new(color.black, 40), text_size=size.small, tooltip=rejTip)
 
 // ── RENDER ───────────────────────────────────────────────────────────────────
 var array<line>  dLine = array.new<line>()

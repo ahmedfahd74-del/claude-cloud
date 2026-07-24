@@ -91,6 +91,34 @@ NOTE: these validate the LOGIC, not compiled Pine — the real compile check is 
   tune minSweepATR / useLocFilter / entryMinCnf / rejMin / internalPiv / seqWindow from observation.
   Backtest before real money.
 
+## LAYERED DECISION SYSTEM (target architecture — approved)
+Top-down authorization, bottom-up execution. Higher layer grants permission + direction;
+lower layer only refines timing/price. A signal is valid only when all active layers agree;
+a lower layer can NEVER create or override higher-layer bias.
+- **POSITION LAYER** (BUILT — see below): HTF bias {bull/bear/neutral} + regime {trend/range}.
+- **INTRADAY LAYER** (next): AOI/liquidity setup validation → setup-quality score, SL from
+  invalidation, TP from opposing liquidity, break&retest. Gates execution.
+- **EXECUTION LAYER** = M4 v3 (built), now bias-free — consumes Position bias only. Next: optional
+  EMA50 reaction filter, wire the setup-quality gate. Timing only: sweep→internal BOS/CHoCH→entry.
+
+## POSITION LAYER — HTF bias + regime — BUILT + VALIDATED, **NOT frozen**
+- Lives in `level_core_v2.pine`, group "Position Layer (HTF bias + regime)". Module 1 untouched.
+- **Bias**: HH+HL / LH+LL structure per **1W / 1D / 4H** (`f_seqBias`, `entryBiasSw` swing), each TF's
+  vote **confirmed by momentum** (`f_momPrev`, price vs EMA `posMomLen`=50) — momentum that OPPOSES
+  structure vetoes that TF to 0 (`f_vote`). **≥2 of 3 HTFs must agree → directional; else NEUTRAL.**
+  `posDir` (=`entryDir` the execution layer reads) · `posAgree` (2 or 3). No single TF can force a call.
+- **Regime**: Daily **Kaufman efficiency ratio** (`f_erPrev`, `erLen`=20) ≥ `erTrend`(0.35) → TRENDING
+  else RANGING. Independent of structure = genuine second opinion. `regTrend`.
+- **Execution layer is now bias-free**: deleted M4's own weighted W/D/4H/1H score+deadband; `entryDir`
+  is assigned from `posDir`. M4 timing/gates unchanged (all 13 entry scenarios still PASS).
+- **Panel** (bottom-right, now 2×5): HTF BIAS (n/3, hover = per-TF struct·mom·vote) · REGIME
+  (hover = efficiency ratio vs threshold) · STATE · SIGNALS · REJECTED.
+- Validator: `pine/position_layer_validate.py` — 6 claims (vote veto truth table, 2/3 rule, no single-TF
+  force, momentum only REMOVES calls [194/729, never adds], selectivity 14 vs old 20 over 27 states,
+  regime threshold, determinism) PASS.
+- **Freeze blockers**: user compile + observe that NEUTRAL correctly suppresses trades in chop and the
+  bias matches the visible 1W/1D/4H structure. Tune posMomLen / erLen / erTrend from observation.
+
 ## OPEN / NON-BLOCKING FOLLOW-UPS
 - (polish) print FINAL CONF to 1 decimal to kill the display-rounding optic.
 - (future) optional min-confidence gate on which levels can arm M4; session-H/L + EQH/EQL pools as
