@@ -37,6 +37,14 @@ sr_engine.pine, sr_poc.pine, level_core.pine (v1), setup_engine.pine, sr_fusion.
   Appearance—Active Zone · Appearance—Labels · Confluence Merge · Manual Nudge (LIVE floor/ceiling).
 - **Manual Nudge:** presentation-only % shift of the LIVE floor/ceiling line+label+zone; true anchor,
   memory, score, detection all unchanged.
+- **CROSS-TF DETERMINISM FIX (root cause, user-approved edit to Module 1):** the book used to differ per
+  chart TF because four things were measured against the CHART, not the level's own degree. All four are
+  now TF-invariant: (1) `f_found` eviction distance uses `refPx` (fastest available HTF close 1H→4H→1D→1W)
+  not chart `close`; (2) `f_audit` decay uses `(nowRef − ev.t)/f_degMs(deg)` (degree-bars) not
+  `bar_index − ev.bar`; (3) `f_separation` and (4) `f_qualified` spacing use event timestamps `.t` in
+  degree-bars not `.bar`. `nowRef` = 1H-aligned epoch ms. Result: membership + confidence + star rank are
+  byte-identical on 1m/5m/15m/1H (proven by `parity_audit.py` before/after). `decayBars`/`sepNorm` now mean
+  the level's OWN degree-bars. `ev.bar` is retained but no longer read by any scoring reduction.
 
 ## MS-CORE v1.1 — independent market-structure panel (freeze candidate)
 - **REVERTED to v1.1 (independent) on user's call** after the v1.2 state-engine upgrade "didn't look
@@ -56,7 +64,8 @@ sr_engine.pine, sr_poc.pine, level_core.pine (v1), setup_engine.pine, sr_fusion.
 
 ## VALIDATORS (Python models of the Pine logic — run before every freeze)
 `pine/level_core_validate.py` (detection 5 props) · `pine/level_core_v2_score_validate.py` (scoring) ·
-`pine/level_core_v2_merge_validate.py` (merge). All currently PASS.
+`pine/level_core_v2_merge_validate.py` (merge) · `pine/parity_audit.py` (cross-TF determinism: OLD
+diverges, FIXED byte-identical on 1m/5m/15m/1H). All currently PASS.
 NOTE: these validate the LOGIC, not compiled Pine — the real compile check is the user's paste.
 
 ## ADVERSARIAL REVIEW (last run) — verdict per question
