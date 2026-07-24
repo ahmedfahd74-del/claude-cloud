@@ -81,6 +81,15 @@ gNz = "Manual Nudge (LIVE floor / ceiling)"
 nudgeCeil  = input.float(0.0, "Nudge nearest RESISTANCE / ceiling (% of price)", minval=-2.0, maxval=2.0, step=0.01, group=gNz, tooltip="Presentation only. Shift the nearest level ABOVE price (the ceiling price is about to hit) up/down a hair to sit it on the exact wick. Does not change the level, its memory, or its score.")
 nudgeFloor = input.float(0.0, "Nudge nearest SUPPORT / floor (% of price)", minval=-2.0, maxval=2.0, step=0.01, group=gNz, tooltip="Presentation only. Shift the nearest level BELOW price (the floor price is about to hit).")
 
+gE = "Entry Engine (liquidity-first) — M4"
+useEntry    = input.bool(true, "Enable liquidity-first entry signals", group=gE, tooltip="HTF bias decides direction. No entry at S/R directly: wait for a SWEEP of the LIVE level (wick through, close back = liquidity grab + rejection), then a structure CONFIRM (close through the sweep bar's opposite extreme) → signal toward the opposing LIVE level. Signals are visual/alerts only — paper trading.")
+entryBiasSw = input.int(5, "Bias Swing Size (W/D/4H/1H sequence classifier)", minval=2, maxval=30, group=gE, tooltip="Same HH+HL / LH+LL sequence rule as MS-Core, weighted W .40 D .30 4H .20 1H .10 with a ±0.15 deadband. MIXED bias = no signals.")
+confirmBars = input.int(3, "Confirm window (bars after sweep)", minval=1, maxval=20, group=gE)
+coolBars    = input.int(10, "Cooldown after a signal (bars)", minval=0, maxval=200, group=gE)
+showSwpMark = input.bool(true, "Mark armed sweeps (✕)", group=gE)
+showTrdLn   = input.bool(true, "Draw entry / stop / target lines on signal", group=gE)
+showEPanel  = input.bool(true, "Show entry-state panel", group=gE)
+
 f_sz(s) => s == "Tiny" ? size.tiny : s == "Normal" ? size.normal : size.small
 f_degTxt(int d) => d == 0 ? "1H" : d == 1 ? "4H" : d == 2 ? "1D" : "1W"
 f_lstyle(s) => s == "Dashed" ? line.style_dashed : s == "Dotted" ? line.style_dotted : line.style_solid
@@ -313,6 +322,129 @@ if a1D
     f_interact(2, nd, bar_index, time, hd, ld, cd, pcd)
 if a1W
     f_interact(3, nw, bar_index, time, hw, lw, cw, pcw)
+
+// ── M4: ENTRY ENGINE (liquidity-first) — read-only over the frozen level book ─
+// Bias: same HH+HL / LH+LL sequence classifier as MS-Core, on W/D/4H/1H closed
+// bars, weighted W .40 D .30 4H .20 1H .10, deadband ±0.15 → +1 / -1 / 0(MIXED).
+f_seqBias() =>
+    _ph = ta.pivothigh(high, entryBiasSw, entryBiasSw)
+    _pl = ta.pivotlow(low,  entryBiasSw, entryBiasSw)
+    var float _lastPH = na
+    var float _lastPL = na
+    var int   _hi = 0
+    var int   _lo = 0
+    if not na(_ph)
+        _hi := (na(_lastPH) or _ph > _lastPH) ? 1 : -1
+        _lastPH := _ph
+    if not na(_pl)
+        _lo := (na(_lastPL) or _pl < _lastPL) ? -1 : 1
+        _lastPL := _pl
+    _hi == 1 and _lo == 1 ? 1 : _hi == -1 and _lo == -1 ? -1 : 0
+
+f_seqBiasPrev() =>
+    int _b = f_seqBias()
+    _b[1]
+
+ebW = request.security(syminfo.tickerid, "W",   f_seqBiasPrev(), lookahead=barmerge.lookahead_on)
+ebD = request.security(syminfo.tickerid, "D",   f_seqBiasPrev(), lookahead=barmerge.lookahead_on)
+eb4 = request.security(syminfo.tickerid, "240", f_seqBiasPrev(), lookahead=barmerge.lookahead_on)
+eb1 = request.security(syminfo.tickerid, "60",  f_seqBiasPrev(), lookahead=barmerge.lookahead_on)
+entryScore = ebW * 0.40 + ebD * 0.30 + eb4 * 0.20 + eb1 * 0.10
+entryDir   = entryScore > 0.15 ? 1 : entryScore < -0.15 ? -1 : 0
+
+// nearest level anchors above / below price (true anchors — nudge never touches this)
+f_nearest() =>
+    float _up = na
+    float _dn = na
+    if array.size(book) > 0
+        for i = 0 to array.size(book) - 1
+            a = array.get(book, i).anchor
+            if a >= close and (na(_up) or a < _up)
+                _up := a
+            if a < close and (na(_dn) or a > _dn)
+                _dn := a
+    [_up, _dn]
+
+// state machine: 0 = IDLE · 1 = ARMED (swept, awaiting structure confirm)
+var int   eSt     = 0
+var int   eDirL   = 0      // armed direction: -1 short / +1 long
+var float eAnchor = na     // swept level
+var float eSwHi   = na     // sweep bar extremes
+var float eSwLo   = na
+var int   eSwBar  = 0
+var int   eCool   = 0
+var int   eSigCnt = 0      // signals fired (session stat)
+bool sigLong  = false
+bool sigShort = false
+float sigStop = na
+float sigTgt  = na
+
+if useEntry and barstate.isconfirmed
+    [nUp, nDn] = f_nearest()
+    // ARMED: expire / invalidate / confirm
+    if eSt == 1
+        if bar_index - eSwBar > confirmBars or entryDir != eDirL
+            eSt := 0
+        else if eDirL == -1
+            if close < eSwLo
+                sigShort := true
+            else if close > eSwHi
+                eSt := 0
+        else
+            if close > eSwHi
+                sigLong := true
+            else if close < eSwLo
+                eSt := 0
+    // SIGNAL: draw + cooldown
+    if sigShort or sigLong
+        sigStop := sigShort ? eSwHi : eSwLo
+        sigTgt  := sigShort ? nDn : nUp
+        rr = na(sigTgt) or math.abs(sigStop - close) == 0 ? na : math.abs(close - sigTgt) / math.abs(sigStop - close)
+        txt = (sigShort ? "▼ SHORT" : "▲ LONG") + "  @" + str.tostring(close, format.mintick) + "\nswept " + str.tostring(eAnchor, format.mintick) + " · stop " + str.tostring(sigStop, format.mintick) + (na(sigTgt) ? "" : " · tgt " + str.tostring(sigTgt, format.mintick)) + (na(rr) ? "" : " · R " + str.tostring(rr, "#.0"))
+        label.new(bar_index, sigShort ? high : low, txt, xloc=xloc.bar_index, style=sigShort ? label.style_label_down : label.style_label_up, color=sigShort ? color.new(#ef5350, 10) : color.new(#26a69a, 10), textcolor=color.white, size=size.small)
+        if showTrdLn
+            line.new(bar_index, close, bar_index + 12, close, xloc=xloc.bar_index, color=color.gray, width=1, style=line.style_solid)
+            line.new(bar_index, sigStop, bar_index + 12, sigStop, xloc=xloc.bar_index, color=#ef5350, width=1, style=line.style_dotted)
+            if not na(sigTgt)
+                line.new(bar_index, sigTgt, bar_index + 12, sigTgt, xloc=xloc.bar_index, color=#26a69a, width=1, style=line.style_dotted)
+        eSigCnt := eSigCnt + 1
+        eCool := bar_index + coolBars
+        eSt := 0
+    // IDLE: watch for a sweep of the LIVE level in the bias direction
+    if eSt == 0 and not (sigShort or sigLong) and bar_index >= eCool and entryDir != 0
+        if entryDir == -1 and not na(nUp) and high > nUp and close <= nUp
+            eSt := 1
+            eDirL := -1
+            eAnchor := nUp
+            eSwHi := high
+            eSwLo := low
+            eSwBar := bar_index
+            if showSwpMark
+                label.new(bar_index, high, "✕", xloc=xloc.bar_index, style=label.style_none, textcolor=#ef5350, size=size.small)
+        else if entryDir == 1 and not na(nDn) and low < nDn and close >= nDn
+            eSt := 1
+            eDirL := 1
+            eAnchor := nDn
+            eSwHi := high
+            eSwLo := low
+            eSwBar := bar_index
+            if showSwpMark
+                label.new(bar_index, low, "✕", xloc=xloc.bar_index, style=label.style_none, textcolor=#26a69a, size=size.small)
+
+alertcondition(sigLong,  "M4 LONG (liquidity-first)",  "Liquidity-first LONG: floor swept + structure confirmed")
+alertcondition(sigShort, "M4 SHORT (liquidity-first)", "Liquidity-first SHORT: ceiling swept + structure confirmed")
+
+var table eT = table.new(position.bottom_right, 2, 3, border_width=1)
+if useEntry and showEPanel and barstate.islast
+    ebTxt = entryDir == 1 ? "BULL" : entryDir == -1 ? "BEAR" : "MIXED"
+    ebCol = entryDir == 1 ? #26a69a : entryDir == -1 ? #ef5350 : color.new(color.gray, 20)
+    stTxt = eSt == 1 ? (eDirL == -1 ? "ARMED ▼ (" : "ARMED ▲ (") + str.tostring(confirmBars - (bar_index - eSwBar)) + " left)" : bar_index < eCool ? "COOLDOWN " + str.tostring(eCool - bar_index) : "IDLE — watching"
+    table.cell(eT, 0, 0, "ENTRY BIAS", text_color=color.white, bgcolor=color.new(color.black, 20), text_size=size.small)
+    table.cell(eT, 1, 0, ebTxt + " (" + str.tostring(entryScore, "#.00") + ")", text_color=color.white, bgcolor=ebCol, text_size=size.small)
+    table.cell(eT, 0, 1, "STATE", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
+    table.cell(eT, 1, 1, stTxt, text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
+    table.cell(eT, 0, 2, "SIGNALS", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
+    table.cell(eT, 1, 2, str.tostring(eSigCnt), text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
 
 // ── RENDER ───────────────────────────────────────────────────────────────────
 var array<line>  dLine = array.new<line>()

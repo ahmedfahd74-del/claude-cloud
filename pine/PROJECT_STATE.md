@@ -59,11 +59,25 @@ NOTE: these validate the LOGIC, not compiled Pine — the real compile check is 
 · 4 Insufficient pivots PASS (→ MIXED / "—") · 5 Tests PARTIAL (logic solid; compile risk remains).
 **Recommended: FREEZE (conditional on user's clean compile of both files).**
 
+## M4 — ENTRY ENGINE (liquidity-first) — BUILT + LOGIC-VALIDATED, **NOT frozen**
+- Lives inside `level_core_v2.pine`, group "Entry Engine (liquidity-first) — M4". Read-only over the
+  frozen book — no detection/scoring changes (all prior validators re-run and pass).
+- **Bias**: sequence classifier (HH+HL/LH+LL) on W/D/4H/1H closed bars, weights .40/.30/.20/.10,
+  deadband ±0.15 → +1/−1/0. **MIXED = no signals.** Input: `Bias Swing Size` (entryBiasSw, default 5).
+- **State machine (closed bars only)**: IDLE → sweep of LIVE level in bias direction (bear: wick > ceiling,
+  close ≤ ceiling; bull: mirror) = ARM (✕ mark) → within `confirmBars`(3) a close through the sweep bar's
+  opposite extreme = **SIGNAL** (label + entry/stop/target lines, stop = sweep wick, target = opposing LIVE
+  level, R:R shown) → cooldown `coolBars`(10). Expiry / close-beyond-sweep-extreme / bias-flip all reset.
+- Alerts: "M4 LONG/SHORT (liquidity-first)". Bottom-right entry panel: BIAS(score) / STATE / SIGNALS count.
+- Validator: `pine/level_core_v2_entry_validate.py` — 9 scenarios (arm, confirm, expiry, invalidation,
+  bias-flip reset, cooldown, MIXED, no-repaint gate, determinism) all PASS.
+- **Freeze blockers**: user compile + forward-test on live crypto (does it only fire on real sweeps?),
+  then tune confirmBars/coolBars from observation. Backtest before trusting with money.
+
 ## OPEN / NON-BLOCKING FOLLOW-UPS
 - (polish) print FINAL CONF to 1 decimal to kill the display-rounding optic.
-- (asked, not built) **Liquidity-first entry state machine**: HTF bias decides direction → don't enter
-  at S/R → wait for sweep of liquidity (BSL/SSL, EQH/EQL, session H/L) → rejection + structure confirm
-  → enter toward the opposing S/R level. Backtest before trusting. This is the proposed next module.
+- (future) optional min-confidence gate on which levels can arm M4; session-H/L + EQH/EQL pools as
+  additional sweep sources; backtest harness for M4 signal quality.
 
 ## GLOSSARY (desk / SMC terms the user uses)
 - **BSL** buy-side liquidity = buy stops above highs (red-dashed eye levels). **EQH** equal highs.
