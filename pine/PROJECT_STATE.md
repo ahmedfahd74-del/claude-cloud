@@ -38,15 +38,22 @@ sr_engine.pine, sr_poc.pine, level_core.pine (v1), setup_engine.pine, sr_fusion.
 - **Manual Nudge:** presentation-only % shift of the LIVE floor/ceiling line+label+zone; true anchor,
   memory, score, detection all unchanged.
 
-## MS-CORE — bias panel (frozen intent)
-- Dashboard rows (1W/1D/4H/1H **+ Chart**) all read the **same HH/HL/LH/LL sequence classifier**
-  `f_structPrev` via `request.security([1] + lookahead_on)` = last CLOSED bar.
-  Bias: **HH+HL = BULL · LH+LL = BEAR · conflicting = MIXED**. Not candle direction, not EMAs.
-- **Two swing sizes, decoupled:** `Bias Swing Size` (mtfSwing) drives **all** bias rows incl. Chart
-  (Chart row = security on `timeframe.period`, so on any TF it is byte-identical to that TF's MTF row);
-  `Label Swing Size` (swL) drives HH/HL/LH/LL labels + BOS/CHoCH visuals **only** — never bias.
-- Panel: TF | bias | struct(e.g. LH+LL); hover a row = audit (last swing high/low, state, reason).
-- BOS/CHoCH protected-swing drawing engine is separate and untouched.
+## MS-CORE v1.2 — market-structure panel + STATE engine (freeze candidate)
+- **Bias engine UPGRADED to the shared market-state engine** (was the simple HH+HL/LH+LL/MIXED
+  classifier). `f_state` here is **byte-identical** to `level_core_v2.pine`'s Position-Layer `f_state`
+  (six states TREND/PULLBACK/TRANSITION/DISTRIBUTION/ACCUMULATION/RANGE from HH/HL/LH/LL + swing
+  expansion + momentum + volatility). Verified by `pine/state_engine_consistency_check.py` (40-line
+  tree, identical). With matching inputs the two indicators **cannot disagree** — single bias authority.
+- Rows 1W/1D/4H/1H **+ Chart** each show their **state** (+ ▲/▼ if directional) and HH/HL sequence,
+  read via `f_statePrev` + `[1]` + lookahead_on = last CLOSED bar (non-repaint). Verdict = **2/3
+  agreement of W/D/4H** state votes → confirmed direction + system state (same precedence as Level Core).
+  1H + Chart are context only. Directional votes come **only** from TREND/PULLBACK.
+- Inputs must MATCH Level Core: `mtfSwing` (Bias Swing), `posMomLen`, `erLen`, `erTrend`, `erChop`.
+  Bias uses **wick high/low** (like Level Core); `swingSrc` affects the drawn labels only.
+- **BOS/CHoCH protected-swing drawing engine + HH/HL/LH/LL labels + sweeps are UNCHANGED** (the unique
+  on-chart visual; `swL` Label Swing Size). MS-Core = the structure PICTURE; Level Core = the decision.
+- Validators covering the engine: `position_layer_validate.py` (the shared classifier logic, 7 claims)
+  + `state_engine_consistency_check.py` (textual identity of the two Pine trees). Both PASS.
 
 ## VALIDATORS (Python models of the Pine logic — run before every freeze)
 `pine/level_core_validate.py` (detection 5 props) · `pine/level_core_v2_score_validate.py` (scoring) ·
