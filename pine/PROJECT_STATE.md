@@ -54,7 +54,13 @@ sr_engine.pine, sr_poc.pine, level_core.pine (v1), setup_engine.pine, sr_fusion.
   every chart TF. Proven by `reach_audit.py` (OLD 1m=2/5m=6/15m=9/1h=19; NEW 19 on every TF). **Known
   follow-up:** event COUNT/CONF are still tallied by chart-side `f_interact`, so older levels read lower ev
   on very low TFs — the LINES + distances (the engine's job) are complete/identical; HTF-sourcing the event
-  log is the next step. **COMPILE-TEST PENDING** (array-return-from-security is a new construct in this file).
+  log is the next step. (array-return-from-security COMPILES + RUNS — confirmed on chart.)
+- **RE10110 PERF FIX (Sentinel baseline candidate):** the first HTF-sourced build seeded every bar
+  (O(bars×anchors×book) ≈ 240M → 20s timeout). Now: (1) `f_seedFrom` seeds each anchor ONCE (append-only
+  index), (2) eviction removed — book holds the full distinct set (safety cap 480), (3) render draws only
+  the `maxLvls` nearest `close` (`distThr`, computed once on the last bar). Detection/scoring untouched;
+  membership still TF-invariant (identical book + same last-bar price → same nearest set). `refPx`/eviction
+  retired. All validators PASS.
 
 ## MS-CORE v1.1 — independent market-structure panel (freeze candidate)
 - **REVERTED to v1.1 (independent) on user's call** after the v1.2 state-engine upgrade "didn't look

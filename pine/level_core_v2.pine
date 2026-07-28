@@ -164,10 +164,10 @@ f_create(float px, int deg, int bar, int t) =>
     array.push(L.log, Ev.new(bar, t, 2, 0.0, 0.0, false))     // founding rejection (held)
     array.push(book, L)
 
-// found a level of a given degree; anchor immutable; keep book centered on price.
-// Eviction distance is measured against refPx (a TF-INVARIANT HTF close), NOT the
-// chart close — so the surviving set is identical on every chart timeframe.
-f_found(float px, int deg, int bar, int t, float refPx) =>
+// found a level of a given degree; anchor immutable. NO eviction: the book holds the
+// full distinct HTF-sourced set (hard safety cap only). The render caps the DISPLAY to
+// the maxLvls nearest price — so cost stays bounded without a per-bar eviction scan.
+f_found(float px, int deg, int bar, int t) =>
     if not na(px)
         band = px * bandPct / 100.0
         exists = false
@@ -176,20 +176,8 @@ f_found(float px, int deg, int bar, int t, float refPx) =>
                 if array.get(book, i).deg == deg and math.abs(array.get(book, i).anchor - px) <= band
                     exists := true
                     break
-        if not exists
-            if array.size(book) < maxLvls
-                f_create(px, deg, bar, t)
-            else
-                int far = -1
-                float fard = math.abs(px - refPx)
-                for i = 0 to array.size(book) - 1
-                    d = math.abs(array.get(book, i).anchor - refPx)
-                    if d > fard
-                        fard := d
-                        far := i
-                if far >= 0
-                    array.remove(book, far)
-                    f_create(px, deg, bar, t)
+        if not exists and array.size(book) < 480
+            f_create(px, deg, bar, t)
 
 // run interaction detection for one degree using ITS closed-bar OHLC (identical on any chart TF)
 f_interact(int deg, bool newBar, int bar, int t, float dh, float dl, float dc, float dpc) =>
@@ -348,25 +336,27 @@ n4 = ta.change(time("240")) != 0
 nd = ta.change(time("D"))   != 0
 nw = ta.change(time("W"))   != 0
 
-// TF-invariant centering reference for eviction: the fastest available HTF close
-// (1H → 4H → 1D → 1W). Same value on every chart TF → deterministic book membership.
-refPx = not na(c1) ? c1 : not na(c4) ? c4 : not na(cd) ? cd : cw
-
-// seed the book with the COMPLETE per-degree anchor set (identical on every chart TF).
-// f_found dedups and keeps the maxLvls nearest refPx; events accumulate via f_interact.
-f_seed(array<float> arr, int deg, float refP) =>
-    if array.size(arr) > 0
-        for i = 0 to array.size(arr) - 1
-            f_found(array.get(arr, i), deg, bar_index, time, refP)
-    array.size(arr)
+// seed the book ONCE with each degree's COMPLETE anchor set (HTF-sourced). Anchors are
+// appended in detection order, so we process only indices not yet seeded → O(anchors)
+// total across the whole chart, NOT O(bars × anchors). This is the RE10110 fix.
+f_seedFrom(array<float> arr, int deg, int from) =>
+    n = array.size(arr)
+    if n > from
+        for i = from to n - 1
+            f_found(array.get(arr, i), deg, bar_index, time)
+    n
+var int sd1 = 0
+var int sd4 = 0
+var int sdD = 0
+var int sdW = 0
 if a1H
-    f_seed(aVals1, 0, refPx)
+    sd1 := f_seedFrom(aVals1, 0, sd1)
 if a4H
-    f_seed(aVals4, 1, refPx)
+    sd4 := f_seedFrom(aVals4, 1, sd4)
 if a1D
-    f_seed(aValsD, 2, refPx)
+    sdD := f_seedFrom(aValsD, 2, sdD)
 if a1W
-    f_seed(aValsW, 3, refPx)
+    sdW := f_seedFrom(aValsW, 3, sdW)
 
 // interactions on each active degree's closed bars
 if a1H
@@ -747,6 +737,15 @@ if barstate.islast
         idx = math.min(topN, array.size(confs)) - 1
         if idx >= 0
             starThr := array.get(confs, idx)
+    // DISPLAY cap: the book holds the full HTF-sourced set, but draw only the maxLvls
+    // nearest price (+ always LIVE). TF-invariant: close on the last bar = current price.
+    float distThr = 1.0e20
+    if array.size(book) > maxLvls
+        dists = array.new_float()
+        for i = 0 to array.size(book) - 1
+            array.push(dists, math.abs(array.get(book, i).anchor - close))
+        array.sort(dists, order.ascending)
+        distThr := array.get(dists, maxLvls - 1)
     if array.size(book) > 0
         for i = 0 to array.size(book) - 1
             L = array.get(book, i)
@@ -757,7 +756,7 @@ if barstate.islast
             live = i == naIdx or i == nbIdx
             [conf, winF, rejF, dispF, sweepF, sepF, evidF, degW, nEv, avgW, held, brk] = f_audit(L)
             starred = topN > 0 and conf >= starThr
-            if (conf >= minConf or live) and (events >= minShow or live)
+            if (conf >= minConf or live) and (events >= minShow or live) and (math.abs(L.anchor - close) <= distThr or live)
                 // CONFLUENCE MERGE (inline, no parallel arrays → crash-proof): absorb this level
                 // if a stronger candidate sits within the merge band; else it's the cluster's line.
                 merged = false
