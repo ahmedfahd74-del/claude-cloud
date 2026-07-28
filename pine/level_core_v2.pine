@@ -104,6 +104,15 @@ showSwpMark = input.bool(true, "Mark armed sweeps (✕)", group=gE)
 showTrdLn   = input.bool(true, "Draw entry / stop / target lines on signal", group=gE)
 showEPanel  = input.bool(true, "Show entry-state panel (hover REJECTED = reasons log)", group=gE)
 
+gCZ = "Claude Zone (ranked view)"
+viewMode   = input.string("All levels", "View", options=["All levels", "Leading (ranked)", "Claude Zone (3)"], group=gCZ, tooltip="All = every level (nearest maxLvls). Leading = only the N strongest each side. Claude Zone = just 3 lines: strongest support, strongest resistance, and the Claude Line between them.")
+leadN      = input.int(3, "Leading levels per side", minval=1, maxval=20, group=gCZ)
+showClaude = input.bool(true, "Show Claude Line (equilibrium of the alpha range)", group=gCZ, tooltip="The center line between the strongest support cluster below price and the strongest resistance cluster above. Fair-value magnet: price tends to bounce it or break-and-retest it, then travel.")
+midMode    = input.string("Equilibrium 50%", "Middle =", options=["Equilibrium 50%", "Snap to nearest strong level"], group=gCZ)
+showPD     = input.bool(true, "Shade premium / discount", group=gCZ)
+gateCZ     = input.bool(true, "Bias by MARKET STATE (range = mean-revert · trend = continuation)", group=gCZ)
+claudeCol  = input.color(#ffd24a, "Claude Line colour", group=gCZ)
+
 f_sz(s) => s == "Tiny" ? size.tiny : s == "Normal" ? size.normal : size.small
 f_degTxt(int d) => d == 0 ? "1H" : d == 1 ? "4H" : d == 2 ? "1D" : "1W"
 f_lstyle(s) => s == "Dashed" ? line.style_dashed : s == "Dotted" ? line.style_dotted : line.style_solid
@@ -746,6 +755,53 @@ if barstate.islast
             array.push(dists, math.abs(array.get(book, i).anchor - close))
         array.sort(dists, order.ascending)
         distThr := array.get(dists, maxLvls - 1)
+    // ── CLAUDE ZONE: rank each level's cluster strength; pick the strongest support
+    // below price + strongest resistance above; the Claude Line is their equilibrium. ──
+    strengths = array.new_float()
+    if array.size(book) > 0
+        for i = 0 to array.size(book) - 1
+            array.push(strengths, f_lvlStrength(i))
+    int aFloorI = -1
+    int aCeilI  = -1
+    float aFloorS = -1.0
+    float aCeilS  = -1.0
+    if array.size(book) > 0
+        for i = 0 to array.size(book) - 1
+            a = array.get(book, i).anchor
+            s = array.get(strengths, i)
+            if a < close and s > aFloorS
+                aFloorS := s
+                aFloorI := i
+            if a >= close and s > aCeilS
+                aCeilS := s
+                aCeilI := i
+    float aFloor = aFloorI >= 0 ? array.get(book, aFloorI).anchor : na
+    float aCeil  = aCeilI  >= 0 ? array.get(book, aCeilI).anchor  : na
+    float eqMid  = na(aFloor) or na(aCeil) ? na : (aFloor + aCeil) / 2.0
+    float claudeMid = eqMid
+    if midMode == "Snap to nearest strong level" and not na(eqMid) and array.size(book) > 0
+        float bestD = 1.0e20
+        for i = 0 to array.size(book) - 1
+            d = math.abs(array.get(book, i).anchor - eqMid)
+            if d < bestD
+                bestD := d
+                claudeMid := array.get(book, i).anchor
+    float leadFloorThr = -1.0
+    float leadCeilThr  = -1.0
+    if viewMode == "Leading (ranked)" and array.size(book) > 0
+        fS = array.new_float()
+        cS = array.new_float()
+        for i = 0 to array.size(book) - 1
+            if array.get(book, i).anchor < close
+                array.push(fS, array.get(strengths, i))
+            else
+                array.push(cS, array.get(strengths, i))
+        if array.size(fS) > 0
+            array.sort(fS, order.descending)
+            leadFloorThr := array.get(fS, math.min(leadN, array.size(fS)) - 1)
+        if array.size(cS) > 0
+            array.sort(cS, order.descending)
+            leadCeilThr := array.get(cS, math.min(leadN, array.size(cS)) - 1)
     if array.size(book) > 0
         for i = 0 to array.size(book) - 1
             L = array.get(book, i)
@@ -756,7 +812,9 @@ if barstate.islast
             live = i == naIdx or i == nbIdx
             [conf, winF, rejF, dispF, sweepF, sepF, evidF, degW, nEv, avgW, held, brk] = f_audit(L)
             starred = topN > 0 and conf >= starThr
-            if (conf >= minConf or live) and (events >= minShow or live) and (math.abs(L.anchor - close) <= distThr or live)
+            passView = viewMode == "Claude Zone (3)" ? false : viewMode == "Leading (ranked)" ? (array.get(strengths, i) >= (L.anchor < close ? leadFloorThr : leadCeilThr)) : (math.abs(L.anchor - close) <= distThr)
+            liveShow = live and viewMode != "Claude Zone (3)"
+            if (conf >= minConf or liveShow) and (events >= minShow or liveShow) and (passView or liveShow)
                 // CONFLUENCE MERGE (inline, no parallel arrays → crash-proof): absorb this level
                 // if a stronger candidate sits within the merge band; else it's the cluster's line.
                 merged = false
@@ -832,3 +890,19 @@ if barstate.islast
                     lblX = lblSide == "Left" ? x1 : x2
                     lblStyle = lblSide == "Left" ? label.style_label_right : label.style_label_left
                     array.push(dLab, label.new(lblX, drawA, head, xloc=xloc.bar_index, style=lblStyle, color=color.new(col, live ? 0 : lblOp), textcolor=color.white, size=f_sz(lblSize), tooltip=tl))
+    // ── CLAUDE ZONE lines (only in "Claude Zone (3)" view) + the Claude Line (any view) ──
+    zoneOn = viewMode == "Claude Zone (3)"
+    if zoneOn and not na(aFloor)
+        array.push(dLine, line.new(x1, aFloor, x2, aFloor, color=supCol, width=emphWidth, extend=f_ext(extMode)))
+        array.push(dLab, label.new(x2, aFloor, "◄ FLOOR " + str.tostring(aFloor, format.mintick) + "  STR " + str.tostring(math.round(aFloorS)), xloc=xloc.bar_index, style=label.style_label_left, color=color.new(supCol, 0), textcolor=color.white, size=f_sz(lblSize)))
+    if zoneOn and not na(aCeil)
+        array.push(dLine, line.new(x1, aCeil, x2, aCeil, color=resCol, width=emphWidth, extend=f_ext(extMode)))
+        array.push(dLab, label.new(x2, aCeil, "◄ CEILING " + str.tostring(aCeil, format.mintick) + "  STR " + str.tostring(math.round(aCeilS)), xloc=xloc.bar_index, style=label.style_label_left, color=color.new(resCol, 0), textcolor=color.white, size=f_sz(lblSize)))
+    if showClaude and not na(claudeMid)
+        pd = close >= claudeMid ? "PREMIUM · lean short" : "DISCOUNT · lean long"
+        beh = not gateCZ ? "" : (sysState == 1 or sysState == 2) ? "  ·  TREND → continuation only" : "  ·  RANGE → mean-revert"
+        array.push(dLine, line.new(x1, claudeMid, x2, claudeMid, color=claudeCol, width=2, extend=f_ext(extMode), style=line.style_dashed))
+        array.push(dLab, label.new(x2, claudeMid, "CLAUDE LINE " + str.tostring(claudeMid, format.mintick) + "\n" + pd + beh, xloc=xloc.bar_index, style=label.style_label_left, color=color.new(claudeCol, 0), textcolor=color.black, size=f_sz(lblSize)))
+        if showPD and not na(aFloor) and not na(aCeil)
+            array.push(dBox, box.new(x1, aCeil, x2, claudeMid, border_color=color.new(resCol, 100), bgcolor=color.new(resCol, 92)))
+            array.push(dBox, box.new(x1, claudeMid, x2, aFloor, border_color=color.new(supCol, 100), bgcolor=color.new(supCol, 92)))

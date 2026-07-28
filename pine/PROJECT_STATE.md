@@ -122,6 +122,18 @@ NOTE: these validate the LOGIC, not compiled Pine — the real compile check is 
   tune minSweepATR / useLocFilter / entryMinCnf / rejMin / internalPiv / seqWindow from observation.
   Backtest before real money.
 
+## CLAUDE ZONE (ranked view) — display layer, BUILT, NOT frozen
+- `level_core_v2.pine` group "Claude Zone (ranked view)". DISPLAY-ONLY (reuses `f_lvlStrength` =
+  CONF + confluence; no detection/scoring change). Renders on the last bar.
+- `viewMode`: **All** (nearest maxLvls) · **Leading (ranked)** (top `leadN` by strength each side) ·
+  **Claude Zone (3)** (only: strongest support cluster below price + strongest resistance above + the
+  Claude Line). Alpha floor/ceiling = argmax `f_lvlStrength` each side of `close`.
+- **Claude Line** (`showClaude`) = equilibrium of alpha floor↔ceiling (or `midMode` snap-to-nearest-level).
+  Labeled PREMIUM/DISCOUNT vs price; `gateCZ` tags behaviour from `sysState` (TREND/PULLBACK → continuation,
+  else mean-revert). `showPD` shades premium/discount boxes. Concept: fair-value magnet the user trades.
+- **COMPILE-TEST PENDING** (new render block, blind). All Python validators still PASS; determinism/HTF
+  sourcing/RE10110 fix untouched.
+
 ## LAYERED DECISION SYSTEM (target architecture — approved)
 Top-down authorization, bottom-up execution. Higher layer grants permission + direction;
 lower layer only refines timing/price. A signal is valid only when all active layers agree;
