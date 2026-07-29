@@ -349,11 +349,14 @@ nw = ta.change(time("W"))   != 0
 // appended in detection order, so we process only indices not yet seeded → O(anchors)
 // total across the whole chart, NOT O(bars × anchors). This is the RE10110 fix.
 f_seedFrom(array<float> arr, int deg, int from) =>
-    n = array.size(arr)
-    if n > from
-        for i = from to n - 1
-            f_found(array.get(arr, i), deg, bar_index, time)
-    n
+    int r = from
+    if not na(arr)                          // request.security arrays are na until HTF has data
+        n = array.size(arr)
+        if n > from
+            for i = from to n - 1
+                f_found(array.get(arr, i), deg, bar_index, time)
+        r := n
+    r
 var int sd1 = 0
 var int sd4 = 0
 var int sdD = 0
@@ -397,7 +400,8 @@ f_state() =>
     _lh = not na(_h1) and not na(_h2) and _h1 < _h2      // lower high
     _hl = not na(_l1) and not na(_l2) and _l1 > _l2      // higher low
     _ll = not na(_l1) and not na(_l2) and _l1 < _l2      // lower low
-    _m  = close > ta.ema(close, posMomLen) ? 1 : close < ta.ema(close, posMomLen) ? -1 : 0   // momentum
+    _e  = ta.ema(close, posMomLen)                       // call ta.ema once (every bar)
+    _m  = close > _e ? 1 : close < _e ? -1 : 0           // momentum
     _dir = math.abs(close - close[erLen])
     _vol = math.sum(math.abs(close - close[1]), erLen)
     _er  = _vol == 0 ? 0.0 : _dir / _vol                 // efficiency ratio = volatility/strength
@@ -838,7 +842,7 @@ if barstate.islast
                 col = colByDeg ? f_degCol(L.deg) : (isRes ? resCol : supCol)
                 decided = bounces + breaks
                 band = L.anchor * bandPct / 100.0
-                lw = (live or starred or isCluster) ? emphWidth : lineWidth
+                linW = (live or starred or isCluster) ? emphWidth : lineWidth
                 // manual nudge — presentation only, applies to the LIVE ceiling / floor
                 nOff = (i == naIdx ? nudgeCeil : i == nbIdx ? nudgeFloor : 0.0) * L.anchor / 100.0
                 drawA = L.anchor + nOff
@@ -847,7 +851,7 @@ if barstate.islast
                     zb = (na(L.testLo) ? L.anchor - band : math.min(L.testLo, L.anchor - band)) + nOff
                     array.push(dBox, box.new(x1, zt, x2, zb, border_color=zoneBord > 0 ? color.new(zoneCol, 40) : color.new(zoneCol, 100), bgcolor=color.new(zoneCol, zoneOp), border_width=zoneBord))
                 else
-                    array.push(dLine, line.new(x1, drawA, x2, drawA, color=col, width=lw, extend=f_ext(extMode), style=f_lstyle(lineStyleIn)))
+                    array.push(dLine, line.new(x1, drawA, x2, drawA, color=col, width=linW, extend=f_ext(extMode), style=f_lstyle(lineStyleIn)))
                 if showLbl
                     bornT = array.size(L.log) > 0 ? array.get(L.log, 0).t : time
                     string tl = "LEVEL " + str.tostring(L.anchor, format.mintick) + "  [" + f_degTxt(L.deg) + " degree]\n" + (isRes ? "resistance" : "support") + " · born " + str.format_time(bornT, "yyyy-MM-dd") + "\n———————————————\n"
