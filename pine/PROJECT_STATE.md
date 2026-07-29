@@ -134,6 +134,26 @@ NOTE: these validate the LOGIC, not compiled Pine — the real compile check is 
 - **COMPILE-TEST PENDING** (new render block, blind). All Python validators still PASS; determinism/HTF
   sourcing/RE10110 fix untouched.
 
+## LOCATION ENGINE (active dealing range / auction) — BUILT, NOT frozen
+- `level_core_v2.pine` group "Location Engine (auction range)". The Claude Zone's stable, TF-independent
+  definition — replaces the touch-cluster floor/ceiling (which can't be cross-TF stable in Pine; reach limit).
+- Reads the last 3 CONFIRMED swings each side on a FIXED `auctionTF` (default 1D) via
+  `request.security(auctionTF, [ta.valuewhen(pivot,0..2) …], lookahead_off)` — SINGLE HTF values Pine
+  computes over the auction TF's own full history → **identical on every chart TF** (no accumulated book).
+- Publishes: `locUB` (nearest swing high ≥ price), `locLB` (nearest swing low ≤ price), `locEQ` (midpoint =
+  Claude Line), `locPremium`, `locState` (0 INSIDE·1 APPROACH_CEIL·2 APPROACH_FLOOR·3 EXPANSION_UP·
+  4 EXPANSION_DOWN·5 UNDEFINED), and **auction Version / Age / Transition** (v++ on any boundary change;
+  transition types new-ceiling/new-floor/accept-up/accept-down/both). Machine-readable via
+  `plot(..., display.data_window)`; `alertcondition` fires on transition. **Publisher-first: the visual
+  Claude Zone is one consumer; every IMIS component can read the same auction description.**
+- **Consumers wired:** Claude Zone (3) floor/ceiling/line = locLB/locUB/locEQ; "Claude Line only" = locEQ;
+  **Leading (ranked) now draws the 3 auction swings each side (test of the same auction basis).** "All levels"
+  still shows the per-TF touch-cluster book unchanged.
+- Validator `pine/location_engine_validate.py` — 5 claims (nearest boundaries, premium/discount, 6 states,
+  versioned transitions+age, identical-output-for-identical-swings, determinism) PASS. **COMPILE-TEST PENDING**
+  (security tuple + valuewhen + data_window plots are new constructs). Honest note: `auctionVer` is a per-chart
+  counter (its absolute value can differ by chart history) but the RANGE (UB/LB/EQ) is byte-stable across TFs.
+
 ## LAYERED DECISION SYSTEM (target architecture — approved)
 Top-down authorization, bottom-up execution. Higher layer grants permission + direction;
 lower layer only refines timing/price. A signal is valid only when all active layers agree;
