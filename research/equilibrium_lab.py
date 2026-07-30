@@ -223,6 +223,79 @@ def lead_lag(events):
     return {k:(v[0]/v[1], v[1]) for k,v in acc.items() if v[1]>0}
 
 # ─────────────────────────────────────────────────────────────────────────────
+# REUSABLE ANALYSIS (so ORDERED and SURROGATE run through the identical pipeline)
+# ─────────────────────────────────────────────────────────────────────────────
+def rate(ms, attr):
+    vals=[getattr(m,attr) for m in ms if getattr(m,attr) is not None]
+    return (100*sum(1 for v in vals if v)/len(vals)) if vals else float('nan')
+
+def build_all(o,h,l,c,Ls):
+    """the whole 26-line family, migrations mapped onto the DAILY timeline."""
+    wo,wh,wl,wc,day2wk = resample(o,h,l,c,7)
+    wk_first={}
+    for di,wk in enumerate(day2wk):
+        wk_first.setdefault(wk,di)
+    all_migs=[]; per_line={}
+    for L in Ls:
+        _,migs = build_line('D',L,o,h,l,c)
+        per_line[('D',L)]=migs; all_migs+=migs
+    for L in Ls:
+        _,migs = build_line('W',L,wo,wh,wl,wc)
+        mapped=[Migration('W',L,wk_first[m.t_tf],m.prev,m.new,m.delta,m.direction,m.cause)
+                for m in migs if m.t_tf in wk_first]
+        per_line[('W',L)]=mapped; all_migs+=mapped
+    return all_migs, per_line
+
+def analyze(o,h,l,c,Ls,M,thresh):
+    n=len(c)
+    all_migs, per_line = build_all(o,h,l,c,Ls)
+    eval_respect(all_migs,o,h,l,c,M=M)          # mutates the shared objects in per_line too
+    struct=[m for m in all_migs if m.cause.startswith('new_')]
+    ev=coherence_events(struct,n,W=2,thresh=thresh)
+    coh=[m for _,_,p in ev for m in p]
+    gap_t=rate(coh,'respected_touch')-rate(struct,'respected_touch')
+    gap_h=rate(coh,'respected_hold') -rate(struct,'respected_hold')
+    return dict(n=n, all=all_migs, per_line=per_line, struct=struct, ev=ev, coh=coh,
+                gap_t=gap_t, gap_h=gap_h)
+
+def surrogate(o,h,l,c, seed=101):
+    """SHUFFLE control: permute close-to-close returns AND intrabar offsets. Same
+    return distribution / volatility / fat tails, but time-ordering DESTROYED — so
+    any structure that survives ordering but dies here was genuinely temporal."""
+    rnd=random.Random(seed); n=len(c)
+    rets=[math.log(c[t]/c[t-1]) for t in range(1,n)]
+    up =[(h[t]-c[t])/c[t] for t in range(n)]
+    dn =[(c[t]-l[t])/c[t] for t in range(n)]
+    opf=[(o[t]-c[t])/c[t] for t in range(n)]
+    rnd.shuffle(rets); rnd.shuffle(up); rnd.shuffle(dn); rnd.shuffle(opf)
+    cc=[c[0]]
+    for r in rets: cc.append(cc[-1]*math.exp(r))
+    o2=[];h2=[];l2=[];c2=[]
+    for t in range(n):
+        cl=cc[t]
+        oo=cl*(1+opf[t]); hh=cl*(1+abs(up[t])); ll=cl*(1-abs(dn[t]))
+        o2.append(oo); h2.append(max(hh,oo,cl)); l2.append(min(ll,oo,cl)); c2.append(cl)
+    return o2,h2,l2,c2
+
+def sequencing(per_line):
+    """HIGHER-LOW / LOWER-HIGH SEQUENCING: per line, find RUNS of consecutive
+    same-direction structural migrations (equilibrium stair-stepping). Split into
+    SEQUENCED (run length >= 2) vs ISOLATED (single). The user's phenomenon is the
+    sequenced up-chain (HL after HL). Returns (sequenced, isolated) migration lists."""
+    seq=[]; iso=[]
+    for ms in per_line.values():
+        s=sorted([m for m in ms if m.cause.startswith('new_')], key=lambda m:m.t_tf)
+        i=0
+        while i<len(s):
+            j=i
+            while j+1<len(s) and s[j+1].direction==s[i].direction:
+                j+=1
+            run=s[i:j+1]
+            (seq if len(run)>=2 else iso).extend(run)
+            i=j+1
+    return seq, iso
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
@@ -236,91 +309,63 @@ def main():
         o,h,l,c=load_csv(a.csv); src=f"REAL CSV {a.csv}"
     else:
         o,h,l,c=synth_daily(a.n,a.seed); src=f"SYNTHETIC NULL MODEL (seed {a.seed}, {a.n} daily bars)"
-    n=len(c)
-    wo,wh,wl,wc,day2wk = resample(o,h,l,c,7)
     Ls=list(range(2,15))
 
-    all_daily_migs=[]; per_line={}
-    for L in Ls:                                   # DAILY family
-        _,migs = build_line('D',L,o,h,l,c)
-        for m in migs: all_daily_migs.append(m)    # daily migs already on day index
-        per_line[('D',L)]=migs
-    for L in Ls:                                   # WEEKLY family → map week migs to first day of that week
-        _,migs = build_line('W',L,wo,wh,wl,wc)
-        # invert day2wk: first day index of each week
-        wk_first={}
-        for di,wk in enumerate(day2wk):
-            wk_first.setdefault(wk,di)
-        mapped=[]
-        for m in migs:
-            dd=wk_first.get(m.t_tf)
-            if dd is not None:
-                mm=Migration('W',L,dd,m.prev,m.new,m.delta,m.direction,m.cause)
-                mapped.append(mm)
-        per_line[('W',L)]=mapped
-        all_daily_migs+=mapped
-
-    eval_respect(all_daily_migs,o,h,l,c,M=a.M)
-
-    # ---- report ----
+    R=analyze(o,h,l,c,Ls,a.M,a.thresh)          # ORDERED
     print("="*74)
     print("EQUILIBRIUM LAB  ·  source:",src)
     print("family: W@2..14 + D@2..14 = 26 independent equilibrium lines")
     print("="*74)
 
-    # Q1: are migrations structure-driven or price-cross (mechanical drift)?
-    tot=len(all_daily_migs)
-    new_swing=sum(1 for m in all_daily_migs if m.cause.startswith('new_'))
-    print(f"\n[Q1] MIGRATIONS ARE STRUCTURE-DRIVEN?")
-    print(f"  total migrations: {tot}")
-    print(f"  caused by a NEW confirmed swing: {new_swing} ({100*new_swing/max(1,tot):.0f}%)")
-    print(f"  caused by price crossing an old level: {tot-new_swing} ({100*(tot-new_swing)/max(1,tot):.0f}%)")
+    tot=len(R['all']); new_swing=len(R['struct'])
+    print(f"\n[Q1] STRUCTURE-DRIVEN vs price-drift")
+    print(f"  total migrations {tot} · NEW swing {new_swing} ({100*new_swing/max(1,tot):.0f}%) · price-cross {tot-new_swing} ({100*(tot-new_swing)/max(1,tot):.0f}%)")
 
-    # Q2/Q3: per-(tf,L) migration count + BOTH respect rates
-    print(f"\n[Q2/Q3] PER-LINE BEHAVIOUR  (respect measured {a.M} bars forward, no lookahead)")
+    print(f"\n[Q2/Q3] PER-LINE  (respect {a.M} bars fwd, no lookahead)")
     print(f"  {'line':>6} {'migs':>5} {'respTOUCH':>10} {'respHOLD':>9}")
-    def rate(ms, attr):
-        vals=[getattr(m,attr) for m in ms if getattr(m,attr) is not None]
-        return (100*sum(1 for v in vals if v)/len(vals)) if vals else float('nan')
     for tf in ('W','D'):
         for L in Ls:
-            ms=per_line[(tf,L)]
+            ms=R['per_line'][(tf,L)]
             print(f"  {tf+'@'+str(L):>6} {len(ms):>5} {rate(ms,'respected_touch'):>9.0f}% {rate(ms,'respected_hold'):>8.0f}%")
 
-    # Q4/Q5: coherence + lead-lag
-    # STRUCTURE-DRIVEN migrations only = the user's actual phenomenon (new auction level),
-    # not price drifting across old levels. Coherence among THESE is the real test.
-    struct_migs=[m for m in all_daily_migs if m.cause.startswith('new_')]
-    ev=coherence_events(struct_migs,n,W=2,thresh=a.thresh)
-    print(f"\n[Q4] COHERENCE of STRUCTURE-DRIVEN migrations only (the real phenomenon)")
-    print(f"  (>= {a.thresh} independent lines repricing SAME way on new swings within +/-2 days)")
-    print(f"  coherent repricing events found: {len(ev)}")
-    if ev:
-        sizes=[len(p) for _,_,p in ev]
-        print(f"  avg lines participating per event: {sum(sizes)/len(sizes):.1f}  (max {max(sizes)})")
-        # THE key test: does independent agreement improve the respect rate?
-        coh_migs=[m for _,_,p in ev for m in p]
-        print(f"  respTOUCH  coherent: {rate(coh_migs,'respected_touch'):.0f}%   vs all struct: {rate(struct_migs,'respected_touch'):.0f}%   vs everything: {rate(all_daily_migs,'respected_touch'):.0f}%")
-        print(f"  respHOLD   coherent: {rate(coh_migs,'respected_hold'):.0f}%   vs all struct: {rate(struct_migs,'respected_hold'):.0f}%   vs everything: {rate(all_daily_migs,'respected_hold'):.0f}%")
-        gap_t = rate(coh_migs,'respected_touch') - rate(struct_migs,'respected_touch')
-        gap_h = rate(coh_migs,'respected_hold')  - rate(struct_migs,'respected_hold')
-        print(f"  >>> coherence lifts respect by +{gap_t:.0f}pt (touch) / +{gap_h:.0f}pt (hold) even on the")
-        print(f"      NULL MODEL — a MECHANICAL premium (strong swings are multi-scale by nature).")
-        print(f"      REAL market 'intent' only if real data's gap EXCEEDS this null gap.")
+    print(f"\n[Q4] COHERENCE of STRUCTURE-DRIVEN migrations (>= {a.thresh} lines same-way, +/-2d)")
+    print(f"  events {len(R['ev'])} · respTOUCH coherent {rate(R['coh'],'respected_touch'):.0f}% vs struct {rate(R['struct'],'respected_touch'):.0f}%  |  respHOLD coherent {rate(R['coh'],'respected_hold'):.0f}% vs struct {rate(R['struct'],'respected_hold'):.0f}%")
 
-    ll=lead_lag(ev)
+    ll=lead_lag(R['ev'])
     if ll:
-        print(f"\n[Q5] LEAD-LAG  (avg migration order in coherent events; LOW = leads first)")
         ranked=sorted(ll.items(), key=lambda kv:kv[1][0])
-        print("  LEADERS:", ", ".join(f"{tf}@{L}({r:.1f})" for (tf,L),(r,cnt) in ranked[:5]))
-        print("  LAGGERS:", ", ".join(f"{tf}@{L}({r:.1f})" for (tf,L),(r,cnt) in ranked[-5:]))
+        print(f"\n[Q5] LEAD-LAG (order in coherent events; LOW leads)")
+        print("  LEADERS:", ", ".join(f"{tf}@{L}({r:.1f})" for (tf,L),(r,_) in ranked[:5]))
+        print("  LAGGERS:", ", ".join(f"{tf}@{L}({r:.1f})" for (tf,L),(r,_) in ranked[-5:]))
+
+    # ── SHUFFLE SURROGATE CONTROL — does temporal ORDER matter? ──
+    so,sh,sl,sc=surrogate(o,h,l,c, seed=a.seed+101)
+    S=analyze(so,sh,sl,sc,Ls,a.M,a.thresh)
+    print(f"\n[CONTROL] SHUFFLED-RETURN SURROGATE (same distribution, time-order destroyed)")
+    print(f"  coherence gap  ORDERED:  +{R['gap_t']:.0f}pt touch / +{R['gap_h']:.0f}pt hold")
+    print(f"  coherence gap  SURROGATE:+{S['gap_t']:.0f}pt touch / +{S['gap_h']:.0f}pt hold")
+    print(f"  EXCESS (ordered - surrogate): {R['gap_t']-S['gap_t']:+.0f}pt touch / {R['gap_h']-S['gap_h']:+.0f}pt hold")
+    print(f"  >>> EXCESS > 0 = coherence relies on real time-ORDER (auction memory), not")
+    print(f"      just the return distribution. EXCESS ~ 0 = it's a distributional artifact.")
+
+    # ── HIGHER-LOW / LOWER-HIGH SEQUENCING EXPERIMENT (surrogate-controlled) ──
+    seq,iso=sequencing(R['per_line'])
+    sqS,isS=sequencing(S['per_line'])
+    seq_gap_t=rate(seq,'respected_touch')-rate(iso,'respected_touch')
+    seq_gap_h=rate(seq,'respected_hold') -rate(iso,'respected_hold')
+    sur_gap_t=rate(sqS,'respected_touch')-rate(isS,'respected_touch')
+    sur_gap_h=rate(sqS,'respected_hold') -rate(isS,'respected_hold')
+    print(f"\n[EXPERIMENT] STRUCTURAL SEQUENCING (equilibrium stair-stepping: run>=2 vs single)")
+    print(f"  ORDERED   sequenced {len(seq)}/isolated {len(iso)} · respTOUCH {rate(seq,'respected_touch'):.0f}% vs {rate(iso,'respected_touch'):.0f}% (+{seq_gap_t:.0f}) · respHOLD {rate(seq,'respected_hold'):.0f}% vs {rate(iso,'respected_hold'):.0f}% (+{seq_gap_h:.0f})")
+    print(f"  SURROGATE sequenced {len(sqS)}/isolated {len(isS)} · gap +{sur_gap_t:.0f} touch / +{sur_gap_h:.0f} hold")
+    print(f"  EXCESS (ordered - surrogate): {seq_gap_t-sur_gap_t:+.0f}pt touch / {seq_gap_h-sur_gap_h:+.0f}pt hold")
+    print(f"  >>> EXCESS > 0 = a CHAIN of higher-lows repricing equilibrium up is respected")
+    print(f"      more BECAUSE of real time-order — your phenomenon, beyond distribution.")
 
     print("\n" + "-"*74)
-    print("READING THIS HONESTLY:")
-    print("  • This is the NULL MODEL (no market intent). Whatever coherence/respect")
-    print("    shows here is the equilibrium MATH, not the market being smart.")
-    print("  • Real bars must BEAT these baselines (esp. 'respect in coherent events'")
-    print("    vs 'all') for the 'equilibrium reveals intent early' claim to hold.")
+    print("READING HONESTLY:")
+    print("  • Default run = synthetic NULL. The two NEW tests (surrogate EXCESS,")
+    print("    sequencing) are what real data must light up. Synthetic shows the method.")
     print("  • Feed real data:  python3 equilibrium_lab.py --csv YOURFILE.csv")
     print("-"*74)
 
