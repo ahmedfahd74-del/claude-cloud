@@ -44,3 +44,35 @@ destroyed). Real must beat the 95th percentile of shuffles to count.
 **The win:** the method is honest and it protected us from trading a pretty story that
 isn't there. The equilibrium family is a good *descriptive/visual* tool; as a *predictive*
 edge it is unconfirmed.
+
+---
+
+# S/R Lab — Findings (v1)
+
+**Data:** same real BTC daily (3,410 bars). Pivot L=5, 351 levels. Forward respect
+10 bars, no lookahead. Nulls: random-levels (weak) + shuffled surrogate (strong) +
+40-shuffle permutation.
+
+| test | real | null | verdict |
+|---|---|---|---|
+| T1 levels vs RANDOM · TOUCH | 21% | 16% | beats random (but see below) |
+| T1 levels vs RANDOM · HOLD | 83% | 46% | beats random |
+| T1 vs SURROGATE · HOLD excess | — | — | **−4pt → mechanical, no real edge** |
+| **T2 memory: held-before vs not** | **47% vs 27% (+19)** | **surrogate +8±3** | **beats 100% of shuffles ✓✓** |
+
+## Honest conclusion
+- **Test 1 is mostly a tautology.** A pivot low is a recent low, so "price holds above
+  it" is baked in — the shuffled surrogate reaches the same HOLD rate. Beating *random
+  lines* is true but trivial; there is **no edge over the strong null** here.
+- **Test 2 is the real result.** A level that HAS HELD before is respected ~19pt more on
+  its next touch, and the lift **exceeds the surrogate null (+8)** → a genuine ~+11pt
+  excess that survives time-order destruction. **The engine's memory/scoring premise —
+  "a proven level is a stronger level" — is real.**
+- **Where the edge lives:** not in the existence of a pivot, but in its HISTORY. This
+  validates the confidence-scoring direction and says the S/R engine's value is the
+  *memory*, not the line.
+
+## Caveats / next
+Single asset (BTC), daily, one 10-bar horizon. Replicate on ETH/SOL and multiple
+horizons before banking it. But unlike the equilibrium claim, this one **passed** the
+strong control.
