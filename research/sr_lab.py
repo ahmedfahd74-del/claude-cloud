@@ -83,6 +83,23 @@ def test2_history(levels, o,h,l,c, M=10, tol=0.004, sep=3):
     r=lambda a: (100*sum(a)/len(a)) if a else float('nan')
     return r(with_p), r(without_p), len(with_p), len(without_p)
 
+def test3_confluence(o,h,l,c, base_L=5, Lset=(3,5,8,13,21), band=0.005, M=10, tol=0.004, need=3):
+    """CONFLUENCE = how many independent pivot-lengths agree at a level (the 'lines
+    set perfectly' clustering). Causal: only pivots confirmed by the anchor's bar
+    count. Does high confluence (>= need of the set) predict respect vs low?"""
+    base=levels_from(o,h,l,c,base_L)
+    piv={}
+    for L in Lset:
+        hi,lo=pivots(h,l,L); piv[L]=[(cb,p,'H') for cb,p,_ in hi]+[(cb,p,'L') for cb,p,_ in lo]
+    hic=[]; loc=[]
+    for cb,p,k in base:
+        conf=sum(1 for L in Lset if any(kk==k and abs(pp-p)<=p*band and ccb<=cb for ccb,pp,kk in piv[L]))
+        _,rh=respect(p,k,cb,o,h,l,c,M,tol)
+        if rh is None: continue
+        (hic if conf>=need else loc).append(rh)
+    r=lambda arr: (100*sum(arr)/len(arr)) if arr else float('nan')
+    return r(hic), r(loc), len(hic), len(loc)
+
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument('--csv'); ap.add_argument('--L',type=int,default=5)
@@ -139,9 +156,26 @@ def main():
             print(f"\n[TEST 2 permutation] memory-lift real {w-wo:+.0f}pt  vs surrogate {m:+.0f}±{sd:.0f}  >null {pct:.0f}%  "
                   + ("*** SIGNIFICANT" if pct>=95 else "within noise" if pct>=50 else "BELOW null"))
 
+    hc,lc,nh,nl=test3_confluence(o,h,l,c,a.L,M=a.M)
+    print(f"\n[TEST 3] DOES CONFLUENCE PREDICT? (many pivot-lengths agree at the level)")
+    print(f"  HIGH confluence (>=3 lengths):  respHOLD {hc:.0f}%   (n={nh})")
+    print(f"  LOW  confluence:                respHOLD {lc:.0f}%   (n={nl})")
+    print(f"  lift from confluence: {hc-lc:+.0f}pt")
+    if a.perm:
+        lifts=[]
+        for i in range(a.perm):
+            po,ph,pl,pc=surrogate(o,h,l,c,seed=3000+i)
+            hh,ll,_,_=test3_confluence(po,ph,pl,pc,a.L,M=a.M)
+            if hh==hh and ll==ll: lifts.append(hh-ll)
+        if lifts:
+            m=statistics.mean(lifts); sd=statistics.pstdev(lifts) or 1e-9
+            pct=100*sum(1 for x in lifts if x<(hc-lc))/len(lifts)
+            print(f"  [permutation] confluence-lift real {hc-lc:+.0f}pt  vs surrogate {m:+.0f}±{sd:.0f}  >null {pct:.0f}%  "
+                  + ("*** SIGNIFICANT" if pct>=95 else "within noise" if pct>=50 else "BELOW null"))
+
     print("\n"+"-"*72)
-    print("READING: TEST 1 = is a level better than a random line · TEST 2 = does the")
-    print("engine's MEMORY/scoring add signal. Real must beat random AND surrogate.")
+    print("RECIPE UNDER TEST: PLACE at confluence (T3) · RANK by memory (T2) · every")
+    print("change must beat the surrogate. T1 random-beat is mechanical — ignore it.")
     print("-"*72)
 
 if __name__=="__main__": main()

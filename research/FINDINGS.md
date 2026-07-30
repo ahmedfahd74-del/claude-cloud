@@ -76,3 +76,31 @@ edge it is unconfirmed.
 Single asset (BTC), daily, one 10-bar horizon. Replicate on ETH/SOL and multiple
 horizons before banking it. But unlike the equilibrium claim, this one **passed** the
 strong control.
+
+## Test 3 — confluence (placement)
+HIGH confluence (>=3 of 5 pivot-lengths agree) HOLD 86% vs LOW 82% = +4pt, permutation
+85th pct (n=42, underpowered) → **suggestive, NOT significant.** A lead to confirm with
+more assets, not a confirmed feature. Do not bank it yet.
+
+---
+
+# HOW WE PERFECT THE ENGINE — the test-driven loop (the real trophy)
+
+The equilibrium detour didn't fail — it built us a **fitness function that can't be fooled.**
+From now on the S/R engine improves by a closed loop, never by opinion:
+
+1. PROPOSE a change to how levels are placed/scored (e.g. weight confidence on held-count).
+2. MEASURE it in the Lab on real data: respect rate + memory/confluence lift.
+3. CONTROL it: it only counts if it beats the SHUFFLE SURROGATE (permutation p<0.05).
+4. If it beats the null → PORT to the Pine engine. If not → discard, no matter how pretty.
+
+CONFIRMED so far (safe to build on):
+  • MEMORY is real (+11pt over null). Live rule: a level's strength should lean hard on
+    its PROVEN HOLDS; a fresh untested level starts weak and earns trust by holding.
+LEADS (need more data before building):
+  • CONFLUENCE placement (+4pt, not yet significant) — retest on ETH/SOL.
+DISCARDED (proven not to help):
+  • equilibrium migration as a predictor; raw "beats a random line" (mechanical).
+
+The engine is no longer "we think this level matters." It is "this level has EARNED its
+strength, measured, against a control." That is the victory.
