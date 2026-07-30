@@ -154,6 +154,29 @@ NOTE: these validate the LOGIC, not compiled Pine — the real compile check is 
   (security tuple + valuewhen + data_window plots are new constructs). Honest note: `auctionVer` is a per-chart
   counter (its absolute value can differ by chart history) but the RANGE (UB/LB/EQ) is byte-stable across TFs.
 
+## MARKET CONTEXT ENGINE (orthogonal 2nd direction source) — BUILT, NOT frozen
+- `level_core_v2.pine` group "Market Context Engine (external 2nd source)". The INDEPENDENT second
+  confirmation layer requested: a true market direction is declared only when two engines built on
+  **disjoint inputs** agree. **NO MA, no oscillator, no trend indicator, no chart price** — external only.
+- Reuses the SAME structure classifier (`f_statePrev`) applied to OTHER symbols via
+  `request.security(sym, ctxTF, f_statePrev(), lookahead_on)` (prior closed bar, non-repaint):
+  **Leader** (`leaderSym`, default `BINANCE:BTCUSDT`) + **Tide** (`tideSym`, default `CRYPTOCAP:TOTAL2`).
+- `ctxDir` = leader AND tide must agree (else neutral) — the external vote. `useContext` off → degrades to
+  structure-only (`ctxDir = posDir`).
+- **TRUE DIRECTION combiner**: `dirVerdict` = BULL/BEAR **only when `posDir` (Structure, internal price) ==
+  `ctxDir` (Context, external)**; opposition → `ctxConflict` (a trap — never directional); everything else →
+  RANGE. Prefers RANGE (waiting is a position). Published `ctx.direction`, `true.direction` to data window;
+  `alertcondition` on `ta.change(dirVerdict)`.
+- **Relative strength** (`useRS`, this asset's structure vs leader's): annotation ONLY
+  (IN-LINE/LEADING/LAGGING/DIVERGING) — never a vote, never in the verdict path.
+- **Surfaced**: panel now 2×7 — **DIRECTION** (headline one-word verdict, orange on conflict) · **STRUCTURE**
+  (posDir) · **CONTEXT** (ctxDir + RS) · MARKET STATE · EXEC · SIGNALS · REJECTED. The Claude Line label also
+  carries the one-word verdict (▸ BULL/BEAR/RANGE + agree/conflict) — "all information ends at the Claude Zone".
+- Validator `pine/market_context_validate.py` — 7 claims (context needs leader+tide, true-dir on agreement only,
+  opposition=CONFLICT, independence via disjoint inputs, RS annotation-only, degrade-to-structure, determinism)
+  PASS. **COMPILE-TEST PENDING** (2 new security calls + 2 data-window plots + 1 alertcondition; 17 security
+  calls total). Determinism / HTF sourcing / RE10110 fix untouched.
+
 ## LAYERED DECISION SYSTEM (target architecture — approved)
 Top-down authorization, bottom-up execution. Higher layer grants permission + direction;
 lower layer only refines timing/price. A signal is valid only when all active layers agree;

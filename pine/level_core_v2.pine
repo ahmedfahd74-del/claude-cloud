@@ -119,6 +119,13 @@ auctionSwing = input.int(5, "Auction swing size (pivot L/R)", minval=2, maxval=5
 approachPct  = input.float(10.0, "Approaching threshold (% of range width)", minval=1.0, maxval=45.0, step=1.0, group=gLE)
 showAuMeta   = input.bool(true, "Show auction state/version/age on the Claude Line", group=gLE)
 
+gMC = "Market Context Engine (external 2nd source)"
+useContext = input.bool(true, "Enable market context confirmation", group=gMC, tooltip="An INDEPENDENT second direction source: the SAME structure classifier applied to EXTERNAL data (asset-class leader + market-cap tide) — NO moving average, oscillator, or this chart's own price. A TRUE direction (BULL/BEAR) is declared ONLY when Structure and Context AGREE; disagreement = RANGE (a trap — waiting is a position).")
+ctxTF     = input.timeframe("D", "Context timeframe", group=gMC, tooltip="The timeframe on which the leader/tide structure is read. Independent of the chart TF (single HTF values → stable).")
+leaderSym = input.symbol("BINANCE:BTCUSDT", "Leader (drives the asset class)", group=gMC, tooltip="Crypto: BTC. The dominant instrument the class follows.")
+tideSym   = input.symbol("CRYPTOCAP:TOTAL2", "Tide (total market cap ex-BTC)", group=gMC, tooltip="Crypto: TOTAL2 (altcoin tide). For indices/FX, pick the relevant breadth/complex proxy.")
+useRS     = input.bool(true, "Show relative strength vs leader", group=gMC, tooltip="Qualitative annotation only (this asset's structure vs the leader's) — never a vote. LEADING/LAGGING/IN-LINE/DIVERGING.")
+
 gZL = "Appearance — Zone / Leading lines"
 czCeilCol  = input.color(#ef5350, "Ceiling (upper boundary)", inline="ce", group=gZL)
 czCeilW    = input.int(3, "w", minval=1, maxval=8, inline="ce", group=gZL)
@@ -499,6 +506,32 @@ f_stName(int s) => s == 1 ? "TRENDING" : s == 2 ? "PULLBACK" : s == 3 ? "TRANSIT
 // the execution layer reads ONLY this confirmed bias — it does not compute its own
 entryDir = posDir
 
+// ══ MARKET CONTEXT ENGINE — orthogonal EXTERNAL 2nd direction source ═════════════
+// Independence BY CONSTRUCTION: the SAME structure classifier (f_state) applied to
+// OTHER symbols (asset-class leader + market-cap tide) — never this chart's price,
+// and no MA / oscillator / trend indicator. Its verdict is source-independent from
+// the Structure engine (posDir), so agreement between the two is genuine confluence,
+// not two views of the same series. Reads the prior CLOSED ctxTF bar (non-repaint).
+[ctxStL, ctxBvL, ctxLnL, ctxErL] = request.security(leaderSym, ctxTF, f_statePrev(), lookahead=barmerge.lookahead_on)
+[ctxStT, ctxBvT, ctxLnT, ctxErT] = request.security(tideSym,  ctxTF, f_statePrev(), lookahead=barmerge.lookahead_on)
+// context direction: leader AND tide must agree (else neutral). External-only vote.
+ctxDir = not useContext ? posDir : (ctxBvL == 1 and ctxBvT == 1) ? 1 : (ctxBvL == -1 and ctxBvT == -1) ? -1 : 0
+// relative strength: this asset's structure vs the leader's — qualitative annotation, NEVER a vote
+rsTag = not (useContext and useRS) ? "" : (posDir == ctxBvL and posDir != 0) ? "IN-LINE" : (posDir != 0 and ctxBvL == 0) ? "LEADING" : (posDir == 0 and ctxBvL != 0) ? "LAGGING" : (posDir != 0 and ctxBvL != 0 and posDir != ctxBvL) ? "DIVERGING" : "FLAT"
+
+// ══ TRUE DIRECTION — the two INDEPENDENT engines must AGREE ══════════════════════
+// Confidence comes from independent sources agreeing (IMIS §3). BULL/BEAR only when
+// Structure (internal price) AND Context (external leader+tide) point the same way;
+// opposition = CONFLICT (trap); anything else = RANGE. The system prefers RANGE.
+ctxAgree    = posDir != 0 and posDir == ctxDir
+ctxConflict = posDir != 0 and ctxDir != 0 and posDir != ctxDir
+dirVerdict  = not useContext ? posDir : (ctxAgree ? posDir : 0)
+dirTxt      = dirVerdict == 1 ? "BULL" : dirVerdict == -1 ? "BEAR" : "RANGE"
+// ── publish to the data window (machine-readable for other IMIS consumers) ──
+plot(ctxDir,     "ctx.direction",  display=display.data_window)
+plot(dirVerdict, "true.direction", display=display.data_window)
+alertcondition(ta.change(dirVerdict) != 0, "True direction change", "IMIS: true market direction changed (Structure × Context agreement)")
+
 // ══ LOCATION ENGINE — active dealing range (the auction), reach-independent + stable ══
 // Reads the last 3 CONFIRMED swings each side on a FIXED auction TF via ta.valuewhen
 // (single HTF values Pine computes over the auction TF's OWN full history → identical on
@@ -787,10 +820,17 @@ if useEntry and execOK and barstate.isconfirmed
 alertcondition(sigLong,  "M4 LONG (liquidity-first)",  "Liquidity-first LONG: floor swept + HL→HH structure confirmed")
 alertcondition(sigShort, "M4 SHORT (liquidity-first)", "Liquidity-first SHORT: ceiling swept + LH→LL structure confirmed")
 
-var table eT = table.new(position.bottom_right, 2, 5, border_width=1)
+var table eT = table.new(position.bottom_right, 2, 7, border_width=1)
 if useEntry and showEPanel and barstate.islast
     ebTxt = posDir == 1 ? "BULL" : posDir == -1 ? "BEAR" : "NEUTRAL"
     ebCol = posDir == 1 ? #26a69a : posDir == -1 ? #ef5350 : color.new(color.gray, 20)
+    // context + true-direction verdict (the two independent engines)
+    ctxTxt = not useContext ? "OFF" : ctxDir == 1 ? "BULL" : ctxDir == -1 ? "BEAR" : "MIXED"
+    ctxCol = not useContext ? color.new(color.gray, 40) : ctxDir == 1 ? #26a69a : ctxDir == -1 ? #ef5350 : color.new(color.gray, 20)
+    dCol   = dirVerdict == 1 ? #26a69a : dirVerdict == -1 ? #ef5350 : (ctxConflict ? color.new(#ff9800, 5) : color.new(color.gray, 10))
+    dSub   = ctxConflict ? "RANGE ⚠ conflict" : dirTxt
+    string ctxTip = "MARKET CONTEXT ENGINE — external, INDEPENDENT of this chart's price (no MA/oscillator)\nLeader  " + f_stName(ctxStL) + "  vote " + str.tostring(ctxBvL) + "\nTide    " + f_stName(ctxStT) + "  vote " + str.tostring(ctxBvT) + (useRS ? "\nRel. strength vs leader: " + rsTag : "") + "\n→ context " + ctxTxt + "  (leader AND tide must agree)"
+    string dirTip = "TRUE DIRECTION — declared only when the two INDEPENDENT engines AGREE:\nStructure (internal HH/HL price) = " + ebTxt + "\nContext (external leader+tide)   = " + ctxTxt + "\n" + (ctxConflict ? "CONFLICT → stand aside (potential trap). Waiting is a position." : dirVerdict == 0 ? "No agreement → RANGE." : "AGREEMENT → " + dirTxt + ".")
     string biasTip = "POSITION LAYER — bias DERIVED from HTF market state; 2/3 agreement CONFIRMS\n1W  " + f_stName(stW) + "  vote " + str.tostring(bvW) + " · eff " + str.tostring(erWv, "#.00") + "\n1D  " + f_stName(stD) + "  vote " + str.tostring(bvD) + " · eff " + str.tostring(erDv, "#.00") + "\n4H  " + f_stName(st4) + "  vote " + str.tostring(bv4) + " · eff " + str.tostring(er4v, "#.00") + "\n→ " + ebTxt + "  (" + str.tostring(posAgree) + "/3 agree)  ·  only TREND/PULLBACK vote directionally"
     sName = f_stName(sysState)
     sDir  = sysLean == 1 ? " ▲" : sysLean == -1 ? " ▼" : ""
@@ -804,16 +844,20 @@ if useEntry and showEPanel and barstate.islast
             rejTip := rejTip + array.get(rejLog, ri) + "\n"
     else
         rejTip := rejTip + "none yet"
-    table.cell(eT, 0, 0, "HTF BIAS", text_color=color.white, bgcolor=color.new(color.black, 20), text_size=size.small, tooltip=biasTip)
-    table.cell(eT, 1, 0, ebTxt + "  " + str.tostring(posAgree) + "/3", text_color=color.white, bgcolor=ebCol, text_size=size.small, tooltip=biasTip)
-    table.cell(eT, 0, 1, "MARKET STATE", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small, tooltip=stateTip)
-    table.cell(eT, 1, 1, sName + sDir, text_color=color.white, bgcolor=sCol, text_size=size.small, tooltip=stateTip)
-    table.cell(eT, 0, 2, "EXEC", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
-    table.cell(eT, 1, 2, stTxt, text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
-    table.cell(eT, 0, 3, "SIGNALS", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
-    table.cell(eT, 1, 3, str.tostring(eSigCnt), text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
-    table.cell(eT, 0, 4, "REJECTED", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small, tooltip=rejTip)
-    table.cell(eT, 1, 4, str.tostring(array.get(rejTot, 0)), text_color=color.orange, bgcolor=color.new(color.black, 40), text_size=size.small, tooltip=rejTip)
+    table.cell(eT, 0, 0, "DIRECTION", text_color=color.white, bgcolor=color.new(color.black, 0), text_size=size.small, tooltip=dirTip)
+    table.cell(eT, 1, 0, dSub, text_color=color.white, bgcolor=dCol, text_size=size.small, tooltip=dirTip)
+    table.cell(eT, 0, 1, "STRUCTURE", text_color=color.white, bgcolor=color.new(color.black, 20), text_size=size.small, tooltip=biasTip)
+    table.cell(eT, 1, 1, ebTxt + "  " + str.tostring(posAgree) + "/3", text_color=color.white, bgcolor=ebCol, text_size=size.small, tooltip=biasTip)
+    table.cell(eT, 0, 2, "CONTEXT", text_color=color.white, bgcolor=color.new(color.black, 20), text_size=size.small, tooltip=ctxTip)
+    table.cell(eT, 1, 2, ctxTxt + (useRS and useContext ? "  " + rsTag : ""), text_color=color.white, bgcolor=ctxCol, text_size=size.small, tooltip=ctxTip)
+    table.cell(eT, 0, 3, "MARKET STATE", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small, tooltip=stateTip)
+    table.cell(eT, 1, 3, sName + sDir, text_color=color.white, bgcolor=sCol, text_size=size.small, tooltip=stateTip)
+    table.cell(eT, 0, 4, "EXEC", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
+    table.cell(eT, 1, 4, stTxt, text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
+    table.cell(eT, 0, 5, "SIGNALS", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
+    table.cell(eT, 1, 5, str.tostring(eSigCnt), text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
+    table.cell(eT, 0, 6, "REJECTED", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small, tooltip=rejTip)
+    table.cell(eT, 1, 6, str.tostring(array.get(rejTot, 0)), text_color=color.orange, bgcolor=color.new(color.black, 40), text_size=size.small, tooltip=rejTip)
 
 // ── RENDER ───────────────────────────────────────────────────────────────────
 var array<line>  dLine = array.new<line>()
@@ -1002,8 +1046,10 @@ if barstate.islast
         pd = close >= claudeMid ? "PREMIUM · lean short" : "DISCOUNT · lean long"
         beh = not gateCZ ? "" : (sysState == 1 or sysState == 2) ? "  ·  TREND → continuation only" : "  ·  RANGE → mean-revert"
         meta = showAuMeta ? "\n" + f_locStateTxt(locState) + "  ·  v" + str.tostring(auctionVer) + " · age " + str.tostring(auctionAge) : ""
+        // the one-word story: what is this market doing? (both independent engines must agree)
+        verdict = "\n▸ " + dirTxt + (ctxConflict ? " ⚠ Structure×Context conflict" : dirVerdict == 0 ? "  (no agreement)" : "  (Structure + Context agree)")
         array.push(dLine, line.new(x1, claudeMid, x2, claudeMid, color=claudeCol, width=claudeW, extend=f_ext(extMode), style=f_lstyle(claudeSty)))
-        array.push(dLab, label.new(x2, claudeMid, "CLAUDE LINE " + str.tostring(claudeMid, format.mintick) + "\n" + pd + beh + meta, xloc=xloc.bar_index, style=label.style_label_left, color=color.new(claudeCol, 0), textcolor=color.black, size=f_sz(lblSize)))
+        array.push(dLab, label.new(x2, claudeMid, "CLAUDE LINE " + str.tostring(claudeMid, format.mintick) + "\n" + pd + beh + meta + verdict, xloc=xloc.bar_index, style=label.style_label_left, color=color.new(claudeCol, 0), textcolor=color.black, size=f_sz(lblSize)))
         if showPD and viewMode != "Claude Line only" and not na(aFloor) and not na(aCeil)
             array.push(dBox, box.new(x1, aCeil, x2, claudeMid, border_color=color.new(czCeilCol, 100), bgcolor=color.new(czCeilCol, 92)))
             array.push(dBox, box.new(x1, claudeMid, x2, aFloor, border_color=color.new(czFloorCol, 100), bgcolor=color.new(czFloorCol, 92)))
