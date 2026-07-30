@@ -7,14 +7,25 @@
 > `PAPER_TRADING_ONLY=true`. Discipline: **build one module at a time, validate, freeze
 > before the next. No patching. Verify every build 3 ways (structural + logic + determinism).**
 
-## FREEZE CANDIDATES (the only 2 active files)
+## FREEZE CANDIDATES (active files)
 | File | Role |
 |---|---|
-| `pine/level_core_v2.pine` | The S/R engine ("Level Core") — levels, memory, scoring, merge, appearance, nudge |
-| `pine/ms_core.pine` | MS-Core market-structure **bias panel** (separate indicator) |
+| `pine/level_core_v2.pine` | **Module 1** — the S/R engine ("Level Core") — levels, memory, scoring, merge, appearance, nudge. (Also currently hosts the Position Layer + Market Context Engine — see note below.) |
+| `pine/market_structure_engine.pine` | **Module 2** — STANDALONE Institutional Market Structure Engine (price-only state machine; NO S/R). Supersedes `ms_core.pine`. |
+| `pine/ms_core.pine` | Prior single-tier structure **bias panel** — kept for reference; its proven non-repaint MTF pattern was carried into Module 2. |
 
 Everything else in `pine/` is **legacy / not part of this freeze** (institutional_sr_ics.pine,
 sr_engine.pine, sr_poc.pine, level_core.pine (v1), setup_engine.pine, sr_fusion.pine, etc.).
+
+## MODULE BOUNDARY CORRECTION (important)
+The **Market Structure Engine is NOT an S/R engine.** Earlier, structure-flavoured logic
+(Position Layer, Market Context Engine) was added *inside* `level_core_v2.pine` (the S/R engine).
+That mixed responsibilities. The correct architecture is a pipeline of independent modules where
+**S/R is one INPUT to Structure, not its foundation**:
+`Module 1 S/R → Module 2 Market Structure → Module 3 Liquidity → Module 4 Order Blocks → Module 5 Execution`.
+Module 2 is now its own file with its own state machine and a clean API; it does not import or extend the
+S/R code. (Follow-up: the Position/Context layers living in Module 1 should migrate to consume Module 2's
+`ms.*` outputs rather than recomputing structure inside the S/R script.)
 
 ## LEVEL CORE v2 — architecture (frozen intent)
 - Levels sourced from **fixed degrees 1H / 4H / 1D / 1W** via `request.security` — NOT chart
@@ -176,6 +187,28 @@ NOTE: these validate the LOGIC, not compiled Pine — the real compile check is 
   opposition=CONFLICT, independence via disjoint inputs, RS annotation-only, degrade-to-structure, determinism)
   PASS. **COMPILE-TEST PENDING** (2 new security calls + 2 data-window plots + 1 alertcondition; 17 security
   calls total). Determinism / HTF sourcing / RE10110 fix untouched.
+
+## MARKET STRUCTURE ENGINE (Module 2, STANDALONE) — BUILT, NOT frozen
+- `pine/market_structure_engine.pine`. Price-only state machine; **draws structure, never S/R**.
+  Consumes price now; S/R context is an optional INPUT later (per the module diagram), never a dependency.
+- **Cooperating sub-engines → one "structure brain":** (1) swing extraction — confirmed fractal pivots,
+  two tiers `iLen`(internal 5) / `xLen`(external 25); (2) hierarchy — HH/HL/LH/LL per tier; (3) trend +
+  events — protected-swing break machine: a CLOSE break of the protected ref = **BOS** (with trend) or a
+  **FLIP** (against). Internal flip = **CHoCH**; external flip = **MSS**; trend follows the flip;
+  (4) protected/strong-weak — protected LOW guards a bull trend, protected HIGH a bear (the strong point);
+  weak point = the opposing latest swing; (5) confidence — swing strength = clamped ATR displacement of
+  the break, confidence = weighted blend of internal/external alignment + move efficiency (Kaufman ER) +
+  swing strength; (6) MTF — external trend on W/D/4H via `f_dirPrev(mtfLen)` (`[1]`+`lookahead_on`, non-repaint).
+- **Clean API (data window, `ms.*`)** — 19 outputs: `trend`, `trendInternal`, `phase` (1 IMPULSE/2 PULLBACK),
+  `lastHH/HL/LH/LL`, `protectedHigh/Low`, `bosExternal/bosInternal`, `choch`, `mss`, `swingStrength` (0..1),
+  `confidence` (0..100), `mtfW/D/4`, `mtfAligned`. Alerts: External BOS · Internal BOS · CHoCH · MSS.
+  Downstream modules (Liquidity/OB/Execution/Cortex) read these — the engine is a publisher.
+- **Non-repaint/deterministic:** pivots confirm N bars back, breaks on `barstate.isconfirmed` (close), MTF on
+  last CLOSED HTF bar. No MA/oscillator anywhere. 3 security calls.
+- Validator `pine/market_structure_validate.py` — 7 claims (BOS-vs-flip taxonomy, CHoCH internal / MSS
+  external, trend-follows-flip, protected levels, HH/HL/LH/LL, impulse/pullback phase, strength+confidence,
+  determinism) PASS. Structural audit: delimiters balanced, indentation clean, **zero S/R coupling refs**,
+  unique plot names, global alerts. **COMPILE-TEST PENDING** (user paste).
 
 ## LAYERED DECISION SYSTEM (target architecture — approved)
 Top-down authorization, bottom-up execution. Higher layer grants permission + direction;
