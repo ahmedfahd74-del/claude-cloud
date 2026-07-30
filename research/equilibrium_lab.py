@@ -303,6 +303,7 @@ def main():
     ap.add_argument('--csv'); ap.add_argument('--n',type=int,default=1500)
     ap.add_argument('--seed',type=int,default=7); ap.add_argument('--M',type=int,default=10)
     ap.add_argument('--thresh',type=int,default=6)
+    ap.add_argument('--perm',type=int,default=0,help="run N surrogate shuffles → permutation p-value")
     a=ap.parse_args()
 
     if a.csv:
@@ -361,6 +362,31 @@ def main():
     print(f"  EXCESS (ordered - surrogate): {seq_gap_t-sur_gap_t:+.0f}pt touch / {seq_gap_h-sur_gap_h:+.0f}pt hold")
     print(f"  >>> EXCESS > 0 = a CHAIN of higher-lows repricing equilibrium up is respected")
     print(f"      more BECAUSE of real time-order — your phenomenon, beyond distribution.")
+
+    # ── PERMUTATION TEST — the real significance test (many shuffles → p-value) ──
+    if a.perm:
+        import statistics
+        real_st=rate(seq,'respected_touch')-rate(iso,'respected_touch')
+        real_sh=rate(seq,'respected_hold') -rate(iso,'respected_hold')
+        n_ct=[];n_ch=[];n_st=[];n_sh=[]
+        for i in range(a.perm):
+            po,ph,pl,pc=surrogate(o,h,l,c, seed=1000+i)
+            Pi=analyze(po,ph,pl,pc,Ls,a.M,a.thresh)
+            n_ct.append(Pi['gap_t']); n_ch.append(Pi['gap_h'])
+            sq,iq=sequencing(Pi['per_line'])
+            n_st.append(rate(sq,'respected_touch')-rate(iq,'respected_touch'))
+            n_sh.append(rate(sq,'respected_hold') -rate(iq,'respected_hold'))
+        def report(nm, real, null):
+            m=statistics.mean(null); sd=statistics.pstdev(null) or 1e-9
+            pct=100*sum(1 for x in null if x<real)/len(null)
+            z=(real-m)/sd
+            verdict="*** SIGNIFICANT (beats null p<0.05)" if pct>=95 else "within noise" if pct>=50 else "BELOW null"
+            print(f"  {nm:22} real {real:+5.1f}   null {m:+5.1f} ± {sd:4.1f}   z={z:+5.2f}   >null {pct:3.0f}%   {verdict}")
+        print(f"\n[PERMUTATION TEST] real vs {a.perm}-shuffle null distribution (p<0.05 = real above 95% of shuffles)")
+        report("coherence TOUCH gap", R['gap_t'], n_ct)
+        report("coherence HOLD gap",  R['gap_h'], n_ch)
+        report("sequencing TOUCH gap", real_st, n_st)
+        report("sequencing HOLD gap",  real_sh, n_sh)
 
     print("\n" + "-"*74)
     print("READING HONESTLY:")
