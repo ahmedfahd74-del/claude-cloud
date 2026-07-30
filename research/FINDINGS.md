@@ -104,3 +104,34 @@ DISCARDED (proven not to help):
 
 The engine is no longer "we think this level matters." It is "this level has EARNED its
 strength, measured, against a control." That is the victory.
+
+---
+
+# Cross-Ticker Honesty Test (v2) — the line you actually trade
+
+Ran the Claude-Line (equilibrium) respect AND the memory lift on THREE tickers vs a
+25-shuffle surrogate null, out-of-sample. research/cross_ticker.py.
+
+| ticker | class | Claude-Line HOLD (real / shuffled / excess) | sig | memory lift (real / null) | sig |
+|---|---|---|---|---|---|
+| BTC | crypto | 51% / 53% / **−2** | no | +19 / +8 | **YES** |
+| SOL | crypto | 48% / 50% / **−2** | no | +17 / +11 | no |
+| EURUSD | forex | 60% / 70% / **−10** | no | +16 / +8 | **YES** |
+
+## Two hard truths
+1. **The Claude Line (equilibrium) has NO predictive edge on ANY ticker** — BTC, SOL,
+   or forex. On all three, real ≤ shuffled. It is a *location/context* tool (premium/
+   discount, fair value), NOT a bounce predictor. The "works on crypto, fails on forex"
+   feeling is an illusion: it doesn't predict anywhere; forex just exposes it brutally
+   (−10, worse than random) while crypto sits near chance (−2), which memory/selection
+   makes *feel* like it works.
+2. **Memory does NOT cleanly replicate.** Significant on BTC + EURUSD, but NOT on SOL.
+   The +11pt BTC "victory" was **over-called** — it is real on some markets, absent on a
+   high-vol alt. Direction is positive on all three, but it clears the bar on only 2/3.
+
+## What this changes
+- Trade the Claude Line as a MAP, never a trigger.
+- The proven-holds factor stays in the score but is downgraded from "validated" to
+  "confirmed on BTC/EURUSD, weak on SOL — needs per-asset calibration."
+- The real, unshaken asset is the METHOD: we can now measure any idea per-ticker before
+  believing it. Tonight it stopped us trusting a line that doesn't predict.
