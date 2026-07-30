@@ -100,6 +100,25 @@ def test3_confluence(o,h,l,c, base_L=5, Lset=(3,5,8,13,21), band=0.005, M=10, to
     r=lambda arr: (100*sum(arr)/len(arr)) if arr else float('nan')
     return r(hic), r(loc), len(hic), len(loc)
 
+def memory_curve(o,h,l,c, base_L=5, M=10, tol=0.004, sep=3):
+    """respect (next-touch HOLD) bucketed by how many times the level has ALREADY
+    held (causal). Gives the exact weighting shape to bake into the score."""
+    n=len(c); buckets={0:[],1:[],2:[],3:[]}
+    for cb,p,k in levels_from(o,h,l,c,base_L):
+        band=p*tol; up=(k=='L'); prior=0; last=-999; t=cb+1
+        while t<n:
+            if l[t]-band<=p<=h[t]+band and t-last>=sep:
+                last=t; holds=0; tot=0
+                for t2 in range(t+1,min(t+1+M,n)):
+                    tot+=1
+                    if (c[t2]>=p*(1-tol)) if up else (c[t2]<=p*(1+tol)): holds+=1
+                th=(holds/tot>=0.7) if tot else None
+                if th is not None:
+                    buckets[min(prior,3)].append(th)
+                    if th: prior+=1
+            t+=1
+    return {b:(100*sum(v)/len(v) if v else float('nan'), len(v)) for b,v in buckets.items()}
+
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument('--csv'); ap.add_argument('--L',type=int,default=5)

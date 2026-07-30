@@ -40,6 +40,7 @@ wDisp  = input.float(0.16, "Weight: ATR displacement after touch", minval=0.0, m
 wSweep = input.float(0.12, "Weight: liquidity sweep before reaction", minval=0.0, maxval=1.0, step=0.02, group=gC)
 wSep   = input.float(0.12, "Weight: touch separation (anti-cluster)", minval=0.0, maxval=1.0, step=0.02, group=gC)
 wEvid  = input.float(0.12, "Weight: evidence (# recent interactions)", minval=0.0, maxval=1.0, step=0.02, group=gC)
+wProven = input.float(0.30, "Weight: PROVEN HOLDS (bounced before) ★ data-validated", minval=0.0, maxval=1.0, step=0.02, group=gC, tooltip="Backtest (BTC daily, surrogate-controlled, no lookahead): an UNTESTED level is respected only 27% vs ~40% for a random line — WORSE than chance, a trap. A level that has HELD even once jumps to ~43%, then climbs. So a fresh level starts weak and EARNS strength by bouncing. This is the one factor that beat the shuffle-null (+11pt), so it carries real weight.")
 
 gLn = "Appearance — Lines"
 lineStyleIn = input.string("Solid", "Line style", options=["Solid", "Dashed", "Dotted"], group=gLn)
@@ -293,6 +294,7 @@ f_audit(Lvl L) =>
     float sweepF = 0.0
     float sepF = 1.0
     float evidF = 0.0
+    float provenF = 0.15    // untested default = TRAP (data: fresh level respected below random)
     float avgW = 0.0
     int held = 0
     int brk = 0
@@ -321,15 +323,18 @@ f_audit(Lvl L) =>
         sweepF := wsum > 0 ? math.min(sweepW / wsum * 2.0, 1.0) : 0.0
         sepF   := f_separation(L)
         evidF  := math.min(wsum / evidNorm, 1.0)
+        // PROVEN HOLDS — the data-validated cliff: untested = trap, one hold = normal, then climbs.
+        // held counts confirmed bounces (incl. the founding rejection), so held<=1 = never re-tested.
+        provenF := held <= 1 ? 0.15 : held == 2 ? 0.55 : held == 3 ? 0.78 : 1.0
         avgW   := wsum / n
-        wtot   = wWin + wRej + wDisp + wSweep + wSep + wEvid
-        raw    = wtot > 0 ? (winF*wWin + rejF*wRej + dispF*wDisp + sweepF*wSweep + sepF*wSep + evidF*wEvid) / wtot : 0.0
+        wtot   = wWin + wRej + wDisp + wSweep + wSep + wEvid + wProven
+        raw    = wtot > 0 ? (winF*wWin + rejF*wRej + dispF*wDisp + sweepF*wSweep + sepF*wSep + evidF*wEvid + provenF*wProven) / wtot : 0.0
         conf   := math.min(math.max(raw * degW * 100.0, 0.0), 100.0)
-    [conf, winF, rejF, dispF, sweepF, sepF, evidF, degW, n, avgW, held, brk]
+    [conf, winF, rejF, dispF, sweepF, sepF, evidF, provenF, degW, n, avgW, held, brk]
 
 // score only (thin wrapper over the single source)
 f_conf(Lvl L) =>
-    [cf, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11] = f_audit(L)
+    [cf, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12] = f_audit(L)
     cf
 
 // point-contribution of one component to the final confidence (they sum to CONF)
@@ -931,7 +936,7 @@ if barstate.islast
             retests = f_count(L, 4)
             events  = array.size(L.log)
             live = i == naIdx or i == nbIdx
-            [conf, winF, rejF, dispF, sweepF, sepF, evidF, degW, nEv, avgW, held, brk] = f_audit(L)
+            [conf, winF, rejF, dispF, sweepF, sepF, evidF, provenF, degW, nEv, avgW, held, brk] = f_audit(L)
             starred = topN > 0 and conf >= starThr
             degOn = L.deg == 0 ? a1H : L.deg == 1 ? a4H : L.deg == 2 ? a1D : a1W   // display only degrees ≥ chart TF
             // only "All levels" draws the per-level touch book; Leading/Zone/Line-only are
@@ -985,9 +990,9 @@ if barstate.islast
                     wrtxt = decided > 0 ? str.tostring(math.round(bounces / decided * 100)) + "%" : "n/a"
                     // AUDIT breakdown (★ levels): every component's point-contribution, summing to CONF
                     if showAudit and starred
-                        wtot = wWin + wRej + wDisp + wSweep + wSep + wEvid
+                        wtot = wWin + wRej + wDisp + wSweep + wSep + wEvid + wProven
                         qual = f_qualified(L)
-                        sub = f_pts(winF, wWin, wtot, 1.0) + f_pts(rejF, wRej, wtot, 1.0) + f_pts(dispF, wDisp, wtot, 1.0) + f_pts(sweepF, wSweep, wtot, 1.0) + f_pts(sepF, wSep, wtot, 1.0) + f_pts(evidF, wEvid, wtot, 1.0)
+                        sub = f_pts(winF, wWin, wtot, 1.0) + f_pts(rejF, wRej, wtot, 1.0) + f_pts(dispF, wDisp, wtot, 1.0) + f_pts(sweepF, wSweep, wtot, 1.0) + f_pts(sepF, wSep, wtot, 1.0) + f_pts(evidF, wEvid, wtot, 1.0) + f_pts(provenF, wProven, wtot, 1.0)
                         tfPts = sub * (degW - 1.0)
                         tl := tl + "———— AUDIT (calculation order) ————\n"
                         tl := tl + "1 interactions  " + str.tostring(nEv) + " ev · qualified " + str.tostring(qual) + "  (≥" + str.tostring(sepNorm, "#") + " bars apart)\n"
@@ -998,9 +1003,10 @@ if barstate.islast
                         tl := tl + "6 win rate      " + str.tostring(math.round(winF * 100)) + "%  → +" + str.tostring(f_pts(winF, wWin, wtot, 1.0), "#.0") + "\n"
                         tl := tl + "7 separation    " + str.tostring(sepF, "#.00") + "  → +" + str.tostring(f_pts(sepF, wSep, wtot, 1.0), "#.0") + "\n"
                         tl := tl + "8 evidence      " + str.tostring(evidF, "#.00") + "  → +" + str.tostring(f_pts(evidF, wEvid, wtot, 1.0), "#.0") + "\n"
+                        tl := tl + "9 proven holds  " + str.tostring(held) + " bounce" + (held == 1 ? "" : "s") + " → f " + str.tostring(provenF, "#.00") + "  → +" + str.tostring(f_pts(provenF, wProven, wtot, 1.0), "#.0") + (held <= 1 ? "  (UNTESTED — trap)" : "") + "\n"
                         tl := tl + "  subtotal      " + str.tostring(sub, "#.0") + " pts\n"
-                        tl := tl + "9 timeframe " + f_degTxt(L.deg) + "  ×" + str.tostring(degW, "#.00") + "  → " + (tfPts >= 0 ? "+" : "") + str.tostring(tfPts, "#.0") + " pts\n"
-                        tl := tl + "10 FINAL CONF   " + str.tostring(math.round(conf)) + "  (= subtotal " + (tfPts >= 0 ? "+ " : "− ") + str.tostring(math.abs(tfPts), "#.0") + ")\n"
+                        tl := tl + "10 timeframe " + f_degTxt(L.deg) + "  ×" + str.tostring(degW, "#.00") + "  → " + (tfPts >= 0 ? "+" : "") + str.tostring(tfPts, "#.0") + " pts\n"
+                        tl := tl + "11 FINAL CONF   " + str.tostring(math.round(conf)) + "  (= subtotal " + (tfPts >= 0 ? "+ " : "− ") + str.tostring(math.abs(tfPts), "#.0") + ")\n"
                     if isCluster
                         tl := tl + "———— ⧉ MERGED CLUSTER · STR " + str.tostring(math.round(clStr)) + " ————\n" + str.tostring(clCount) + " levels within " + str.tostring(mergeBandPct, "#.00") + "% of price:\n"
                         for k = 0 to array.size(book) - 1

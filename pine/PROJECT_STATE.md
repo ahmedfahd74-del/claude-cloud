@@ -37,8 +37,14 @@ S/R code. (Follow-up: the Position/Context layers living in Module 1 should migr
 - **LIVE** = nearest level above + below price (always shown, emphasised).
 - Modules done + validated: M1 event-sourced core · M1.1 cross-TF multi-degree · M2 confidence
   scoring + explainable audit · M3 confluence merge (renders as **classic red/green lines**, not zones).
+- **★ PROVEN-HOLDS factor (data-validated, `wProven` 0.30):** added after a surrogate-controlled
+  backtest (research/sr_lab.py on real BTC daily). Finding: an UNTESTED level is respected only
+  27% vs ~40% for a random line — *worse than chance, a trap*; one confirmed hold → ~43%, then climbs.
+  `provenF = held<=1 ? .15 : held==2 ? .55 : held==3 ? .78 : 1.0` (held = confirmed bounces incl. the
+  founding rejection, so held≤1 = never re-tested). This was the ONLY level feature that beat the
+  shuffle-null (+11pt). Score/audit/validator all carry it (untested<proven asserted).
 - **Scoring:** `conf = clamp(raw·degW·100)`, `raw` = weighted blend of win-rate, rejection,
-  displacement, sweep, separation(anti-cluster), evidence; `degW` = per-degree/TF weight
+  displacement, sweep, separation(anti-cluster), evidence, **proven-holds**; `degW` = per-degree/TF weight
   (1W 1.0 · 1D .85 · 4H .70 · 1H .55). raw,degW ∈ [0,1] ⇒ clamp never fires ⇒ audit reconciles exactly.
 - **Audit (hover ★ levels):** calc order = 1 interactions (real qualified count, ≥sepNorm bars apart,
   NOT round(nEv·sepF)) · 2 decay · 3 rejection · 4 displacement · 5 sweep · 6 win · 7 separation ·
