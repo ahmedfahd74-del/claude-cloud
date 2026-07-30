@@ -1053,13 +1053,16 @@ if barstate.islast
                         array.push(dLab, label.new(x2, v, str.tostring(v, format.mintick) + " SUP", xloc=xloc.bar_index, style=label.style_label_left, color=color.new(leadSupCol, math.min(80, fade + lblOp)), textcolor=color.white, size=f_sz(lblSize)))
                     nDnDrawn += 1
     if showClaude and not na(claudeMid)
-        pd = close >= claudeMid ? "PREMIUM · lean short" : "DISCOUNT · lean long"
-        beh = not gateCZ ? "" : (sysState == 1 or sysState == 2) ? "  ·  TREND → continuation only" : "  ·  RANGE → mean-revert"
-        meta = showAuMeta ? "\n" + f_locStateTxt(locState) + "  ·  v" + str.tostring(auctionVer) + " · age " + str.tostring(auctionAge) : ""
-        // the 2-word story: direction + what to do (both independent engines must agree)
-        verdict = "\n▸ " + dirWord + " · " + attnTxt
+        // ON-CHART LABEL = the decision only: price + the 2 words (direction · what to do).
+        claudeLbl = "CLAUDE LINE " + str.tostring(claudeMid, format.mintick) + "\n▸ " + dirWord + " · " + attnTxt
+        // EVERYTHING descriptive moves to the hover tooltip so the chart stays a decision, not noise.
+        pd  = close >= claudeMid ? "PREMIUM (above fair value)" : "DISCOUNT (below fair value)"
+        beh = not gateCZ ? "" : (sysState == 1 or sysState == 2) ? "\nregime: TREND → continuation" : "\nregime: RANGE → mean-revert"
+        meta = showAuMeta ? "\nauction: " + f_locStateTxt(locState) + " · v" + str.tostring(auctionVer) + " · age " + str.tostring(auctionAge) : ""
+        agreeTxt = ctxConflict ? "Structure×Context: CONFLICT (trap)" : dirVerdict == 0 ? "Structure×Context: no agreement" : "Structure×Context: agree"
+        claudeTip = "CLAUDE LINE = fair value (auction equilibrium)\nlocation: " + pd + beh + meta + "\n" + agreeTxt + "\n→ " + dirWord + " · " + attnTxt
         array.push(dLine, line.new(x1, claudeMid, x2, claudeMid, color=claudeCol, width=claudeW, extend=f_ext(extMode), style=f_lstyle(claudeSty)))
-        array.push(dLab, label.new(x2, claudeMid, "CLAUDE LINE " + str.tostring(claudeMid, format.mintick) + "\n" + pd + beh + meta + verdict, xloc=xloc.bar_index, style=label.style_label_left, color=color.new(claudeCol, 0), textcolor=color.black, size=f_sz(lblSize)))
+        array.push(dLab, label.new(x2, claudeMid, claudeLbl, xloc=xloc.bar_index, style=label.style_label_left, color=color.new(claudeCol, 0), textcolor=color.black, size=f_sz(lblSize), tooltip=claudeTip))
         if showPD and viewMode != "Claude Line only" and not na(aFloor) and not na(aCeil)
             array.push(dBox, box.new(x1, aCeil, x2, claudeMid, border_color=color.new(czCeilCol, 100), bgcolor=color.new(czCeilCol, 92)))
             array.push(dBox, box.new(x1, claudeMid, x2, aFloor, border_color=color.new(czFloorCol, 100), bgcolor=color.new(czFloorCol, 92)))
