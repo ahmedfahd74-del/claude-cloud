@@ -609,6 +609,16 @@ if barstate.isconfirmed
         pLB := locLB
 auctionAge = bar_index - auctionBar
 
+// ── ATTENTION verdict: exactly 2 words — direction + what to do ──
+// direction (UP/DOWN/RANGE) from the true-direction combiner · attention state from
+// agreement + auction location: STAY AWAY = conflict (trap); GET READY = true direction
+// AND price at a favourable location (bull cheap/at floor · bear rich/at ceiling — where the
+// limit order belongs); WAIT = agreement but price extended (don't chase), or plain RANGE.
+dirWord  = dirVerdict == 1 ? "UP" : dirVerdict == -1 ? "DOWN" : "RANGE"
+favLong  = dirVerdict == 1 and (not locPremium or locState == 2)
+favShort = dirVerdict == -1 and (locPremium or locState == 1)
+attnTxt  = ctxConflict ? "STAY AWAY" : (favLong or favShort) ? "GET READY" : "WAIT"
+
 // ── publish to the data window (machine-readable for other IMIS consumers) ──
 plot(locUB,      "loc.UB",                 display=display.data_window)
 plot(locLB,      "loc.LB",                 display=display.data_window)
@@ -828,7 +838,7 @@ if useEntry and showEPanel and barstate.islast
     ctxTxt = not useContext ? "OFF" : ctxDir == 1 ? "BULL" : ctxDir == -1 ? "BEAR" : "MIXED"
     ctxCol = not useContext ? color.new(color.gray, 40) : ctxDir == 1 ? #26a69a : ctxDir == -1 ? #ef5350 : color.new(color.gray, 20)
     dCol   = dirVerdict == 1 ? #26a69a : dirVerdict == -1 ? #ef5350 : (ctxConflict ? color.new(#ff9800, 5) : color.new(color.gray, 10))
-    dSub   = ctxConflict ? "RANGE ⚠ conflict" : dirTxt
+    dSub   = dirWord + " · " + attnTxt
     string ctxTip = "MARKET CONTEXT ENGINE — external, INDEPENDENT of this chart's price (no MA/oscillator)\nLeader  " + f_stName(ctxStL) + "  vote " + str.tostring(ctxBvL) + "\nTide    " + f_stName(ctxStT) + "  vote " + str.tostring(ctxBvT) + (useRS ? "\nRel. strength vs leader: " + rsTag : "") + "\n→ context " + ctxTxt + "  (leader AND tide must agree)"
     string dirTip = "TRUE DIRECTION — declared only when the two INDEPENDENT engines AGREE:\nStructure (internal HH/HL price) = " + ebTxt + "\nContext (external leader+tide)   = " + ctxTxt + "\n" + (ctxConflict ? "CONFLICT → stand aside (potential trap). Waiting is a position." : dirVerdict == 0 ? "No agreement → RANGE." : "AGREEMENT → " + dirTxt + ".")
     string biasTip = "POSITION LAYER — bias DERIVED from HTF market state; 2/3 agreement CONFIRMS\n1W  " + f_stName(stW) + "  vote " + str.tostring(bvW) + " · eff " + str.tostring(erWv, "#.00") + "\n1D  " + f_stName(stD) + "  vote " + str.tostring(bvD) + " · eff " + str.tostring(erDv, "#.00") + "\n4H  " + f_stName(st4) + "  vote " + str.tostring(bv4) + " · eff " + str.tostring(er4v, "#.00") + "\n→ " + ebTxt + "  (" + str.tostring(posAgree) + "/3 agree)  ·  only TREND/PULLBACK vote directionally"
@@ -1046,8 +1056,8 @@ if barstate.islast
         pd = close >= claudeMid ? "PREMIUM · lean short" : "DISCOUNT · lean long"
         beh = not gateCZ ? "" : (sysState == 1 or sysState == 2) ? "  ·  TREND → continuation only" : "  ·  RANGE → mean-revert"
         meta = showAuMeta ? "\n" + f_locStateTxt(locState) + "  ·  v" + str.tostring(auctionVer) + " · age " + str.tostring(auctionAge) : ""
-        // the one-word story: what is this market doing? (both independent engines must agree)
-        verdict = "\n▸ " + dirTxt + (ctxConflict ? " ⚠ Structure×Context conflict" : dirVerdict == 0 ? "  (no agreement)" : "  (Structure + Context agree)")
+        // the 2-word story: direction + what to do (both independent engines must agree)
+        verdict = "\n▸ " + dirWord + " · " + attnTxt
         array.push(dLine, line.new(x1, claudeMid, x2, claudeMid, color=claudeCol, width=claudeW, extend=f_ext(extMode), style=f_lstyle(claudeSty)))
         array.push(dLab, label.new(x2, claudeMid, "CLAUDE LINE " + str.tostring(claudeMid, format.mintick) + "\n" + pd + beh + meta + verdict, xloc=xloc.bar_index, style=label.style_label_left, color=color.new(claudeCol, 0), textcolor=color.black, size=f_sz(lblSize)))
         if showPD and viewMode != "Claude Line only" and not na(aFloor) and not na(aCeil)
