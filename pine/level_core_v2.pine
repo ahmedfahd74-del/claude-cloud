@@ -127,6 +127,16 @@ leaderSym = input.symbol("BINANCE:BTCUSDT", "Leader (drives the asset class)", g
 tideSym   = input.symbol("CRYPTOCAP:TOTAL2", "Tide (total market cap ex-BTC)", group=gMC, tooltip="Crypto: TOTAL2 (altcoin tide). For indices/FX, pick the relevant breadth/complex proxy.")
 useRS     = input.bool(true, "Show relative strength vs leader", group=gMC, tooltip="Qualitative annotation only (this asset's structure vs the leader's) — never a vote. LEADING/LAGGING/IN-LINE/DIVERGING.")
 
+gTC = "Trade Card (decision + risk)"
+showCard  = input.bool(true, "Show Trade Card", group=gTC, tooltip="Turns the map into a disciplined GO/NO-GO for the level in front of price. Not a predictive signal — it enforces the things that actually protect an account: only PROVEN levels (validated), right side of value, and a minimum reward:risk. Everything is sized to a fixed % account risk.")
+tcAcct    = input.float(1000.0, "Account size ($)", minval=1.0, group=gTC)
+tcRiskPct = input.float(1.0, "Risk per trade (%)", minval=0.05, maxval=10.0, step=0.05, group=gTC)
+tcMinRR   = input.float(2.0, "Minimum reward:risk to GO", minval=0.5, maxval=10.0, step=0.25, group=gTC)
+tcStopBuf = input.float(0.5, "Stop buffer beyond level (× ATR)", minval=0.0, maxval=5.0, step=0.1, group=gTC)
+tcNeedProven = input.bool(true, "Require a PROVEN level (bounced before)", group=gTC, tooltip="The one thing the backtest validated: a level that has HELD before is stronger than a fresh one. ON = never GO on an untested level.")
+tcDraw    = input.bool(true, "Draw entry / stop / target lines", group=gTC)
+tcPos     = input.string("Bottom Left", "Card position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=gTC)
+
 gZL = "Appearance — Zone / Leading lines"
 czCeilCol  = input.color(#ef5350, "Ceiling (upper boundary)", inline="ce", group=gZL)
 czCeilW    = input.int(3, "w", minval=1, maxval=8, inline="ce", group=gZL)
@@ -873,6 +883,82 @@ if useEntry and showEPanel and barstate.islast
     table.cell(eT, 1, 5, str.tostring(eSigCnt), text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
     table.cell(eT, 0, 6, "REJECTED", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small, tooltip=rejTip)
     table.cell(eT, 1, 6, str.tostring(array.get(rejTot, 0)), text_color=color.orange, bgcolor=color.new(color.black, 40), text_size=size.small, tooltip=rejTip)
+
+// ══ TRADE CARD — disciplined decision + risk on the nearest level ═══════════════
+// NOT a predictive signal. It enforces the account-savers: PROVEN level (validated),
+// right side of value (discount→buy support · premium→sell resistance), minimum R:R,
+// and fixed-% position size. Refuses untested levels, wrong side, and bad R:R.
+f_tcPos(s) => s == "Top Right" ? position.top_right : s == "Top Left" ? position.top_left : s == "Bottom Right" ? position.bottom_right : position.bottom_left
+var table tcT = table.new(f_tcPos(tcPos), 2, 8, border_width=1)
+var line tcELn = na
+var line tcSLn = na
+var line tcTLn = na
+if showCard and barstate.islast
+    [upI, dnI] = f_nearestIdx()
+    disc = not na(locEQ) and close < locEQ
+    prem = not na(locEQ) and close >= locEQ
+    int sideDir = disc and dnI >= 0 ? 1 : prem and upI >= 0 ? -1 : 0
+    float entry = na
+    float stop  = na
+    float tgt   = na
+    int bounces = 0
+    if sideDir == 1
+        Ll = array.get(book, dnI)
+        entry := Ll.anchor
+        bounces := f_count(Ll, 2)
+        stop := entry - atrE * tcStopBuf
+        tgt := upI >= 0 ? array.get(book, upI).anchor : locEQ
+    else if sideDir == -1
+        Ls = array.get(book, upI)
+        entry := Ls.anchor
+        bounces := f_count(Ls, 2)
+        stop := entry + atrE * tcStopBuf
+        tgt := dnI >= 0 ? array.get(book, dnI).anchor : locEQ
+    float risk   = na(entry) or na(stop) ? na : math.abs(entry - stop)
+    float reward = na(entry) or na(tgt) ? na : math.abs(tgt - entry)
+    float rr     = na(risk) or risk == 0 or na(reward) ? na : reward / risk
+    proven = bounces >= 2                                       // founding + ≥1 real bounce (the validated cliff)
+    dirOppose = (sideDir == 1 and dirVerdict == -1) or (sideDir == -1 and dirVerdict == 1)
+    okProven = not tcNeedProven or proven
+    okRR = not na(rr) and rr >= tcMinRR
+    int vc = sideDir == 0 ? 0 : dirOppose ? 1 : not okProven ? 1 : not okRR ? 2 : 3   // 0 none·1 nogo·2 wait·3 go
+    verdict = vc == 0 ? "NO SETUP" : vc == 3 ? "GO" : vc == 2 ? "WAIT · R:R low" : dirOppose ? "NO-GO ⚠ conflict" : "NO-GO · untested"
+    vCol = vc == 3 ? (sideDir == 1 ? #26a69a : #ef5350) : vc == 2 ? color.new(#ff9800, 10) : color.new(color.gray, 20)
+    riskAmt = tcAcct * tcRiskPct / 100.0
+    float units = na(risk) or risk == 0 ? na : riskAmt / risk
+    sideTxt = sideDir == 1 ? "LONG (buy support)" : sideDir == -1 ? "SHORT (sell resist.)" : "—"
+    // entry/stop/target lines
+    if not na(tcELn)
+        line.delete(tcELn)
+    if not na(tcSLn)
+        line.delete(tcSLn)
+    if not na(tcTLn)
+        line.delete(tcTLn)
+    if tcDraw and sideDir != 0 and not na(entry)
+        xa = bar_index - 20
+        xb = bar_index + 40
+        tcELn := line.new(xa, entry, xb, entry, xloc=xloc.bar_index, color=color.new(color.white, 10), width=2)
+        tcSLn := line.new(xa, stop,  xb, stop,  xloc=xloc.bar_index, color=color.new(#ef5350, 0), width=1, style=line.style_dashed)
+        tcTLn := line.new(xa, tgt,   xb, tgt,   xloc=xloc.bar_index, color=color.new(#26a69a, 0), width=1, style=line.style_dashed)
+    hdrc = color.new(color.black, 10)
+    rowc = color.new(color.black, 40)
+    string tcTip = "Discipline, not prediction. GO needs: PROVEN level + right side of value + R:R ≥ " + str.tostring(tcMinRR, "#.0") + ". Size = " + str.tostring(tcRiskPct, "#.0") + "% of $" + str.tostring(tcAcct, "#") + " ÷ stop distance."
+    table.cell(tcT, 0, 0, "TRADE CARD", text_color=color.white, bgcolor=hdrc, text_size=size.small, tooltip=tcTip)
+    table.cell(tcT, 1, 0, sideTxt, text_color=color.white, bgcolor=sideDir == 1 ? #26a69a : sideDir == -1 ? #ef5350 : color.new(color.gray, 20), text_size=size.small, tooltip=tcTip)
+    table.cell(tcT, 0, 1, "VERDICT", text_color=color.white, bgcolor=rowc, text_size=size.small)
+    table.cell(tcT, 1, 1, verdict, text_color=color.white, bgcolor=vCol, text_size=size.small)
+    table.cell(tcT, 0, 2, "LEVEL", text_color=color.white, bgcolor=rowc, text_size=size.small)
+    table.cell(tcT, 1, 2, na(entry) ? "—" : str.tostring(entry, format.mintick) + (proven ? "  ✓ proven " + str.tostring(bounces - 1) + "×" : "  · UNTESTED"), text_color=color.white, bgcolor=rowc, text_size=size.small)
+    table.cell(tcT, 0, 3, "ENTRY", text_color=color.white, bgcolor=rowc, text_size=size.small)
+    table.cell(tcT, 1, 3, na(entry) ? "—" : str.tostring(entry, format.mintick), text_color=color.white, bgcolor=rowc, text_size=size.small)
+    table.cell(tcT, 0, 4, "STOP", text_color=color.white, bgcolor=rowc, text_size=size.small)
+    table.cell(tcT, 1, 4, na(stop) ? "—" : str.tostring(stop, format.mintick), text_color=#ef5350, bgcolor=rowc, text_size=size.small)
+    table.cell(tcT, 0, 5, "TARGET", text_color=color.white, bgcolor=rowc, text_size=size.small)
+    table.cell(tcT, 1, 5, na(tgt) ? "—" : str.tostring(tgt, format.mintick), text_color=#26a69a, bgcolor=rowc, text_size=size.small)
+    table.cell(tcT, 0, 6, "R : R", text_color=color.white, bgcolor=rowc, text_size=size.small)
+    table.cell(tcT, 1, 6, na(rr) ? "—" : str.tostring(rr, "#.00") + " : 1", text_color=color.white, bgcolor=rowc, text_size=size.small)
+    table.cell(tcT, 0, 7, "SIZE", text_color=color.white, bgcolor=rowc, text_size=size.small, tooltip=tcTip)
+    table.cell(tcT, 1, 7, na(units) ? "—" : str.tostring(units, "#.####") + "  ($" + str.tostring(riskAmt, "#") + " risk)", text_color=color.white, bgcolor=rowc, text_size=size.small, tooltip=tcTip)
 
 // ── RENDER ───────────────────────────────────────────────────────────────────
 var array<line>  dLine = array.new<line>()

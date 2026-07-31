@@ -216,6 +216,19 @@ NOTE: these validate the LOGIC, not compiled Pine — the real compile check is 
   determinism) PASS. Structural audit: delimiters balanced, indentation clean, **zero S/R coupling refs**,
   unique plot names, global alerts. **COMPILE-TEST PENDING** (user paste).
 
+## TRADE CARD (decision + risk) — BUILT, the practical income layer
+- `level_core_v2.pine` group "Trade Card (decision + risk)". Turns the descriptive map into a
+  disciplined GO / NO-GO for the level in front of price. **NOT a predictive signal** — it enforces
+  the account-savers backtesting could confirm: PROVEN level (bounced before, the validated edge) +
+  right side of value (discount→buy support · premium→sell resistance) + minimum reward:risk + fixed-%
+  position size. Refuses untested levels, wrong side, bad R:R, and direction conflicts.
+- Reads live nearest support/resistance (`f_nearestIdx`), their bounce counts (`f_count(L,2)`), the
+  Claude Line (`locEQ`) for value side, and `atrE` for the stop buffer. Card shows: side · VERDICT ·
+  level(proven?) · entry · stop · target · R:R · position size. Draws entry/stop/target lines.
+- Inputs: account size, risk %, min R:R (2.0), stop buffer (×ATR), require-proven toggle.
+- Validator `pine/trade_card_validate.py` — 7 claims (value-side pick, stop/target/RR geometry,
+  proven gate, R:R gate, conflict gate, fixed-% sizing, never-invents-a-setup) PASS.
+
 ## LAYERED DECISION SYSTEM (target architecture — approved)
 Top-down authorization, bottom-up execution. Higher layer grants permission + direction;
 lower layer only refines timing/price. A signal is valid only when all active layers agree;
