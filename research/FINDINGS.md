@@ -135,3 +135,37 @@ Ran the Claude-Line (equilibrium) respect AND the memory lift on THREE tickers v
   "confirmed on BTC/EURUSD, weak on SOL — needs per-asset calibration."
 - The real, unshaken asset is the METHOD: we can now measure any idea per-ticker before
   believing it. Tonight it stopped us trusting a line that doesn't predict.
+
+---
+
+# Expectancy Backtest (v3) — CAN the S/R levels be traded? (the real test)
+
+`research/expectancy_lab.py`. Full level population (every daily pivot, L=5), no
+cherry-pick. A trade per level-touch; stop 0.5·ATR (=1R), target 2R, net of 0.05%/side.
+Stratified proven-vs-untested; natural side vs trend-gated; vs random-entry null
+(60-perm) + shuffle surrogate. Mean R per trade (break-even = 0).
+
+| config | BTC | SOL | EURUSD |
+|---|---|---|---|
+| natural, ALL | −0.087R | +0.024R | −0.206R |
+| trend-gated, ALL | −0.005R | +0.078R | −0.109R |
+| **proven + trend** | **+0.034R** | **+0.086R** | **−0.072R** |
+
+## Verdict: NO tradeable standalone edge
+- Across 3 markets the levels are **break-even to losing** net of cost. Best case
+  (proven + with-trend) is barely + on BTC/SOL, still − on EURUSD. Not tradeable alone.
+- **The "beats random" green flag is a TRAP:** the random-entry null enters at random
+  bars, but a pivot is a local extreme → beating it is the same Test-1 tautology. The
+  honest control is the SHUFFLE SURROGATE, which returns **+0.4…+0.6R** while real ≈ 0 →
+  **real market trends make level-entries WORSE than random-walk data.** Damning.
+
+## Two real, keepable positives
+1. **The score sorts money:** PROVEN beats UNTESTED in every row (the +11pt memory
+   finding, now in R). The ranking separates better from worse — it just can't turn a
+   losing base entry into a winner.
+2. **Trend-gating always helps:** with-structure > natural side, every asset. Confirms
+   trades should never be counter-trend (the Trade Card's counter-trend LONG was wrong).
+
+## Bottom line
+The S/R engine is a good MAP with a working RANKING — but the levels are NOT a profitable
+entry on their own. Income needs the map PLUS a real trigger we don't yet have.
