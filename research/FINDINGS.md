@@ -169,3 +169,36 @@ Stratified proven-vs-untested; natural side vs trend-gated; vs random-entry null
 ## Bottom line
 The S/R engine is a good MAP with a working RANKING — but the levels are NOT a profitable
 entry on their own. Income needs the map PLUS a real trigger we don't yet have.
+
+---
+
+# Institutional Levels (v4) — Volume Profile vs price pivots (loop iter 1)
+
+Grounded the institutional standard (Volume Profile: POC / Value Area / HVN + VWAP —
+levels where money changed hands, not where price merely turned). Built rolling
+VProfile levels (POC+VAH+VAL, 60d window) and ran the SAME expectancy sim vs pivots.
+research/institutional_levels.py, on the 3 tickers we have WITH volume.
+
+| ticker | PIVOT (natural / trend+proven) | VPROFILE (natural / trend+proven) | surrogate |
+|---|---|---|---|
+| BTC | −0.008 / +0.073R | **+0.047 / +0.142R** | +0.6R |
+| ETH | −0.062 / −0.103R | **−0.005 / −0.031R** | +0.56R |
+| SOL | −0.015 / −0.017R | **+0.042 / −0.037R** | +0.53R |
+
+## Findings (honest)
+1. **Volume-Profile levels beat price pivots on all 3** — consistent, real. The
+   institutional method (POC/Value-Area) is a genuine relative improvement; the engine
+   should use volume levels, not bare pivots.
+2. **But still NOT a standalone profitable edge.** Best is BTC vprofile trend+proven
+   +0.14R; ETH ~breakeven; SOL mixed. And ALL remain **far below the shuffle surrogate
+   (+0.5–0.6R)** — which is drift-driven (buy-dip-in-bull-market with a 2R target). Real
+   markets' volatility *clustering* kills that drift edge with the tight stop. So the
+   "beats random-entry" green is again the mechanical tautology, not an edge.
+3. **No ticker "passes" a strict profitability bar** — and I will NOT fit-to-pass. The
+   principled institutional upgrade helped and still wasn't enough. That's the answer.
+
+## Standing conclusion
+Levels alone — pivots OR institutional volume-profile — are a MAP with a working
+ranking, not a profitable trigger. Volume-Profile is the best level *definition* and
+worth porting. Income still needs the map PLUS a trigger. (Coverage: 3 tickers with
+volume; more tickers = confirmation, not a different answer.)
