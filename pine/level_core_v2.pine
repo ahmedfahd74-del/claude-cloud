@@ -83,27 +83,11 @@ nudgeCeil  = input.float(0.0, "Nudge nearest RESISTANCE / ceiling (% of price)",
 nudgeFloor = input.float(0.0, "Nudge nearest SUPPORT / floor (% of price)", minval=-2.0, maxval=2.0, step=0.01, group=gNz, tooltip="Presentation only. Shift the nearest level BELOW price (the floor price is about to hit).")
 
 gP = "Position Layer (HTF bias + regime)"
+biasSwing = input.int(5, "HTF structure swing size (state classifier)", minval=2, maxval=30, group=gP, tooltip="Pivot L/R used to read each HTF's HH/HL/LH/LL market-state structure (per 1W/1D/4H).")
 posMomLen = input.int(50, "HTF momentum EMA length (per 1W/1D/4H)", minval=5, maxval=400, group=gP, tooltip="Each HTF votes its HH/HL/LH/LL structure ONLY if momentum agrees: price above this EMA = bullish momentum, below = bearish. Momentum that OPPOSES the structure vetoes that timeframe's vote.")
 erLen     = input.int(20, "Regime efficiency-ratio lookback (Daily bars)", minval=5, maxval=200, group=gP)
 erTrend   = input.float(0.35, "Trending efficiency ratio (0–1) — churn cutoff", minval=0.05, maxval=0.95, step=0.05, group=gP, tooltip="Kaufman efficiency ratio per HTF = |net move| / |sum of bar moves|. Below this a topping/bottoming structure is read as DISTRIBUTION / ACCUMULATION (churn), not a clean trend.")
 erChop    = input.float(0.12, "Dead-structure floor (efficiency ratio 0–1)", minval=0.02, maxval=0.60, step=0.02, group=gP, tooltip="Even clean HH+HL / LH+LL structure is downgraded to RANGE when efficiency is below this — a low-volatility grind is not a tradable trend. Volatility gate on directional bias.")
-
-gE = "Entry Engine (liquidity-first) — M4"
-useEntry    = input.bool(true, "Enable liquidity-first entry signals", group=gE, tooltip="Flow: HTF bias → target liquidity → SWEEP of a strong LIVE level → quality rejection → LTF structure sequence (SHORT: LH then LL · LONG: HL then HH) → signal toward the opposing level. Signals are visual/alerts only — paper trading.")
-entryBiasSw = input.int(5, "Bias Swing Size (W/D/4H/1H sequence classifier)", minval=2, maxval=30, group=gE, tooltip="Same HH+HL / LH+LL sequence rule as MS-Core, weighted W .40 D .30 4H .20 1H .10 with a ±0.15 deadband. MIXED bias = no signals.")
-maxExecTF   = input.timeframe("5", "Max execution timeframe (engine off above this)", group=gE, tooltip="Execution belongs on 1m–5m. On any chart TF above this the engine stays idle (levels/bias still display).")
-entryMinCnf = input.float(40.0, "Min level strength to arm (CONF + confluence)", minval=0.0, maxval=100.0, step=5.0, group=gE, tooltip="The swept level's confidence plus its confluence bonus (neighbours within the merge band) must reach this. Weak levels never arm — they get logged as rejected setups.")
-rejMin      = input.float(0.5, "Min rejection quality of the sweep bar (0-1)", minval=0.0, maxval=1.0, step=0.05, group=gE, tooltip="SHORT: (high−close)/range · LONG: (close−low)/range of the sweep bar. Same wick/body measure the event engine logs. Low-quality rejections are logged, not armed.")
-minSweepATR = input.float(0.25, "Min sweep depth beyond level (× ATR)", minval=0.0, maxval=5.0, step=0.05, group=gE, tooltip="The wick must pierce the swept level by at least this many ATRs before it counts as a real liquidity grab. Filters the micro-pokes that produced too many signals.")
-atrLen      = input.int(14, "ATR length (sweep-depth normalization)", minval=2, maxval=100, group=gE)
-internalPiv = input.int(3, "Internal structure pivot (BOS / CHoCH size)", minval=1, maxval=10, group=gE, tooltip="Confirmation is a real internal break: after the sweep, price must CLOSE through the last internal swing (a pivot of this size) in the bias direction — a bearish break for shorts, a bullish break for longs.")
-useLocFilter = input.bool(true, "Require premium / discount location", group=gE, tooltip="SHORT only when the swept level sits in the PREMIUM (upper half) of the recent range; LONG only in the DISCOUNT (lower half). Blocks longs at range highs and shorts at range lows.")
-locLookback = input.int(50, "Premium / discount range lookback (bars)", minval=10, maxval=500, group=gE)
-seqWindow   = input.int(20, "Max bars from sweep to structure break", minval=3, maxval=100, group=gE)
-coolBars    = input.int(10, "Cooldown after a signal (bars)", minval=0, maxval=200, group=gE)
-showSwpMark = input.bool(true, "Mark armed sweeps (✕)", group=gE)
-showTrdLn   = input.bool(true, "Draw entry / stop / target lines on signal", group=gE)
-showEPanel  = input.bool(true, "Show entry-state panel (hover REJECTED = reasons log)", group=gE)
 
 gCZ = "Claude Zone (ranked view)"
 viewMode   = input.string("All levels", "View", options=["All levels", "Leading (ranked)", "Claude Zone (3)", "Claude Line only"], group=gCZ, tooltip="All = every level (nearest maxLvls). Leading = only the N strongest each side. Claude Zone = 3 lines (support, resistance, Claude Line). Claude Line only = nothing but the Claude Line — cleanest chart.")
@@ -119,23 +103,6 @@ auctionTF    = input.timeframe("D", "Auction timeframe (fixed — the auction yo
 auctionSwing = input.int(5, "Auction swing size (pivot L/R)", minval=2, maxval=50, group=gLE)
 approachPct  = input.float(10.0, "Approaching threshold (% of range width)", minval=1.0, maxval=45.0, step=1.0, group=gLE)
 showAuMeta   = input.bool(true, "Show auction state/version/age on the Claude Line", group=gLE)
-
-gMC = "Market Context Engine (external 2nd source)"
-useContext = input.bool(true, "Enable market context confirmation", group=gMC, tooltip="An INDEPENDENT second direction source: the SAME structure classifier applied to EXTERNAL data (asset-class leader + market-cap tide) — NO moving average, oscillator, or this chart's own price. A TRUE direction (BULL/BEAR) is declared ONLY when Structure and Context AGREE; disagreement = RANGE (a trap — waiting is a position).")
-ctxTF     = input.timeframe("D", "Context timeframe", group=gMC, tooltip="The timeframe on which the leader/tide structure is read. Independent of the chart TF (single HTF values → stable).")
-leaderSym = input.symbol("BINANCE:BTCUSDT", "Leader (drives the asset class)", group=gMC, tooltip="Crypto: BTC. The dominant instrument the class follows.")
-tideSym   = input.symbol("CRYPTOCAP:TOTAL2", "Tide (total market cap ex-BTC)", group=gMC, tooltip="Crypto: TOTAL2 (altcoin tide). For indices/FX, pick the relevant breadth/complex proxy.")
-useRS     = input.bool(true, "Show relative strength vs leader", group=gMC, tooltip="Qualitative annotation only (this asset's structure vs the leader's) — never a vote. LEADING/LAGGING/IN-LINE/DIVERGING.")
-
-gTC = "Trade Card (decision + risk)"
-showCard  = input.bool(true, "Show Trade Card", group=gTC, tooltip="Turns the map into a disciplined GO/NO-GO for the level in front of price. Not a predictive signal — it enforces the things that actually protect an account: only PROVEN levels (validated), right side of value, and a minimum reward:risk. Everything is sized to a fixed % account risk.")
-tcAcct    = input.float(1000.0, "Account size ($)", minval=1.0, group=gTC)
-tcRiskPct = input.float(1.0, "Risk per trade (%)", minval=0.05, maxval=10.0, step=0.05, group=gTC)
-tcMinRR   = input.float(2.0, "Minimum reward:risk to GO", minval=0.5, maxval=10.0, step=0.25, group=gTC)
-tcStopBuf = input.float(0.5, "Stop buffer beyond level (× ATR)", minval=0.0, maxval=5.0, step=0.1, group=gTC)
-tcNeedProven = input.bool(true, "Require a PROVEN level (bounced before)", group=gTC, tooltip="The one thing the backtest validated: a level that has HELD before is stronger than a fresh one. ON = never GO on an untested level.")
-tcDraw    = input.bool(true, "Draw entry / stop / target lines", group=gTC)
-tcPos     = input.string("Bottom Left", "Card position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=gTC)
 
 gZL = "Appearance — Zone / Leading lines"
 czCeilCol  = input.color(#ef5350, "Ceiling (upper boundary)", inline="ce", group=gZL)
@@ -428,8 +395,8 @@ f_interact(3, nw, bar_index, time, hw, lw, cw, pcw)
 // ONLY source of bias; the execution layer consumes it and never creates it.
 // state codes: 0 RANGE · 1 TRENDING · 2 PULLBACK · 3 TRANSITION · 4 DISTRIBUTION · 5 ACCUMULATION
 f_state() =>
-    _ph = ta.pivothigh(high, entryBiasSw, entryBiasSw)
-    _pl = ta.pivotlow(low,  entryBiasSw, entryBiasSw)
+    _ph = ta.pivothigh(high, biasSwing, biasSwing)
+    _pl = ta.pivotlow(low,  biasSwing, biasSwing)
     var float _h1 = na
     var float _h2 = na
     var float _l1 = na
@@ -497,7 +464,6 @@ f_statePrev() =>
 bulls = (bvW == 1 ? 1 : 0) + (bvD == 1 ? 1 : 0) + (bv4 == 1 ? 1 : 0)
 bears = (bvW == -1 ? 1 : 0) + (bvD == -1 ? 1 : 0) + (bv4 == -1 ? 1 : 0)
 posDir   = bulls >= 2 ? 1 : bears >= 2 ? -1 : 0   // confirmed direction (else neutral)
-posAgree = math.max(bulls, bears)
 
 // SYSTEM market state (precedence): confirmed dir → TRENDING if ≥2 agreeing HTFs are
 // TREND else PULLBACK; no confirmed dir → conflict=TRANSITION, else surface D/A, else RANGE
@@ -513,39 +479,14 @@ else if stW == 5 or stD == 5 or st4 == 5
     sysState := 5
 else
     sysState := 0
-sysLean = posDir != 0 ? posDir : (sysState == 4 ? -1 : sysState == 5 ? 1 : 0)   // incl. topping/bottoming lean
-erSys   = (erWv + erDv + er4v) / 3.0                                             // trending regime = TREND/PULLBACK (sysState 1/2)
 
-f_stName(int s) => s == 1 ? "TRENDING" : s == 2 ? "PULLBACK" : s == 3 ? "TRANSITION" : s == 4 ? "DISTRIBUTION" : s == 5 ? "ACCUMULATION" : "RANGE"
-
-// the execution layer reads ONLY this confirmed bias — it does not compute its own
-entryDir = posDir
-
-// ══ MARKET CONTEXT ENGINE — orthogonal EXTERNAL 2nd direction source ═════════════
-// Independence BY CONSTRUCTION: the SAME structure classifier (f_state) applied to
-// OTHER symbols (asset-class leader + market-cap tide) — never this chart's price,
-// and no MA / oscillator / trend indicator. Its verdict is source-independent from
-// the Structure engine (posDir), so agreement between the two is genuine confluence,
-// not two views of the same series. Reads the prior CLOSED ctxTF bar (non-repaint).
-[ctxStL, ctxBvL, ctxLnL, ctxErL] = request.security(leaderSym, ctxTF, f_statePrev(), lookahead=barmerge.lookahead_on)
-[ctxStT, ctxBvT, ctxLnT, ctxErT] = request.security(tideSym,  ctxTF, f_statePrev(), lookahead=barmerge.lookahead_on)
-// context direction: leader AND tide must agree (else neutral). External-only vote.
-ctxDir = not useContext ? posDir : (ctxBvL == 1 and ctxBvT == 1) ? 1 : (ctxBvL == -1 and ctxBvT == -1) ? -1 : 0
-// relative strength: this asset's structure vs the leader's — qualitative annotation, NEVER a vote
-rsTag = not (useContext and useRS) ? "" : (posDir == ctxBvL and posDir != 0) ? "IN-LINE" : (posDir != 0 and ctxBvL == 0) ? "LEADING" : (posDir == 0 and ctxBvL != 0) ? "LAGGING" : (posDir != 0 and ctxBvL != 0 and posDir != ctxBvL) ? "DIVERGING" : "FLAT"
-
-// ══ TRUE DIRECTION — the two INDEPENDENT engines must AGREE ══════════════════════
-// Confidence comes from independent sources agreeing (IMIS §3). BULL/BEAR only when
-// Structure (internal price) AND Context (external leader+tide) point the same way;
-// opposition = CONFLICT (trap); anything else = RANGE. The system prefers RANGE.
-ctxAgree    = posDir != 0 and posDir == ctxDir
-ctxConflict = posDir != 0 and ctxDir != 0 and posDir != ctxDir
-dirVerdict  = not useContext ? posDir : (ctxAgree ? posDir : 0)
-dirTxt      = dirVerdict == 1 ? "BULL" : dirVerdict == -1 ? "BEAR" : "RANGE"
-// ── publish to the data window (machine-readable for other IMIS consumers) ──
-plot(ctxDir,     "ctx.direction",  display=display.data_window)
+// ══ TRUE DIRECTION — HTF structure bias (single source) ══════════════════════════
+// Direction is the confirmed HTF market-state bias (posDir: 2/3 of 1W/1D/4H agreeing).
+// Published for downstream IMIS consumers.
+dirVerdict = posDir
+dirTxt     = dirVerdict == 1 ? "BULL" : dirVerdict == -1 ? "BEAR" : "RANGE"
 plot(dirVerdict, "true.direction", display=display.data_window)
-alertcondition(ta.change(dirVerdict) != 0, "True direction change", "IMIS: true market direction changed (Structure × Context agreement)")
+alertcondition(ta.change(dirVerdict) != 0, "True direction change", "IMIS: true market direction (HTF structure) changed")
 
 // ══ LOCATION ENGINE — active dealing range (the auction), reach-independent + stable ══
 // Reads the last 3 CONFIRMED swings each side on a FIXED auction TF via ta.valuewhen
@@ -625,14 +566,15 @@ if barstate.isconfirmed
 auctionAge = bar_index - auctionBar
 
 // ── ATTENTION verdict: exactly 2 words — direction + what to do ──
-// direction (UP/DOWN/RANGE) from the true-direction combiner · attention state from
-// agreement + auction location: STAY AWAY = conflict (trap); GET READY = true direction
-// AND price at a favourable location (bull cheap/at floor · bear rich/at ceiling — where the
-// limit order belongs); WAIT = agreement but price extended (don't chase), or plain RANGE.
+// direction (UP/DOWN/RANGE) from the HTF structure bias · attention state from
+// direction + auction location: STAY AWAY = no clean bias (RANGE); GET READY = a
+// confirmed direction AND price at a favourable location (bull cheap/at floor · bear
+// rich/at ceiling — where the limit order belongs); WAIT = direction but price
+// extended (don't chase).
 dirWord  = dirVerdict == 1 ? "UP" : dirVerdict == -1 ? "DOWN" : "RANGE"
 favLong  = dirVerdict == 1 and (not locPremium or locState == 2)
 favShort = dirVerdict == -1 and (locPremium or locState == 1)
-attnTxt  = ctxConflict ? "STAY AWAY" : (favLong or favShort) ? "GET READY" : "WAIT"
+attnTxt  = dirVerdict == 0 ? "STAY AWAY" : (favLong or favShort) ? "GET READY" : "WAIT"
 
 // ── publish to the data window (machine-readable for other IMIS consumers) ──
 plot(locUB,      "loc.UB",                 display=display.data_window)
@@ -642,323 +584,6 @@ plot(auctionVer, "loc.auctionVersion",     display=display.data_window)
 plot(auctionAge, "loc.auctionAge",         display=display.data_window)
 plot(locState,   "loc.zoneState",          display=display.data_window)
 alertcondition(auctionTrans != 0, "Auction transition", "IMIS Location Engine: active auction changed (new version)")
-
-// nearest level INDICES above / below price (true anchors — nudge never touches this)
-f_nearestIdx() =>
-    int _up = -1
-    int _dn = -1
-    float _upA = na
-    float _dnA = na
-    if array.size(book) > 0
-        for i = 0 to array.size(book) - 1
-            a = array.get(book, i).anchor
-            if a >= close and (na(_upA) or a < _upA)
-                _upA := a
-                _up := i
-            if a < close and (na(_dnA) or a > _dnA)
-                _dnA := a
-                _dn := i
-    [_up, _dn]
-
-// level strength for arming: its confidence + confluence bonus for neighbours
-// within the merge band (same formula family as the merged-cluster STR)
-f_lvlStrength(int idx) =>
-    L = array.get(book, idx)
-    c = f_conf(L)
-    int nb = 0
-    bandM = L.anchor * mergeBandPct / 100.0
-    for k = 0 to array.size(book) - 1
-        if k != idx and math.abs(array.get(book, k).anchor - L.anchor) <= bandM
-            nb += 1
-    math.min(100.0, c + conflBonus * nb)
-
-// rejected-setups log (rolling, capped) — reasons visible on the panel hover
-var array<string> rejLog = array.new<string>()
-var array<int>    rejTot = array.new<int>(1, 0)
-f_logRej(string why) =>
-    array.push(rejLog, str.format_time(time, "MM-dd HH:mm") + "  " + why)
-    if array.size(rejLog) > 30
-        array.shift(rejLog)
-    array.set(rejTot, 0, array.get(rejTot, 0) + 1)
-
-// ── internal market structure (chart / execution TF) — real BOS / CHoCH ──────
-// Track the last confirmed internal swing high & low; a CLOSE beyond one is an
-// internal structure break (fired once per swing). Non-repainting: the pivots
-// confirm internalPiv bars late and are only read after they confirm.
-iPH = ta.pivothigh(high, internalPiv, internalPiv)
-iPL = ta.pivotlow(low,  internalPiv, internalPiv)
-var float iSwHi   = na
-var float iSwLo   = na
-var bool  iHiUsed = true
-var bool  iLoUsed = true
-var int   iTrend  = 0
-if not na(iPH)
-    iSwHi   := iPH
-    iHiUsed := false
-if not na(iPL)
-    iSwLo   := iPL
-    iLoUsed := false
-brokeHiNow = not na(iSwHi) and not iHiUsed and close > iSwHi
-brokeLoNow = not na(iSwLo) and not iLoUsed and close < iSwLo
-// classify the break: CHoCH (flips internal trend) vs BOS (continuation)
-bool chochUp = false
-bool chochDn = false
-if brokeHiNow
-    chochUp := iTrend <= 0
-    iTrend  := 1
-    iHiUsed := true
-if brokeLoNow
-    chochDn := iTrend >= 0
-    iTrend  := -1
-    iLoUsed := true
-
-// ATR (sweep-depth threshold) + premium / discount range on the execution TF
-atrE  = ta.atr(atrLen)
-rngHi = ta.highest(high, locLookback)
-rngLo = ta.lowest(low,  locLookback)
-eqM   = (rngHi + rngLo) / 2.0
-
-// opposing-liquidity target (draw on liquidity): nearest STRONG opposing level;
-// fall back to the range extreme (the sell-/buy-side pool) when none qualifies.
-f_oppLiq(int dir, float fromPx) =>
-    float best = na
-    if array.size(book) > 0
-        for i = 0 to array.size(book) - 1
-            a = array.get(book, i).anchor
-            if dir == -1 and a < fromPx and f_lvlStrength(i) >= entryMinCnf and (na(best) or a > best)
-                best := a
-            if dir == 1 and a > fromPx and f_lvlStrength(i) >= entryMinCnf and (na(best) or a < best)
-                best := a
-    na(best) ? (dir == -1 ? rngLo : rngHi) : best
-
-// execution-TF guard: engine runs only on execution timeframes (default ≤ 5m)
-execOK = chartSec <= timeframe.in_seconds(maxExecTF)
-
-// state machine: 0 IDLE · 1 SWEPT (await internal BOS/CHoCH in bias direction)
-var int   eSt        = 0
-var int   eDirL      = 0     // -1 short / +1 long
-var float eAnchor    = na    // swept level
-var float eSwHi      = na    // sweep bar extremes
-var float eSwLo      = na
-var int   eSwBar     = 0
-var float eStructRef = na    // the internal swing that was broken (display)
-var string eBreakK   = ""    // "CHoCH" / "BOS" (display)
-var int   eCool      = 0
-var int   eSigCnt    = 0
-bool sigLong  = false
-bool sigShort = false
-float sigStop = na
-float sigTgt  = na
-
-if useEntry and execOK and barstate.isconfirmed
-    [iUp, iDn] = f_nearestIdx()
-    float nUp = iUp >= 0 ? array.get(book, iUp).anchor : na
-    float nDn = iDn >= 0 ? array.get(book, iDn).anchor : na
-    // resets for a live setup: bias flip, window expiry, sweep-extreme reclaim
-    if eSt == 1
-        dTag = eDirL == -1 ? "SHORT" : "LONG"
-        if entryDir != eDirL
-            f_logRej(dTag + " @" + str.tostring(eAnchor, format.mintick) + " — bias flipped")
-            eSt := 0
-        else if bar_index - eSwBar > seqWindow
-            f_logRej(dTag + " @" + str.tostring(eAnchor, format.mintick) + " — no internal break in window")
-            eSt := 0
-        else if eDirL == -1 and close > eSwHi
-            f_logRej(dTag + " @" + str.tostring(eAnchor, format.mintick) + " — invalidated: close above sweep high")
-            eSt := 0
-        else if eDirL == 1 and close < eSwLo
-            f_logRej(dTag + " @" + str.tostring(eAnchor, format.mintick) + " — invalidated: close below sweep low")
-            eSt := 0
-    // CONFIRM: a real internal BOS/CHoCH in the bias direction, after the sweep bar
-    if eSt == 1 and bar_index > eSwBar
-        if eDirL == -1 and brokeLoNow
-            sigShort := true
-            eStructRef := iSwLo
-            eBreakK := chochDn ? "CHoCH" : "BOS"
-        else if eDirL == 1 and brokeHiNow
-            sigLong := true
-            eStructRef := iSwHi
-            eBreakK := chochUp ? "CHoCH" : "BOS"
-    // SIGNAL: draw + cooldown. Target = opposing liquidity (draw), not nearest level.
-    if sigShort or sigLong
-        sigStop := sigShort ? eSwHi : eSwLo
-        sigTgt  := f_oppLiq(eDirL, close)
-        rr = na(sigTgt) or math.abs(sigStop - close) == 0 ? na : math.abs(close - sigTgt) / math.abs(sigStop - close)
-        txt = (sigShort ? "▼ SHORT" : "▲ LONG") + "  @" + str.tostring(close, format.mintick) + "\nsweep " + str.tostring(eAnchor, format.mintick) + " → internal " + eBreakK + " " + str.tostring(eStructRef, format.mintick) + "\nstop " + str.tostring(sigStop, format.mintick) + (na(sigTgt) ? "" : " · tgt " + str.tostring(sigTgt, format.mintick)) + (na(rr) ? "" : " · R " + str.tostring(rr, "#.0"))
-        label.new(bar_index, sigShort ? high : low, txt, xloc=xloc.bar_index, style=sigShort ? label.style_label_down : label.style_label_up, color=sigShort ? color.new(#ef5350, 10) : color.new(#26a69a, 10), textcolor=color.white, size=size.small)
-        if showTrdLn
-            line.new(bar_index, close, bar_index + 12, close, xloc=xloc.bar_index, color=color.gray, width=1, style=line.style_solid)
-            line.new(bar_index, sigStop, bar_index + 12, sigStop, xloc=xloc.bar_index, color=#ef5350, width=1, style=line.style_dotted)
-            if not na(sigTgt)
-                line.new(bar_index, sigTgt, bar_index + 12, sigTgt, xloc=xloc.bar_index, color=#26a69a, width=1, style=line.style_dotted)
-        eSigCnt := eSigCnt + 1
-        eCool := bar_index + coolBars
-        eSt := 0
-    // IDLE: watch for a QUALIFIED sweep of the LIVE level in the bias direction.
-    // Gates (each failure logged, never silent): ATR sweep depth · premium/discount
-    // location · level strength · sweep-bar rejection quality.
-    if eSt == 0 and not (sigShort or sigLong) and bar_index >= eCool and entryDir != 0
-        rng = high - low
-        if entryDir == -1 and iUp >= 0 and high > nUp and close <= nUp
-            depth = high - nUp
-            strengthS = f_lvlStrength(iUp)
-            rqS = rng <= 0 ? 0.0 : (high - close) / rng
-            if depth < minSweepATR * atrE
-                f_logRej("SHORT sweep @" + str.tostring(nUp, format.mintick) + " skipped — shallow (" + str.tostring(atrE > 0 ? depth / atrE : 0.0, "#.00") + " < " + str.tostring(minSweepATR, "#.00") + " ATR)")
-            else if useLocFilter and nUp < eqM
-                f_logRej("SHORT sweep @" + str.tostring(nUp, format.mintick) + " skipped — not in premium (below range mid)")
-            else if strengthS < entryMinCnf
-                f_logRej("SHORT sweep @" + str.tostring(nUp, format.mintick) + " skipped — weak level (STR " + str.tostring(math.round(strengthS)) + " < " + str.tostring(math.round(entryMinCnf)) + ")")
-            else if rqS < rejMin
-                f_logRej("SHORT sweep @" + str.tostring(nUp, format.mintick) + " skipped — weak rejection (" + str.tostring(rqS, "#.00") + " < " + str.tostring(rejMin, "#.00") + ")")
-            else
-                eSt := 1
-                eDirL := -1
-                eAnchor := nUp
-                eSwHi := high
-                eSwLo := low
-                eSwBar := bar_index
-                if showSwpMark
-                    label.new(bar_index, high, "✕", xloc=xloc.bar_index, style=label.style_none, textcolor=#ef5350, size=size.small)
-        else if entryDir == 1 and iDn >= 0 and low < nDn and close >= nDn
-            depth = nDn - low
-            strengthL = f_lvlStrength(iDn)
-            rqL = rng <= 0 ? 0.0 : (close - low) / rng
-            if depth < minSweepATR * atrE
-                f_logRej("LONG sweep @" + str.tostring(nDn, format.mintick) + " skipped — shallow (" + str.tostring(atrE > 0 ? depth / atrE : 0.0, "#.00") + " < " + str.tostring(minSweepATR, "#.00") + " ATR)")
-            else if useLocFilter and nDn > eqM
-                f_logRej("LONG sweep @" + str.tostring(nDn, format.mintick) + " skipped — not in discount (above range mid)")
-            else if strengthL < entryMinCnf
-                f_logRej("LONG sweep @" + str.tostring(nDn, format.mintick) + " skipped — weak level (STR " + str.tostring(math.round(strengthL)) + " < " + str.tostring(math.round(entryMinCnf)) + ")")
-            else if rqL < rejMin
-                f_logRej("LONG sweep @" + str.tostring(nDn, format.mintick) + " skipped — weak rejection (" + str.tostring(rqL, "#.00") + " < " + str.tostring(rejMin, "#.00") + ")")
-            else
-                eSt := 1
-                eDirL := 1
-                eAnchor := nDn
-                eSwHi := high
-                eSwLo := low
-                eSwBar := bar_index
-                if showSwpMark
-                    label.new(bar_index, low, "✕", xloc=xloc.bar_index, style=label.style_none, textcolor=#26a69a, size=size.small)
-
-alertcondition(sigLong,  "M4 LONG (liquidity-first)",  "Liquidity-first LONG: floor swept + HL→HH structure confirmed")
-alertcondition(sigShort, "M4 SHORT (liquidity-first)", "Liquidity-first SHORT: ceiling swept + LH→LL structure confirmed")
-
-var table eT = table.new(position.bottom_right, 2, 7, border_width=1)
-if useEntry and showEPanel and barstate.islast
-    ebTxt = posDir == 1 ? "BULL" : posDir == -1 ? "BEAR" : "NEUTRAL"
-    ebCol = posDir == 1 ? #26a69a : posDir == -1 ? #ef5350 : color.new(color.gray, 20)
-    // context + true-direction verdict (the two independent engines)
-    ctxTxt = not useContext ? "OFF" : ctxDir == 1 ? "BULL" : ctxDir == -1 ? "BEAR" : "MIXED"
-    ctxCol = not useContext ? color.new(color.gray, 40) : ctxDir == 1 ? #26a69a : ctxDir == -1 ? #ef5350 : color.new(color.gray, 20)
-    dCol   = dirVerdict == 1 ? #26a69a : dirVerdict == -1 ? #ef5350 : (ctxConflict ? color.new(#ff9800, 5) : color.new(color.gray, 10))
-    dSub   = dirWord + " · " + attnTxt
-    string ctxTip = "MARKET CONTEXT ENGINE — external, INDEPENDENT of this chart's price (no MA/oscillator)\nLeader  " + f_stName(ctxStL) + "  vote " + str.tostring(ctxBvL) + "\nTide    " + f_stName(ctxStT) + "  vote " + str.tostring(ctxBvT) + (useRS ? "\nRel. strength vs leader: " + rsTag : "") + "\n→ context " + ctxTxt + "  (leader AND tide must agree)"
-    string dirTip = "TRUE DIRECTION — declared only when the two INDEPENDENT engines AGREE:\nStructure (internal HH/HL price) = " + ebTxt + "\nContext (external leader+tide)   = " + ctxTxt + "\n" + (ctxConflict ? "CONFLICT → stand aside (potential trap). Waiting is a position." : dirVerdict == 0 ? "No agreement → RANGE." : "AGREEMENT → " + dirTxt + ".")
-    string biasTip = "POSITION LAYER — bias DERIVED from HTF market state; 2/3 agreement CONFIRMS\n1W  " + f_stName(stW) + "  vote " + str.tostring(bvW) + " · eff " + str.tostring(erWv, "#.00") + "\n1D  " + f_stName(stD) + "  vote " + str.tostring(bvD) + " · eff " + str.tostring(erDv, "#.00") + "\n4H  " + f_stName(st4) + "  vote " + str.tostring(bv4) + " · eff " + str.tostring(er4v, "#.00") + "\n→ " + ebTxt + "  (" + str.tostring(posAgree) + "/3 agree)  ·  only TREND/PULLBACK vote directionally"
-    sName = f_stName(sysState)
-    sDir  = sysLean == 1 ? " ▲" : sysLean == -1 ? " ▼" : ""
-    sCol  = sysState == 1 ? (posDir == 1 ? #26a69a : #ef5350) : sysState == 2 ? color.new(#42bda8, 10) : sysState == 4 ? color.new(#ef5350, 30) : sysState == 5 ? color.new(#26a69a, 30) : color.new(color.gray, 20)
-    stateTip = "MARKET STATE = " + sName + sDir + "\nHH/HL/LH/LL progression + swing expansion + momentum + volatility (efficiency " + str.tostring(erSys, "#.00") + ").\nTRENDING=with momentum · PULLBACK=counter-move in trend (buy the dip) · TRANSITION=structure shifting · DISTRIBUTION=topping · ACCUMULATION=bottoming · RANGE=balanced.\nDirectional bias only in TRENDING/PULLBACK; the rest are neutral (context/lean)."
-    left = seqWindow - (bar_index - eSwBar)
-    stTxt = not execOK ? "OFF — chart TF > " + maxExecTF + "m limit" : eSt == 1 ? (eDirL == -1 ? "SWEPT ▼ await bearish break (" : "SWEPT ▲ await bullish break (") + str.tostring(left) + ")" : bar_index < eCool ? "COOLDOWN " + str.tostring(eCool - bar_index) : "IDLE — watching"
-    string rejTip = "REJECTED SETUPS (latest first not guaranteed — chronological):\n"
-    if array.size(rejLog) > 0
-        for ri = 0 to array.size(rejLog) - 1
-            rejTip := rejTip + array.get(rejLog, ri) + "\n"
-    else
-        rejTip := rejTip + "none yet"
-    table.cell(eT, 0, 0, "DIRECTION", text_color=color.white, bgcolor=color.new(color.black, 0), text_size=size.small, tooltip=dirTip)
-    table.cell(eT, 1, 0, dSub, text_color=color.white, bgcolor=dCol, text_size=size.small, tooltip=dirTip)
-    table.cell(eT, 0, 1, "STRUCTURE", text_color=color.white, bgcolor=color.new(color.black, 20), text_size=size.small, tooltip=biasTip)
-    table.cell(eT, 1, 1, ebTxt + "  " + str.tostring(posAgree) + "/3", text_color=color.white, bgcolor=ebCol, text_size=size.small, tooltip=biasTip)
-    table.cell(eT, 0, 2, "CONTEXT", text_color=color.white, bgcolor=color.new(color.black, 20), text_size=size.small, tooltip=ctxTip)
-    table.cell(eT, 1, 2, ctxTxt + (useRS and useContext ? "  " + rsTag : ""), text_color=color.white, bgcolor=ctxCol, text_size=size.small, tooltip=ctxTip)
-    table.cell(eT, 0, 3, "MARKET STATE", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small, tooltip=stateTip)
-    table.cell(eT, 1, 3, sName + sDir, text_color=color.white, bgcolor=sCol, text_size=size.small, tooltip=stateTip)
-    table.cell(eT, 0, 4, "EXEC", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
-    table.cell(eT, 1, 4, stTxt, text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
-    table.cell(eT, 0, 5, "SIGNALS", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
-    table.cell(eT, 1, 5, str.tostring(eSigCnt), text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
-    table.cell(eT, 0, 6, "REJECTED", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small, tooltip=rejTip)
-    table.cell(eT, 1, 6, str.tostring(array.get(rejTot, 0)), text_color=color.orange, bgcolor=color.new(color.black, 40), text_size=size.small, tooltip=rejTip)
-
-// ══ TRADE CARD — disciplined decision + risk on the nearest level ═══════════════
-// NOT a predictive signal. It enforces the account-savers: PROVEN level (validated),
-// right side of value (discount→buy support · premium→sell resistance), minimum R:R,
-// and fixed-% position size. Refuses untested levels, wrong side, and bad R:R.
-f_tcPos(s) => s == "Top Right" ? position.top_right : s == "Top Left" ? position.top_left : s == "Bottom Right" ? position.bottom_right : position.bottom_left
-var table tcT = table.new(f_tcPos(tcPos), 2, 8, border_width=1)
-var line tcELn = na
-var line tcSLn = na
-var line tcTLn = na
-if showCard and barstate.islast
-    [upI, dnI] = f_nearestIdx()
-    disc = not na(locEQ) and close < locEQ
-    prem = not na(locEQ) and close >= locEQ
-    int sideDir = disc and dnI >= 0 ? 1 : prem and upI >= 0 ? -1 : 0
-    float entry = na
-    float stop  = na
-    float tgt   = na
-    int bounces = 0
-    if sideDir == 1
-        Ll = array.get(book, dnI)
-        entry := Ll.anchor
-        bounces := f_count(Ll, 2)
-        stop := entry - atrE * tcStopBuf
-        tgt := upI >= 0 ? array.get(book, upI).anchor : locEQ
-    else if sideDir == -1
-        Ls = array.get(book, upI)
-        entry := Ls.anchor
-        bounces := f_count(Ls, 2)
-        stop := entry + atrE * tcStopBuf
-        tgt := dnI >= 0 ? array.get(book, dnI).anchor : locEQ
-    float risk   = na(entry) or na(stop) ? na : math.abs(entry - stop)
-    float reward = na(entry) or na(tgt) ? na : math.abs(tgt - entry)
-    float rr     = na(risk) or risk == 0 or na(reward) ? na : reward / risk
-    proven = bounces >= 2                                       // founding + ≥1 real bounce (the validated cliff)
-    dirOppose = (sideDir == 1 and dirVerdict == -1) or (sideDir == -1 and dirVerdict == 1)
-    okProven = not tcNeedProven or proven
-    okRR = not na(rr) and rr >= tcMinRR
-    int vc = sideDir == 0 ? 0 : dirOppose ? 1 : not okProven ? 1 : not okRR ? 2 : 3   // 0 none·1 nogo·2 wait·3 go
-    verdict = vc == 0 ? "NO SETUP" : vc == 3 ? "GO" : vc == 2 ? "WAIT · R:R low" : dirOppose ? "NO-GO ⚠ conflict" : "NO-GO · untested"
-    vCol = vc == 3 ? (sideDir == 1 ? #26a69a : #ef5350) : vc == 2 ? color.new(#ff9800, 10) : color.new(color.gray, 20)
-    riskAmt = tcAcct * tcRiskPct / 100.0
-    float units = na(risk) or risk == 0 ? na : riskAmt / risk
-    sideTxt = sideDir == 1 ? "LONG (buy support)" : sideDir == -1 ? "SHORT (sell resist.)" : "—"
-    // entry/stop/target lines
-    if not na(tcELn)
-        line.delete(tcELn)
-    if not na(tcSLn)
-        line.delete(tcSLn)
-    if not na(tcTLn)
-        line.delete(tcTLn)
-    if tcDraw and sideDir != 0 and not na(entry)
-        xa = bar_index - 20
-        xb = bar_index + 40
-        tcELn := line.new(xa, entry, xb, entry, xloc=xloc.bar_index, color=color.new(color.white, 10), width=2)
-        tcSLn := line.new(xa, stop,  xb, stop,  xloc=xloc.bar_index, color=color.new(#ef5350, 0), width=1, style=line.style_dashed)
-        tcTLn := line.new(xa, tgt,   xb, tgt,   xloc=xloc.bar_index, color=color.new(#26a69a, 0), width=1, style=line.style_dashed)
-    hdrc = color.new(color.black, 10)
-    rowc = color.new(color.black, 40)
-    string tcTip = "Discipline, not prediction. GO needs: PROVEN level + right side of value + R:R ≥ " + str.tostring(tcMinRR, "#.0") + ". Size = " + str.tostring(tcRiskPct, "#.0") + "% of $" + str.tostring(tcAcct, "#") + " ÷ stop distance."
-    table.cell(tcT, 0, 0, "TRADE CARD", text_color=color.white, bgcolor=hdrc, text_size=size.small, tooltip=tcTip)
-    table.cell(tcT, 1, 0, sideTxt, text_color=color.white, bgcolor=sideDir == 1 ? #26a69a : sideDir == -1 ? #ef5350 : color.new(color.gray, 20), text_size=size.small, tooltip=tcTip)
-    table.cell(tcT, 0, 1, "VERDICT", text_color=color.white, bgcolor=rowc, text_size=size.small)
-    table.cell(tcT, 1, 1, verdict, text_color=color.white, bgcolor=vCol, text_size=size.small)
-    table.cell(tcT, 0, 2, "LEVEL", text_color=color.white, bgcolor=rowc, text_size=size.small)
-    table.cell(tcT, 1, 2, na(entry) ? "—" : str.tostring(entry, format.mintick) + (proven ? "  ✓ proven " + str.tostring(bounces - 1) + "×" : "  · UNTESTED"), text_color=color.white, bgcolor=rowc, text_size=size.small)
-    table.cell(tcT, 0, 3, "ENTRY", text_color=color.white, bgcolor=rowc, text_size=size.small)
-    table.cell(tcT, 1, 3, na(entry) ? "—" : str.tostring(entry, format.mintick), text_color=color.white, bgcolor=rowc, text_size=size.small)
-    table.cell(tcT, 0, 4, "STOP", text_color=color.white, bgcolor=rowc, text_size=size.small)
-    table.cell(tcT, 1, 4, na(stop) ? "—" : str.tostring(stop, format.mintick), text_color=#ef5350, bgcolor=rowc, text_size=size.small)
-    table.cell(tcT, 0, 5, "TARGET", text_color=color.white, bgcolor=rowc, text_size=size.small)
-    table.cell(tcT, 1, 5, na(tgt) ? "—" : str.tostring(tgt, format.mintick), text_color=#26a69a, bgcolor=rowc, text_size=size.small)
-    table.cell(tcT, 0, 6, "R : R", text_color=color.white, bgcolor=rowc, text_size=size.small)
-    table.cell(tcT, 1, 6, na(rr) ? "—" : str.tostring(rr, "#.00") + " : 1", text_color=color.white, bgcolor=rowc, text_size=size.small)
-    table.cell(tcT, 0, 7, "SIZE", text_color=color.white, bgcolor=rowc, text_size=size.small, tooltip=tcTip)
-    table.cell(tcT, 1, 7, na(units) ? "—" : str.tostring(units, "#.####") + "  ($" + str.tostring(riskAmt, "#") + " risk)", text_color=color.white, bgcolor=rowc, text_size=size.small, tooltip=tcTip)
 
 // ── RENDER ───────────────────────────────────────────────────────────────────
 var array<line>  dLine = array.new<line>()
@@ -1151,7 +776,7 @@ if barstate.islast
         pd  = close >= claudeMid ? "PREMIUM (above fair value)" : "DISCOUNT (below fair value)"
         beh = not gateCZ ? "" : (sysState == 1 or sysState == 2) ? "\nregime: TREND → continuation" : "\nregime: RANGE → mean-revert"
         meta = showAuMeta ? "\nauction: " + f_locStateTxt(locState) + " · v" + str.tostring(auctionVer) + " · age " + str.tostring(auctionAge) : ""
-        agreeTxt = ctxConflict ? "Structure×Context: CONFLICT (trap)" : dirVerdict == 0 ? "Structure×Context: no agreement" : "Structure×Context: agree"
+        agreeTxt = dirVerdict == 0 ? "HTF structure: RANGE (no clean bias)" : "HTF structure: " + dirTxt
         claudeTip = "CLAUDE LINE = fair value (auction equilibrium)\nlocation: " + pd + beh + meta + "\n" + agreeTxt + "\n→ " + dirWord + " · " + attnTxt
         array.push(dLine, line.new(x1, claudeMid, x2, claudeMid, color=claudeCol, width=claudeW, extend=f_ext(extMode), style=f_lstyle(claudeSty)))
         array.push(dLab, label.new(x2, claudeMid, claudeLbl, xloc=xloc.bar_index, style=label.style_label_left, color=color.new(claudeCol, 0), textcolor=color.black, size=f_sz(lblSize), tooltip=claudeTip))
