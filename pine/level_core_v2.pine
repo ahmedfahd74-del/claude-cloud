@@ -113,7 +113,12 @@ gateCZ     = input.bool(true, "Bias by MARKET STATE (range = mean-revert · tren
 
 gLE = "Dealing Range (latched auction)"
 zoneMinConf  = input.float(35.0, "Min CONF to act as a boundary / leading level", minval=0.0, maxval=100.0, step=5.0, group=gLE, tooltip="The Zone, Claude Line and Leading levels are built from the SCORED book — only levels whose confidence clears this qualify. Raise it for fewer, stronger lines.")
-breakBufPct  = input.float(0.05, "Break buffer beyond boundary (% of price)", minval=0.0, maxval=2.0, step=0.01, group=gLE, tooltip="The range re-anchors only when a bar CLOSES beyond a boundary by more than this. A touch, a wick, or a marginal poke never moves it — that is what stopped the lines jumping.")
+wallProven   = input.string("Proven only", "Wall requirement", options=["Proven only", "Prefer proven", "Strongest only"], group=gLE, tooltip="AUTHORITY of the floor/ceiling. Proven only = a wall must have HELD ≥2× (the one factor that beat the null); if none is in reach the strongest is used and tagged UNPROVEN. Prefer proven = proven wins, but a much stronger fresh level can still qualify. Strongest only = pure CONF, no proven gate.")
+wallDegPref  = input.bool(true, "Prefer higher-degree (4H+) walls", group=gLE, tooltip="Floor/ceiling skip 1H levels and lean on 4H/1D/1W structure — more authority. Falls back to any degree if none qualifies. The 1H levels still appear as Leading lines inside the range.")
+breakBufATR  = input.float(0.25, "Break buffer beyond wall (× ATR)", minval=0.0, maxval=5.0, step=0.05, group=gLE, tooltip="A close must clear the wall by this many ATRs to count toward a break. ATR-scaled so it fits the instrument's real volatility instead of a fixed %.")
+breakAccept  = input.int(2, "Acceptance: closes beyond wall to confirm a break", minval=1, maxval=10, group=gLE, tooltip="How many CONSECUTIVE closes beyond the buffer confirm a real break. 1 = a single decisive close. 2+ = the market must ACCEPT on the other side. This is what stops one noisy 5m candle re-anchoring the whole range.")
+sweepBufATR  = input.float(0.5, "Invalidation buffer beyond wall (× ATR)", minval=0.0, maxval=5.0, step=0.1, group=gLE, tooltip="The stop / invalidation sits this far beyond the wall's band — past the sweep zone, so a liquidity grab that wicks the level does not take you out.")
+showInval    = input.bool(true, "Draw invalidation (stop) line beyond each wall", group=gLE)
 approachPct  = input.float(10.0, "Approaching threshold (% of range width)", minval=1.0, maxval=45.0, step=1.0, group=gLE)
 showAuMeta   = input.bool(true, "Show range state/version/age on the Claude Line", group=gLE)
 
@@ -487,63 +492,102 @@ dirTxt     = dirVerdict == 1 ? "BULL" : dirVerdict == -1 ? "BEAR" : "RANGE"
 plot(dirVerdict, "true.direction", display=display.data_window)
 alertcondition(ta.change(dirVerdict) != 0, "True direction change", "IMIS: true market direction (HTF structure) changed")
 
-// ══ DEALING RANGE — LATCHED auction boundaries, sourced from the SCORED book ══════
-// Two fixes to the old Location Engine, which took raw single-TF pivots and re-picked
-// "nearest swing above/below the LIVE close" every bar:
-//   1. SOURCE  — boundaries are now the nearest level from the scored, multi-degree
-//      book (System A) whose CONF clears zoneMinConf. What you see IS the engine.
-//   2. LATCH   — the range is held in state. It re-anchors ONLY when a bar CLOSES
-//      beyond a boundary by more than breakBufPct. A touch, a wick, or price simply
-//      crossing a level never moves it. On a real break the broken boundary FLIPS
-//      role (a broken ceiling becomes the new floor) — break-and-retest behaviour.
-// This is what stops the Zone / Claude Line / Leading levels jumping and vanishing.
+// ══ DEALING RANGE — LATCHED, PROVEN-GATED auction boundaries from the SCORED book ══
+//   1. SOURCE    — walls are the nearest scored, multi-degree level that passes the
+//      WALL TEST: CONF ≥ zoneMinConf, degree ≥ 4H (wallDegPref), and PROVEN (held ≥2×,
+//      per wallProven). Proven-holds is the one factor that beat the null, so a wall
+//      must have earned it; if none is in reach the strongest is used and tagged
+//      UNPROVEN rather than faking authority.
+//   2. LATCH     — the range persists in state and re-anchors ONLY on an ACCEPTED
+//      break: breakAccept consecutive closes beyond the wall by breakBufATR×ATR. A
+//      touch, a wick, or one noisy poke never moves it. On a break the broken wall
+//      FLIPS role (broken ceiling → new floor) — break-and-retest.
+//   3. INVALIDATION — a stop line sits beyond the wall's band + sweepBufATR×ATR, past
+//      the liquidity-grab zone, so a wick of the level does not take the stop.
+// This is what stops the Zone / Claude Line / Leading levels jumping, and gives the
+// floor/ceiling real authority instead of drawing weak lines price slices through.
 
-// nearest QUALIFYING level above / below a reference price (scored + degree-filtered)
-f_strongAbove(float px) =>
-    float r = na
-    if array.size(book) > 0
-        for i = 0 to array.size(book) - 1
-            L = array.get(book, i)
-            degOn = L.deg == 0 ? a1H : L.deg == 1 ? a4H : L.deg == 2 ? a1D : a1W
-            if degOn and L.anchor > px and (na(r) or L.anchor < r) and f_conf(L) >= zoneMinConf
-                r := L.anchor
-    r
-f_strongBelow(float px) =>
-    float r = na
-    if array.size(book) > 0
-        for i = 0 to array.size(book) - 1
-            L = array.get(book, i)
-            degOn = L.deg == 0 ? a1H : L.deg == 1 ? a4H : L.deg == 2 ? a1D : a1W
-            if degOn and L.anchor < px and (na(r) or L.anchor > r) and f_conf(L) >= zoneMinConf
-                r := L.anchor
-    r
+drAtr = ta.atr(14)   // chart-TF ATR — scales the break + invalidation buffers
 
-// latched state — these are the boundaries; they persist until a confirmed break
-var float locUBv = na
-var float locLBv = na
-var int   locBrk = 0        // this bar: 0 none · 1 broke up · -1 broke down
+// WALL TEST — does this scored level deserve to be a floor/ceiling?
+// strict = apply the proven gate + degree preference; relaxed = CONF only (fallback).
+f_wallOK(Lvl L, bool strict) =>
+    c = f_conf(L)
+    held = f_count(L, 2)
+    degOK = not wallDegPref or L.deg >= 1
+    pOK = wallProven == "Strongest only" ? true : wallProven == "Prefer proven" ? (held >= 2 or c >= zoneMinConf + 15.0) : held >= 2
+    c >= zoneMinConf and (not strict or (degOK and pOK))
+
+// nearest level in a direction that passes the wall test. Two passes: strict first
+// (proven + degree), then relaxed if nothing qualifies. Returns [price, isProven].
+f_pickWall(float px, int dir) =>
+    float best = na
+    bool  bestPr = false
+    for pass = 0 to 1                                   // 0 = strict, 1 = relaxed fallback
+        if na(best) and array.size(book) > 0
+            for i = 0 to array.size(book) - 1
+                L = array.get(book, i)
+                degOn = L.deg == 0 ? a1H : L.deg == 1 ? a4H : L.deg == 2 ? a1D : a1W
+                side = dir == 1 ? L.anchor > px : L.anchor < px
+                nearer = na(best) or (dir == 1 ? L.anchor < best : L.anchor > best)
+                if degOn and side and nearer and f_wallOK(L, pass == 0)
+                    best := L.anchor
+                    bestPr := f_count(L, 2) >= 2
+    [best, bestPr]
+
+// latched state — the boundaries persist until an ACCEPTED break
+var float locUBv   = na
+var float locLBv   = na
+var bool  ubProven = false
+var bool  lbProven = false
+var int   locBrk   = 0      // this bar: 0 none · 1 broke up · -1 broke down
+var int   upCloses = 0      // consecutive closes beyond the ceiling buffer
+var int   dnCloses = 0      // consecutive closes beyond the floor buffer
 locBrk := 0
 if barstate.isconfirmed
-    buf = close * breakBufPct / 100.0
+    buf = nz(drAtr) * breakBufATR
     if na(locUBv) or na(locLBv)
         // bootstrap (or re-acquire after an expansion left a side empty)
         if na(locUBv)
-            locUBv := f_strongAbove(close)
+            [p, pr] = f_pickWall(close, 1)
+            locUBv := p
+            ubProven := pr
         if na(locLBv)
-            locLBv := f_strongBelow(close)
-    else if close > locUBv + buf
-        locBrk := 1
-        locLBv := locUBv                     // broken ceiling becomes the new floor
-        locUBv := f_strongAbove(close)       // next qualifying level up (na = expansion)
-    else if close < locLBv - buf
-        locBrk := -1
-        locUBv := locLBv                     // broken floor becomes the new ceiling
-        locLBv := f_strongBelow(close)
-    // NO else branch: inside the range — touching, wicking, hovering — nothing moves.
+            [p, pr] = f_pickWall(close, -1)
+            locLBv := p
+            lbProven := pr
+        upCloses := 0
+        dnCloses := 0
+    else
+        // ACCEPTANCE — count consecutive closes beyond the buffer; a single poke resets it
+        upCloses := close > locUBv + buf ? upCloses + 1 : 0
+        dnCloses := close < locLBv - buf ? dnCloses + 1 : 0
+        if upCloses >= breakAccept
+            locBrk := 1
+            locLBv := locUBv                 // broken ceiling becomes the new floor…
+            lbProven := ubProven             // …and keeps its proven status
+            [p, pr] = f_pickWall(close, 1)
+            locUBv := p
+            ubProven := pr
+            upCloses := 0
+            dnCloses := 0
+        else if dnCloses >= breakAccept
+            locBrk := -1
+            locUBv := locLBv
+            ubProven := lbProven
+            [p, pr] = f_pickWall(close, -1)
+            locLBv := p
+            lbProven := pr
+            upCloses := 0
+            dnCloses := 0
+    // NO other branch: inside the range — touching, wicking, one poke — nothing moves.
 
 locUB = locUBv
 locLB = locLBv
 locEQ = na(locUB) or na(locLB) ? na : (locUB + locLB) / 2.0
+// sweep-aware invalidation: beyond the wall's band + an ATR buffer → past the stop-hunt zone
+invUB = na(locUB) ? na : locUB + locUB * bandPct / 100.0 + nz(drAtr) * sweepBufATR
+invLB = na(locLB) ? na : locLB - locLB * bandPct / 100.0 - nz(drAtr) * sweepBufATR
 locPremium = not na(locEQ) and close >= locEQ
 locRangeW  = na(locUB) or na(locLB) ? na : locUB - locLB
 // zone state: 0 INSIDE · 1 APPROACH_CEIL · 2 APPROACH_FLOOR · 3 EXPANSION_UP · 4 EXPANSION_DOWN · 5 UNDEFINED
@@ -583,11 +627,15 @@ favShort = dirVerdict == -1 and (locPremium or locState == 1)
 attnTxt  = dirVerdict == 0 ? "STAY AWAY" : (favLong or favShort) ? "GET READY" : "WAIT"
 
 // ── publish to the data window (machine-readable for other IMIS consumers) ──
-plot(locUB,      "loc.UB",                 display=display.data_window)
-plot(locLB,      "loc.LB",                 display=display.data_window)
+plot(locUB,      "loc.UB (ceiling)",       display=display.data_window)
+plot(locLB,      "loc.LB (floor)",         display=display.data_window)
 plot(locEQ,      "loc.EQ (Claude Line)",   display=display.data_window)
-plot(auctionVer, "loc.auctionVersion",     display=display.data_window)
-plot(auctionAge, "loc.auctionAge",         display=display.data_window)
+plot(invUB,      "loc.invalidUB (stop)",   display=display.data_window)
+plot(invLB,      "loc.invalidLB (stop)",   display=display.data_window)
+plot(ubProven ? 1 : 0, "loc.ceilingProven", display=display.data_window)
+plot(lbProven ? 1 : 0, "loc.floorProven",   display=display.data_window)
+plot(auctionVer, "loc.rangeVersion",       display=display.data_window)
+plot(auctionAge, "loc.rangeAge",           display=display.data_window)
 plot(locState,   "loc.zoneState",          display=display.data_window)
 alertcondition(auctionTrans != 0, "Auction transition", "IMIS Location Engine: active auction changed (new version)")
 
@@ -773,12 +821,18 @@ if barstate.islast
     leadOn = viewMode == "Leading (ranked)"
     if zoneOn and not na(aFloor)
         array.push(dLine, line.new(x1, aFloor, x2, aFloor, color=czFloorCol, width=czFloorW, extend=f_ext(extMode), style=f_lstyle(czFloorSty)))
+        if showInval and not na(invLB)
+            array.push(dLine, line.new(x1, invLB, x2, invLB, color=color.new(czFloorCol, 55), width=1, extend=f_ext(extMode), style=line.style_dotted))
         if showZoneLbl
-            array.push(dLab, label.new(x2, aFloor, "◄ FLOOR " + str.tostring(aFloor, format.mintick) + " · range v" + str.tostring(auctionVer), xloc=xloc.bar_index, style=label.style_label_left, color=color.new(czFloorCol, 0), textcolor=color.white, size=f_sz(lblSize)))
+            fTag = lbProven ? " ✓proven" : " ⚠UNPROVEN"
+            array.push(dLab, label.new(x2, aFloor, "◄ FLOOR " + str.tostring(aFloor, format.mintick) + fTag + " · v" + str.tostring(auctionVer), xloc=xloc.bar_index, style=label.style_label_left, color=color.new(czFloorCol, 0), textcolor=color.white, size=f_sz(lblSize)))
     if zoneOn and not na(aCeil)
         array.push(dLine, line.new(x1, aCeil, x2, aCeil, color=czCeilCol, width=czCeilW, extend=f_ext(extMode), style=f_lstyle(czCeilSty)))
+        if showInval and not na(invUB)
+            array.push(dLine, line.new(x1, invUB, x2, invUB, color=color.new(czCeilCol, 55), width=1, extend=f_ext(extMode), style=line.style_dotted))
         if showZoneLbl
-            array.push(dLab, label.new(x2, aCeil, "◄ CEILING " + str.tostring(aCeil, format.mintick) + " · range v" + str.tostring(auctionVer), xloc=xloc.bar_index, style=label.style_label_left, color=color.new(czCeilCol, 0), textcolor=color.white, size=f_sz(lblSize)))
+            cTag = ubProven ? " ✓proven" : " ⚠UNPROVEN"
+            array.push(dLab, label.new(x2, aCeil, "◄ CEILING " + str.tostring(aCeil, format.mintick) + cTag + " · v" + str.tostring(auctionVer), xloc=xloc.bar_index, style=label.style_label_left, color=color.new(czCeilCol, 0), textcolor=color.white, size=f_sz(lblSize)))
     // ── LEADING (ranked) — the N STRONGEST scored levels each side, by CONF ──────────
     // Was: nearest N raw single-TF pivots to the live close (unscored, re-sorted every
     // tick, so a level vanished the moment price touched it). Now: drawn from the same

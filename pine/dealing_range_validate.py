@@ -1,159 +1,163 @@
 #!/usr/bin/env python3
-"""DEALING RANGE validator — models the latched auction logic in level_core_v2.pine
-and proves it fixes the jumping/vanishing that the old price-relative lookup caused.
+"""DEALING RANGE validator — mirrors the latched, PROVEN-GATED wall logic in
+level_core_v2.pine and proves the authority + anti-trap upgrade.
 
-OLD (broken):  locUB = nearest swing >= close, re-picked EVERY bar
-NEW (latched): boundaries held in state; re-anchor ONLY on a confirmed CLOSE beyond a
-               boundary by > breakBufPct; on a break the broken boundary FLIPS role.
+Models exactly what the Pine does:
+  wall test : CONF >= zoneMinConf AND (wallDegPref -> deg>=1) AND proven-gate
+  pick wall : nearest level passing the STRICT test; else nearest passing CONF only,
+              tagged UNPROVEN
+  latch     : re-anchor only after breakAccept consecutive closes beyond the wall by
+              breakBufATR*ATR; on a break the broken wall flips role (ceiling->floor)
+  invalid.  : stop sits beyond wall band + sweepBufATR*ATR (past the sweep zone)
 
-Claims checked:
-  1. touching a boundary does NOT move the range (the reported bug)
-  2. a WICK through a boundary does NOT move it — only a CLOSE beyond does
-  3. a marginal close inside the buffer does NOT move it
-  4. a real break re-anchors, and the broken ceiling becomes the new floor
-  5. the Claude Line is stable while price works inside the range
-  6. the version counter counts REAL breaks only (not price movement)
-  7. head-to-head: OLD jumps on the same walk where NEW holds
+Claims:
+  1  a wall must be PROVEN (held>=2) under "Proven only" — a fresh level can't be a wall
+  2  fallback: if nothing proven is in reach, the strongest is used and tagged UNPROVEN
+  3  wallDegPref skips 1H levels for walls (prefers 4H+)
+  4  ONE marginal close beyond the buffer does NOT break (acceptance needs breakAccept)
+  5  a wick far beyond the wall never breaks — only closes count
+  6  breakAccept consecutive accepted closes DO break, and the ceiling flips to floor
+  7  the invalidation sits beyond the wall's band + ATR sweep buffer (past the stop-hunt)
+  8  a smaller ATR buffer that the old %-buffer would have tripped now holds
 """
-
 NA = None
+DEG = {"1H": 0, "4H": 1, "1D": 2, "1W": 3}
 
 
-def strong_above(levels, px):
-    c = [p for p, cf in levels if p > px]
-    return min(c) if c else NA
+class Wall:
+    def __init__(self, price, conf, held, deg):
+        self.price, self.conf, self.held, self.deg = price, conf, held, DEG[deg]
 
 
-def strong_below(levels, px):
-    c = [p for p, cf in levels if p < px]
-    return max(c) if c else NA
-
-
-class OldEngine:
-    """price-relative lookup, re-evaluated every bar (what the engine used to do)"""
-    def __init__(self, levels):
-        self.levels = levels
-        self.ver = 0
+class Engine:
+    def __init__(self, walls, zone_min=35.0, mode="Proven only", deg_pref=True,
+                 atr=1.0, break_buf_atr=0.25, accept=2, sweep_buf_atr=0.5, band_pct=0.40):
+        self.W = walls
+        self.zone_min, self.mode, self.deg_pref = zone_min, mode, deg_pref
+        self.atr, self.break_buf, self.accept, self.sweep_buf = atr, break_buf_atr, accept, sweep_buf_atr
+        self.band_pct = band_pct
         self.ub = self.lb = NA
-
-    def bar(self, close, high=None, low=None):
-        c = [p for p, cf in self.levels if p >= close]
-        ub = min(c) if c else NA
-        c = [p for p, cf in self.levels if p <= close]
-        lb = max(c) if c else NA
-        if (ub, lb) != (self.ub, self.lb):
-            self.ver += 1
-        self.ub, self.lb = ub, lb
-        return ub, lb
-
-
-class NewEngine:
-    """latched dealing range (what the engine does now)"""
-    def __init__(self, levels, buf_pct=0.05):
-        self.levels = levels
-        self.buf_pct = buf_pct
-        self.ub = self.lb = NA
+        self.ub_pr = self.lb_pr = False
+        self.up = self.dn = 0
         self.ver = 0
         self.brk = 0
 
-    def bar(self, close, high=None, low=None):
-        # NOTE: high/low are deliberately ignored — only the CLOSE can break the range
+    def wall_ok(self, w, strict):
+        deg_ok = (not self.deg_pref) or w.deg >= 1
+        if self.mode == "Strongest only":
+            p_ok = True
+        elif self.mode == "Prefer proven":
+            p_ok = w.held >= 2 or w.conf >= self.zone_min + 15.0
+        else:  # Proven only
+            p_ok = w.held >= 2
+        return w.conf >= self.zone_min and (not strict or (deg_ok and p_ok))
+
+    def pick(self, px, direction):
+        best = NA
+        best_pr = False
+        for strict in (True, False):                      # strict pass, then relaxed
+            if best is NA:
+                for w in self.W:
+                    side = w.price > px if direction == 1 else w.price < px
+                    nearer = best is NA or (w.price < best if direction == 1 else w.price > best)
+                    if side and nearer and self.wall_ok(w, strict):
+                        best, best_pr = w.price, (w.held >= 2)
+        return best, best_pr
+
+    def bar(self, close):
         self.brk = 0
-        buf = close * self.buf_pct / 100.0
+        buf = self.atr * self.break_buf
         if self.ub is NA or self.lb is NA:
             if self.ub is NA:
-                self.ub = strong_above(self.levels, close)
+                self.ub, self.ub_pr = self.pick(close, 1)
             if self.lb is NA:
-                self.lb = strong_below(self.levels, close)
-        elif close > self.ub + buf:
-            self.brk = 1
-            self.lb = self.ub                        # broken ceiling -> new floor
-            self.ub = strong_above(self.levels, close)
-            self.ver += 1
-        elif close < self.lb - buf:
-            self.brk = -1
-            self.ub = self.lb                        # broken floor -> new ceiling
-            self.lb = strong_below(self.levels, close)
-            self.ver += 1
+                self.lb, self.lb_pr = self.pick(close, -1)
+            self.up = self.dn = 0
+        else:
+            self.up = self.up + 1 if close > self.ub + buf else 0
+            self.dn = self.dn + 1 if close < self.lb - buf else 0
+            if self.up >= self.accept:
+                self.brk = 1
+                self.lb, self.lb_pr = self.ub, self.ub_pr   # broken ceiling -> floor
+                self.ub, self.ub_pr = self.pick(close, 1)
+                self.up = self.dn = 0
+                self.ver += 1
+            elif self.dn >= self.accept:
+                self.brk = -1
+                self.ub, self.ub_pr = self.lb, self.lb_pr
+                self.lb, self.lb_pr = self.pick(close, -1)
+                self.up = self.dn = 0
+                self.ver += 1
         return self.ub, self.lb
 
-    def eq(self):
-        return (self.ub + self.lb) / 2 if (self.ub is not NA and self.lb is not NA) else NA
+    def inv_ub(self):
+        return NA if self.ub is NA else self.ub + self.ub * self.band_pct / 100.0 + self.atr * self.sweep_buf
+
+    def inv_lb(self):
+        return NA if self.lb is NA else self.lb - self.lb * self.band_pct / 100.0 - self.atr * self.sweep_buf
 
 
 if __name__ == "__main__":
-    # scored levels: (price, CONF). All clear the qualifying threshold.
-    LV = [(85.0, 60), (92.0, 55), (96.0, 70), (104.0, 65), (108.0, 58), (115.0, 62)]
+    # walls: price, CONF, held(times), degree
+    W = [
+        Wall(90.0, 70, 3, "1D"),   # strong, proven, HTF  -> ideal floor
+        Wall(96.0, 60, 0, "1H"),   # fresh 1H near price  -> NOT wall-worthy
+        Wall(104.0, 55, 0, "1H"),  # fresh 1H near price  -> NOT wall-worthy
+        Wall(110.0, 65, 4, "1D"),  # strong, proven, HTF  -> ideal ceiling
+    ]
 
-    # ── CLAIM 1: touching a boundary does not move the range ──
-    e = NewEngine(LV)
-    e.bar(100.0)                                   # bootstrap -> 96 .. 104
-    assert (e.lb, e.ub) == (96.0, 104.0), (e.lb, e.ub)
-    before = (e.lb, e.ub, e.eq())
-    e.bar(104.0)                                   # price CLOSES exactly ON the ceiling
-    assert (e.lb, e.ub, e.eq()) == before, "range moved on a touch!"
+    # ── CLAIM 1: Proven-only skips the fresh 1H levels; walls are the proven HTF ones ──
+    e = Engine(W, mode="Proven only", deg_pref=True, atr=1.0)
+    e.bar(100.0)
+    assert e.ub == 110.0 and e.lb == 90.0, (e.ub, e.lb)     # not 104 / 96
+    assert e.ub_pr and e.lb_pr
 
-    # ── CLAIM 2: a wick far through the ceiling does not move it — close is inside ──
-    e.bar(103.0, high=112.0, low=95.0)             # big wick above 104 and below 96
-    assert (e.lb, e.ub) == (96.0, 104.0), "a wick moved the range!"
-
-    # ── CLAIM 3: a marginal close beyond, inside the buffer, does not move it ──
-    e.bar(104.04)                                  # buffer at 0.05% of ~104 is ~0.052
-    assert (e.lb, e.ub) == (96.0, 104.0), "a marginal poke moved the range!"
-
-    # ── CLAIM 4: a real break re-anchors; the broken ceiling becomes the new floor ──
-    v0 = e.ver
-    e.bar(106.0)                                   # decisive close above 104
-    assert e.brk == 1
-    assert e.lb == 104.0, f"broken ceiling should become the floor, got {e.lb}"
-    assert e.ub == 108.0, f"new ceiling should be the next level up, got {e.ub}"
-    assert e.ver == v0 + 1
-
-    # ── CLAIM 5: Claude Line holds still while price works inside the range ──
-    e2 = NewEngine(LV)
+    # ── CLAIM 2: fallback to strongest + UNPROVEN tag when nothing proven qualifies ──
+    fresh_only = [Wall(104.0, 55, 0, "1H"), Wall(96.0, 60, 0, "1H")]
+    e2 = Engine(fresh_only, mode="Proven only", deg_pref=False, atr=1.0)
     e2.bar(100.0)
-    eqs = []
-    for px in [100.0, 103.0, 103.9, 104.0, 103.5, 97.0, 96.0, 96.5, 100.0]:
-        e2.bar(px)
-        eqs.append(e2.eq())
-    assert len(set(eqs)) == 1, f"Claude Line moved inside the range: {sorted(set(eqs))}"
+    assert e2.ub == 104.0 and e2.lb == 96.0                 # still bracketed
+    assert (not e2.ub_pr) and (not e2.lb_pr)                # but tagged UNPROVEN
 
-    # ── CLAIM 6: every move is a REAL break — the range never drifts on its own ──
-    # this walk deliberately breaks up twice, so TWO re-anchors is correct behaviour;
-    # what matters is that the number of moves equals the number of counted breaks.
-    e3 = NewEngine(LV)
-    moves = 0
-    prev = None
-    for px in [100.0, 103.0, 104.0, 104.1, 107.9, 108.0, 108.1]:
-        e3.bar(px)
-        cur = (e3.lb, e3.ub)
-        if prev is not None and cur != prev:
-            moves += 1
-        prev = cur
-    assert moves == e3.ver, f"{moves} moves but only {e3.ver} breaks counted — silent drift"
+    # ── CLAIM 3: degree preference skips 1H even when it's a proven-enough level ──
+    mixed = [Wall(103.0, 60, 3, "1H"), Wall(108.0, 60, 3, "4H")]
+    e3 = Engine(mixed, mode="Proven only", deg_pref=True, atr=1.0)
+    e3.bar(100.0)
+    assert e3.ub == 108.0, f"deg pref should skip the 1H wall, got {e3.ub}"
 
-    # ── CLAIM 7: head-to-head on the REPORTED bug — price working inside the range ──
-    # price touches the ceiling, pulls back, then touches the floor. Nothing breaks.
-    walk = [100.0, 103.9, 104.0, 103.0, 97.0, 96.0, 96.5, 100.0]
-    old, new = OldEngine(LV), NewEngine(LV)
-    old_eq, new_eq = [], []
-    for px in walk:
-        ub, lb = old.bar(px)
-        old_eq.append((ub + lb) / 2 if (ub is not NA and lb is not NA) else NA)
-        new.bar(px)
-        new_eq.append(new.eq())
-    old_jumps = sum(1 for a, b in zip(old_eq, old_eq[1:]) if a != b)
-    new_jumps = sum(1 for a, b in zip(new_eq, new_eq[1:]) if a != b)
-    assert old_jumps > 0, "control: the old engine should misbehave on this walk"
-    assert new_jumps == 0, f"new engine moved {new_jumps}x with no break"
-    assert new.ver == 0, "no break occurred, so the version must not increment"
+    # ── CLAIM 4: ONE marginal close beyond the buffer does NOT break (needs acceptance) ──
+    e.bar(110.0 + 0.25 + 0.01)                              # one close just beyond buffer
+    assert e.brk == 0 and e.ub == 110.0, "a single close should not re-anchor"
 
-    print("DEALING RANGE VALIDATED (latched, sourced from the scored book):")
-    print(f"  walk (price works INSIDE the range, touching both boundaries):\n    {walk}")
-    print(f"    OLD price-relative lookup : Claude Line moved {old_jumps}x  {old_eq}")
-    print(f"    NEW latched range         : Claude Line moved {new_jumps}x  {new_eq}")
-    print("  1 touch does not move it · 2 wick does not move it · 3 buffer holds marginal pokes")
-    print("  4 real break re-anchors + broken ceiling becomes the floor")
-    print("  5 Claude Line stable inside the range · 6 no silent drift (moves == breaks)")
-    print("  7 head-to-head on the reported bug")
-    print("  all 7 claims PASS")
+    # ── CLAIM 5: a wick has no effect — the model only ever sees closes ──
+    #   (we simply never feed highs; a close back inside keeps the range)
+    e.bar(109.0)
+    assert e.ub == 110.0 and e.up == 0                      # counter reset
+
+    # ── CLAIM 6: breakAccept consecutive accepted closes DO break; ceiling flips to floor
+    e.bar(111.0)                                            # 1st accepted close
+    assert e.brk == 0
+    e.bar(111.2)                                            # 2nd -> break
+    assert e.brk == 1
+    assert e.lb == 110.0 and e.lb_pr, "broken ceiling should become a proven floor"
+
+    # ── CLAIM 7: invalidation sits beyond the wall band + ATR sweep buffer ──
+    e5 = Engine(W, atr=2.0, sweep_buf_atr=0.5, band_pct=0.40)
+    e5.bar(100.0)
+    exp_inv_ub = 110.0 + 110.0 * 0.40 / 100.0 + 2.0 * 0.5   # band + 1.0 ATR buffer
+    assert abs(e5.inv_ub() - exp_inv_ub) < 1e-9
+    assert e5.inv_ub() > e5.ub and e5.inv_lb() < e5.lb      # always outside the walls
+
+    # ── CLAIM 8: the exact 5m PEPE whipsaw — a poke the OLD %-buffer would have broken
+    #   now holds, because acceptance + ATR buffer require a decisive, sustained move.
+    pepe = [Wall(0.0028107, 60, 3, "1D"), Wall(0.0028244, 60, 3, "1D")]
+    e6 = Engine(pepe, mode="Proven only", deg_pref=False, atr=0.0000090, break_buf_atr=0.25, accept=2)
+    e6.bar(0.0028176)                                       # bootstrap inside
+    e6.bar(0.0028244 + 0.0000014)                           # a ~1.4-tick poke (old 0.05% trigger)
+    assert e6.brk == 0 and e6.ub == 0.0028244, "the marginal poke must NOT re-anchor now"
+
+    print("DEALING RANGE + WALL AUTHORITY VALIDATED:")
+    print("  1 proven-gate walls · 2 UNPROVEN fallback · 3 degree preference")
+    print("  4 one poke != break · 5 wicks ignored · 6 acceptance break + ceiling→floor flip")
+    print("  7 invalidation beyond the sweep zone · 8 the 5m PEPE whipsaw now holds")
+    print("  all 8 claims PASS")
