@@ -42,33 +42,51 @@ wSep   = input.float(0.12, "Weight: touch separation (anti-cluster)", minval=0.0
 wEvid  = input.float(0.12, "Weight: evidence (# recent interactions)", minval=0.0, maxval=1.0, step=0.02, group=gC)
 wProven = input.float(0.30, "Weight: PROVEN HOLDS (bounced before) ★ data-validated", minval=0.0, maxval=1.0, step=0.02, group=gC, tooltip="Backtest (BTC daily, surrogate-controlled, no lookahead): an UNTESTED level is respected only 27% vs ~40% for a random line — WORSE than chance, a trap. A level that has HELD even once jumps to ~43%, then climbs. So a fresh level starts weak and EARNS strength by bouncing. This is the one factor that beat the shuffle-null (+11pt), so it carries real weight.")
 
-gA = "Appearance"
-colByDeg  = input.bool(false, "Colour lines by degree (TF) instead of R/S", group=gA)
-resCol    = input.color(#ef5350, "Resistance", inline="rs", group=gA)
-supCol    = input.color(#26a69a, "Support", inline="rs", group=gA)
-lineWidth = input.int(1, "Line width", minval=1, maxval=6, group=gA)
-extMode   = input.string("Left", "Extend lines", options=["Left", "Right", "Both", "None"], group=gA)
-showActiveZone = input.bool(true, "Active zone ON  (OFF → plain line)", group=gA, tooltip="When a level is being touched it expands into a zone. OFF = always a plain regional line.")
-showLbl   = input.bool(true, "Show labels", group=gA)
-lblSize   = input.string("Small", "Label size", options=["Tiny", "Small", "Normal"], group=gA)
+gL = "Line Controls — every line on the chart"
+// One row per LINE TYPE: colour · w(idth) · style. Support/Resistance are the per-level
+// book lines ("All levels" view); the rest are the ranked / auction-zone lines.
+supCol = input.color(#26a69a, "Support     ", inline="sup", group=gL)
+supW   = input.int(1, "w", minval=1, maxval=8, inline="sup", group=gL)
+supSty = input.string("Solid", "", options=["Solid", "Dashed", "Dotted"], inline="sup", group=gL)
+resCol = input.color(#ef5350, "Resistance  ", inline="res", group=gL)
+resW   = input.int(1, "w", minval=1, maxval=8, inline="res", group=gL)
+resSty = input.string("Solid", "", options=["Solid", "Dashed", "Dotted"], inline="res", group=gL)
+claudeCol = input.color(#ffd24a, "Claude Line ", inline="cl", group=gL)
+claudeW   = input.int(2, "w", minval=1, maxval=8, inline="cl", group=gL)
+claudeSty = input.string("Dashed", "", options=["Solid", "Dashed", "Dotted"], inline="cl", group=gL)
+czCeilCol  = input.color(#ef5350, "Zone ceiling", inline="ce", group=gL)
+czCeilW    = input.int(3, "w", minval=1, maxval=8, inline="ce", group=gL)
+czCeilSty  = input.string("Solid", "", options=["Solid", "Dashed", "Dotted"], inline="ce", group=gL)
+czFloorCol = input.color(#26a69a, "Zone floor  ", inline="fl", group=gL)
+czFloorW   = input.int(3, "w", minval=1, maxval=8, inline="fl", group=gL)
+czFloorSty = input.string("Solid", "", options=["Solid", "Dashed", "Dotted"], inline="fl", group=gL)
+leadSupCol = input.color(#26a69a, "Leading sup ", inline="ls", group=gL)
+leadResCol = input.color(#ef5350, " res", inline="ls", group=gL)
+leadW      = input.int(1, "w", minval=1, maxval=8, inline="lw", group=gL)
+leadSty    = input.string("Solid", "", options=["Solid", "Dashed", "Dotted"], inline="lw", group=gL)
+leadFade   = input.bool(true, "fade far ones", inline="lw", group=gL)
+emphWidth  = input.int(3, "LIVE / ★ emphasis width (overrides w on live + starred)", minval=1, maxval=8, group=gL)
+showActiveZone = input.bool(true, "Active zone", inline="az", group=gL, tooltip="A level expands into a zone while price is touching it. OFF = always a plain line.")
+zoneCol    = input.color(#ffd24a, "", inline="az", group=gL)
+zoneOp     = input.int(85, "transp", minval=0, maxval=100, inline="az", group=gL)
+zoneBord   = input.int(1, "border", minval=0, maxval=4, inline="az", group=gL)
+extMode    = input.string("Left", "Extend", options=["Left", "Right", "Both", "None"], inline="ex", group=gL)
+extR       = input.int(30, "right bars", minval=0, maxval=200, inline="ex", group=gL)
+colByDeg   = input.bool(false, "Colour by DEGREE (TF) instead of support/resistance", group=gL)
+c1Hcol     = input.color(#787b86, "1H", inline="deg", group=gL)
+c4Hcol     = input.color(#42bda8, "4H", inline="deg", group=gL)
+c1Dcol     = input.color(#5b9cf6, "1D", inline="deg", group=gL)
+c1Wcol     = input.color(#c07cff, "1W", inline="deg", group=gL)
 
-// Fixed styling — was 25 rarely-touched inputs, now sensible constants (same names →
-// zero render changes). Edit a value here if you ever want to change it.
-lineStyleIn = "Solid"
-emphWidth   = 3
-c1Hcol      = #787b86
-c4Hcol      = #42bda8
-c1Dcol      = #5b9cf6
-c1Wcol      = #c07cff
-extR        = 30
-zoneCol     = #ffd24a
-zoneOp      = 85
-zoneBord    = 1
-lblSide     = "Right"
-showConf    = true
-showStats   = true
-showDegTag  = true
-lblOp       = 20
+gLb = "Labels"
+showLbl     = input.bool(true, "Show level labels", group=gLb)
+lblSize     = input.string("Small", "Label size", options=["Tiny", "Small", "Normal"], group=gLb)
+lblSide     = input.string("Right", "Label side", options=["Right", "Left"], group=gLb)
+lblOp       = input.int(20, "Label background transparency", minval=0, maxval=100, group=gLb)
+showConf    = input.bool(true, "Show CONF score", group=gLb)
+showStats   = input.bool(true, "Show event stats line", group=gLb)
+showDegTag  = input.bool(true, "Show degree (TF) tag", group=gLb)
+showZoneLbl = input.bool(true, "Show zone / leading labels", group=gLb)
 
 gM = "Confluence Merge (liquidity zones)"
 mergeOn      = input.bool(true, "Merge clustered levels into one zone", group=gM, tooltip="OFF = every level shows as its own line. ON = nearby levels (a liquidity shelf) collapse into a single zone with combined strength. Underlying levels & memory are preserved.")
@@ -93,7 +111,6 @@ showClaude = input.bool(true, "Show Claude Line (equilibrium of the alpha range)
 midMode    = input.string("Equilibrium 50%", "Middle =", options=["Equilibrium 50%", "Snap to nearest strong level"], group=gCZ)
 showPD     = input.bool(true, "Shade premium / discount", group=gCZ)
 gateCZ     = input.bool(true, "Bias by MARKET STATE (range = mean-revert · trend = continuation)", group=gCZ)
-claudeCol  = input.color(#ffd24a, "Claude Line colour", group=gCZ)
 
 gLE = "Location Engine (auction range)"
 auctionTF    = input.timeframe("D", "Auction timeframe (fixed — the auction you trade around)", group=gLE, tooltip="The Claude Zone = the active dealing range on THIS timeframe, read as single HTF swing values (reach-independent) → identical on every chart TF. 1D = daily auction · 1W = macro.")
@@ -101,21 +118,7 @@ auctionSwing = input.int(5, "Auction swing size (pivot L/R)", minval=2, maxval=5
 approachPct  = input.float(10.0, "Approaching threshold (% of range width)", minval=1.0, maxval=45.0, step=1.0, group=gLE)
 showAuMeta   = input.bool(true, "Show auction state/version/age on the Claude Line", group=gLE)
 
-// Zone / Leading line styling — fixed constants (inherit the R/S colours above).
-czCeilCol   = resCol
-czCeilW     = 3
-czCeilSty   = "Solid"
-czFloorCol  = supCol
-czFloorW    = 3
-czFloorSty  = "Solid"
-claudeW     = 2
-claudeSty   = "Dashed"
-leadResCol  = resCol
-leadSupCol  = supCol
-leadW       = 1
-leadSty     = "Solid"
-leadFade    = true
-showZoneLbl = true
+// (all line styling now lives in the "Line Controls" group above)
 
 f_sz(s) => s == "Tiny" ? size.tiny : s == "Normal" ? size.normal : size.small
 f_degTxt(int d) => d == 0 ? "1H" : d == 1 ? "4H" : d == 2 ? "1D" : "1W"
@@ -677,7 +680,7 @@ if barstate.islast
                 col = colByDeg ? f_degCol(L.deg) : (isRes ? resCol : supCol)
                 decided = bounces + breaks
                 band = L.anchor * bandPct / 100.0
-                linW = (live or starred or isCluster) ? emphWidth : lineWidth
+                linW = (live or starred or isCluster) ? emphWidth : (isRes ? resW : supW)
                 // manual nudge — presentation only, applies to the LIVE ceiling / floor
                 nOff = (i == naIdx ? nudgeCeil : i == nbIdx ? nudgeFloor : 0.0) * L.anchor / 100.0
                 drawA = L.anchor + nOff
@@ -686,7 +689,7 @@ if barstate.islast
                     zb = (na(L.testLo) ? L.anchor - band : math.min(L.testLo, L.anchor - band)) + nOff
                     array.push(dBox, box.new(x1, zt, x2, zb, border_color=zoneBord > 0 ? color.new(zoneCol, 40) : color.new(zoneCol, 100), bgcolor=color.new(zoneCol, zoneOp), border_width=zoneBord))
                 else
-                    array.push(dLine, line.new(x1, drawA, x2, drawA, color=col, width=linW, extend=f_ext(extMode), style=f_lstyle(lineStyleIn)))
+                    array.push(dLine, line.new(x1, drawA, x2, drawA, color=col, width=linW, extend=f_ext(extMode), style=f_lstyle(isRes ? resSty : supSty)))
                 if showLbl
                     bornT = array.size(L.log) > 0 ? array.get(L.log, 0).t : time
                     string tl = "LEVEL " + str.tostring(L.anchor, format.mintick) + "  [" + f_degTxt(L.deg) + " degree]\n" + (isRes ? "resistance" : "support") + " · born " + str.format_time(bornT, "yyyy-MM-dd") + "\n———————————————\n"
