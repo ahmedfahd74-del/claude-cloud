@@ -16,7 +16,7 @@ indicator("Level Core v2 [multi-degree cross-TF]", overlay=true, max_lines_count
 gD = "Detection"
 pivLen  = input.int(5, "Swing size (pivot L/R, per degree)", minval=2, maxval=50, group=gD)
 bandPct = input.float(0.40, "Level band (% of price)", minval=0.02, maxval=5.0, step=0.02, group=gD)
-maxLvls = input.int(60, "Max levels tracked (centered on price)", minval=8, maxval=120, group=gD)
+maxLvls = input.int(20, "Levels shown (top-N by strength, All levels view)", minval=5, maxval=60, group=gD, tooltip="'All levels' ranks every scored, post-merge level by confluence-adjusted CONF and shows only the strongest N — a solid core set instead of whatever happens to be nearest to price. The LIVE nearest support/resistance always shows regardless of rank.")
 maxEv   = input.int(40, "Timeline length (events per level)", minval=5, maxval=80, group=gD)
 minShow = input.int(1, "Min interactions to show (LIVE always shows)", minval=0, maxval=20, group=gD)
 
@@ -105,7 +105,7 @@ erTrend   = input.float(0.35, "Trending efficiency ratio (0–1) — churn cutof
 erChop    = input.float(0.12, "Dead-structure floor (efficiency ratio 0–1)", minval=0.02, maxval=0.60, step=0.02, group=gP, tooltip="Even clean HH+HL / LH+LL structure is downgraded to RANGE when efficiency is below this — a low-volatility grind is not a tradable trend. Volatility gate on directional bias.")
 
 gCZ = "Claude Zone (ranked view)"
-viewMode   = input.string("All levels", "View", options=["All levels", "Leading (ranked)", "Claude Zone (3)", "Claude Line only"], group=gCZ, tooltip="All = every level (nearest maxLvls). Leading = the N STRONGEST scored levels each side (ranked by CONF, not by distance). Claude Zone = the latched dealing range (floor, ceiling, Claude Line). Claude Line only = cleanest chart.")
+viewMode   = input.string("All levels", "View", options=["All levels", "Leading (ranked)", "Claude Zone (3)", "Claude Line only"], group=gCZ, tooltip="All = the maxLvls STRONGEST levels (ranked by confluence-adjusted CONF, post-merge — not by distance). Leading = the N STRONGEST scored levels each side (ranked by CONF). Claude Zone = the latched dealing range (floor, ceiling, Claude Line). Claude Line only = cleanest chart.")
 leadN      = input.int(3, "Leading levels per side", minval=1, maxval=20, group=gCZ)
 showClaude = input.bool(true, "Show Claude Line (equilibrium of the dealing range)", group=gCZ, tooltip="The midpoint of the LATCHED dealing range — the strongest scored level below price and the strongest above. Moves only when the auction actually breaks, never on a touch.")
 showPD     = input.bool(true, "Shade premium / discount", group=gCZ)
@@ -187,7 +187,8 @@ f_create(float px, int deg, int bar, int t) =>
 
 // found a level of a given degree; anchor immutable. NO eviction: the book holds the
 // full distinct HTF-sourced set (hard safety cap only). The render caps the DISPLAY to
-// the maxLvls nearest price — so cost stays bounded without a per-bar eviction scan.
+// the maxLvls strongest (by confluence-adjusted CONF) — so cost stays bounded without
+// a per-bar eviction scan.
 f_found(float px, int deg, int bar, int t) =>
     if not na(px)
         band = px * bandPct / 100.0
@@ -746,39 +747,24 @@ if barstate.islast
         idx = math.min(topN, array.size(confs)) - 1
         if idx >= 0
             starThr := array.get(confs, idx)
-    // DISPLAY cap: the book holds the full HTF-sourced set, but draw only the maxLvls
-    // nearest price (+ always LIVE). TF-invariant: close on the last bar = current price.
-    float distThr = 1.0e20
-    if array.size(book) > maxLvls
-        dists = array.new_float()
-        for i = 0 to array.size(book) - 1
-            array.push(dists, math.abs(array.get(book, i).anchor - close))
-        array.sort(dists, order.ascending)
-        distThr := array.get(dists, maxLvls - 1)
-    // ── CLAUDE ZONE = LOCATION ENGINE (stable auction range). The 3 lines come straight
-    // from the auction boundaries — identical on every chart TF, no touch-cluster book. ──
-    float aFloor    = locLB
-    float aCeil     = locUB
-    float claudeMid = locEQ
-    if array.size(book) > 0
+    // DISPLAY SELECTION — "All levels" shows the maxLvls STRONGEST clusters (ranked by
+    // confluence-adjusted CONF), not merely the nearest by distance. Pass 1 finds each
+    // level's cluster representative (mirrors the old inline merge check, computed once
+    // here instead of once per candidate below); Pass 2 ranks representatives by
+    // strength and keeps the top maxLvls, always force-including the LIVE nearest
+    // above/below so "what's happening right now" can never be ranked out.
+    zoneOnly = viewMode != "All levels"
+    selShow  = array.new_bool(array.size(book), false)
+    clCountA = array.new_int(array.size(book), 1)
+    clStrA   = array.new_float(array.size(book), 0.0)
+    if not zoneOnly and array.size(book) > 0
+        repIdx = array.new_int()
         for i = 0 to array.size(book) - 1
             L = array.get(book, i)
-            events  = array.size(L.log)
-            live = i == naIdx or i == nbIdx
-            conf = array.get(lvlConf, i)          // cached — not re-scored
-            starred = topN > 0 and conf >= starThr
-            degOn = L.deg == 0 ? a1H : L.deg == 1 ? a4H : L.deg == 2 ? a1D : a1W   // display only degrees ≥ chart TF
-            // only "All levels" draws the per-level touch book; Leading/Zone/Line-only are
-            // auction-line based (drawn after the loop) so the per-level loop stays silent.
-            zoneOnly = viewMode != "All levels"
-            passView = zoneOnly ? false : (math.abs(L.anchor - close) <= distThr)
-            liveShow = live and not zoneOnly
-            if degOn and (conf >= minConf or liveShow) and (events >= minShow or liveShow) and (passView or liveShow)
-                bounces = f_count(L, 2)               // event-log walks only for drawn levels
-                breaks  = f_count(L, 3)
-                retests = f_count(L, 4)
-                // CONFLUENCE MERGE (inline, no parallel arrays → crash-proof): absorb this level
-                // if a stronger candidate sits within the merge band; else it's the cluster's line.
+            degOn = L.deg == 0 ? a1H : L.deg == 1 ? a4H : L.deg == 2 ? a1D : a1W
+            live  = i == naIdx or i == nbIdx
+            conf  = array.get(lvlConf, i)
+            if degOn and (conf >= minConf or live) and (array.size(L.log) >= minShow or live)
                 merged = false
                 clCount = 1
                 if mergeOn
@@ -786,16 +772,44 @@ if barstate.islast
                     for k = 0 to array.size(book) - 1
                         if k != i
                             Lk = array.get(book, k)
-                            ck = array.get(lvlConf, k)   // cached — was a full re-score per pair
+                            degOnk = Lk.deg == 0 ? a1H : Lk.deg == 1 ? a4H : Lk.deg == 2 ? a1D : a1W
+                            ck = array.get(lvlConf, k)
                             livek = k == naIdx or k == nbIdx
-                            candk = (ck >= minConf or livek) and (array.size(Lk.log) >= minShow or livek)
+                            candk = degOnk and (ck >= minConf or livek) and (array.size(Lk.log) >= minShow or livek)
                             if candk and math.abs(Lk.anchor - L.anchor) <= bandM
                                 clCount := clCount + 1
                                 if ck > conf or (ck == conf and k < i)
                                     merged := true
-                if mergeOn and merged
-                    continue
-                clStr = math.min(100.0, conf + conflBonus * (clCount - 1))
+                array.set(clCountA, i, clCount)
+                array.set(clStrA, i, math.min(100.0, conf + conflBonus * (clCount - 1)))
+                if not merged
+                    array.push(repIdx, i)
+        topSel = f_rankTop(repIdx, clStrA, maxLvls)
+        if array.size(topSel) > 0
+            for j = 0 to array.size(topSel) - 1
+                array.set(selShow, array.get(topSel, j), true)
+        if naIdx >= 0
+            array.set(selShow, naIdx, true)
+        if nbIdx >= 0
+            array.set(selShow, nbIdx, true)
+    // ── CLAUDE ZONE = LOCATION ENGINE (stable auction range). The 3 lines come straight
+    // from the auction boundaries — identical on every chart TF, no touch-cluster book. ──
+    float aFloor    = locLB
+    float aCeil     = locUB
+    float claudeMid = locEQ
+    if array.size(book) > 0
+        for i = 0 to array.size(book) - 1
+            if array.get(selShow, i)
+                L = array.get(book, i)
+                events  = array.size(L.log)
+                live = i == naIdx or i == nbIdx
+                conf = array.get(lvlConf, i)          // cached — not re-scored
+                starred = topN > 0 and conf >= starThr
+                bounces = f_count(L, 2)               // event-log walks only for drawn levels
+                breaks  = f_count(L, 3)
+                retests = f_count(L, 4)
+                clCount = array.get(clCountA, i)      // from the Pass-1 merge scan above
+                clStr   = array.get(clStrA, i)        // confluence-adjusted strength — the ranking key
                 isCluster = mergeOn and clCount > 1
                 isRes = L.anchor > close
                 col = colByDeg ? f_degCol(L.deg) : (isRes ? resCol : supCol)
