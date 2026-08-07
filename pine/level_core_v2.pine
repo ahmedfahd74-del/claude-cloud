@@ -112,6 +112,7 @@ showPD     = input.bool(true, "Shade premium / discount", group=gCZ)
 gateCZ     = input.bool(true, "Bias by MARKET STATE (range = mean-revert · trend = continuation)", group=gCZ)
 
 gLE = "Dealing Range (latched auction)"
+rangeTF      = input.timeframe("15", "Range anchor timeframe (MTF-consistent walls)", group=gLE, tooltip="The break/acceptance test is timed to THIS timeframe's closed bars, not the chart's. Every chart AT OR BELOW this TF (1m, 5m, 15m…) then latches identical floor/ceiling/Claude Line — no more different walls per chart. Charts ABOVE it (1H/4H/1D/1W) keep timing their own wider range, which is what a HTF trader wants.")
 zoneMinConf  = input.float(35.0, "Min CONF to act as a boundary / leading level", minval=0.0, maxval=100.0, step=5.0, group=gLE, tooltip="The Zone, Claude Line and Leading levels are built from the SCORED book — only levels whose confidence clears this qualify. Raise it for fewer, stronger lines.")
 wallProven   = input.string("Proven only", "Wall requirement", options=["Proven only", "Prefer proven", "Strongest only"], group=gLE, tooltip="AUTHORITY of the floor/ceiling. Proven only = a wall must have HELD ≥2× (the one factor that beat the null); if none is in reach the strongest is used and tagged UNPROVEN. Prefer proven = proven wins, but a much stronger fresh level can still qualify. Strongest only = pure CONF, no proven gate.")
 wallDegPref  = input.bool(true, "Prefer higher-degree (4H+) walls", group=gLE, tooltip="Floor/ceiling skip 1H levels and lean on 4H/1D/1W structure — more authority. Falls back to any degree if none qualifies. The 1H levels still appear as Leading lines inside the range.")
@@ -524,7 +525,22 @@ alertcondition(ta.change(dirVerdict) != 0, "True direction change", "IMIS: true 
 // This is what stops the Zone / Claude Line / Leading levels jumping, and gives the
 // floor/ceiling real authority instead of drawing weak lines price slices through.
 
-drAtr = ta.atr(14)   // chart-TF ATR — scales the break + invalidation buffers
+drAtr = ta.atr(14)   // chart-TF ATR — fallback buffer scale on charts ABOVE the range TF
+
+// MTF-CONSISTENT TIMING — the break/acceptance test used to run on the CHART's own bar
+// closes, so a 1m, 5m and 15m chart each latched a DIFFERENT range (different candle
+// sequence = different break timing = different floor/ceiling/Claude Line, even though
+// the candidate walls themselves were already identical). Fixed by timing the test to
+// ONE fixed timeframe's (rangeTF) own closed bars instead — every chart at or below it
+// then reads the exact same break history. Mirrors the non-repaint prior-closed-bar
+// pattern already used for the per-degree HTF reads (h1/l1/c1 etc. above).
+rSec        = timeframe.in_seconds(rangeTF)
+rangeOn     = rSec >= chartSec                                          // chart is AT/BELOW the anchor TF
+[rC, rAtrV] = request.security(syminfo.tickerid, rangeTF, [close[1], ta.atr(14)[1]], lookahead=barmerge.lookahead_on)
+rangeNewBar = rangeOn and ta.change(time(rangeTF)) != 0                 // a rangeTF bar just closed
+testNow     = rangeOn ? rangeNewBar : barstate.isconfirmed              // ABOVE rangeTF: fall back to chart timing
+refClose    = rangeOn ? rC : close
+refAtr      = rangeOn ? nz(rAtrV) : nz(drAtr)
 
 // WALL TEST — does this scored level deserve to be a floor/ceiling?
 // strict = apply the proven gate + degree preference; relaxed = CONF only (fallback).
@@ -561,50 +577,53 @@ var int   locBrk   = 0      // this bar: 0 none · 1 broke up · -1 broke down
 var int   upCloses = 0      // consecutive closes beyond the ceiling buffer
 var int   dnCloses = 0      // consecutive closes beyond the floor buffer
 locBrk := 0
-if barstate.isconfirmed
-    buf = nz(drAtr) * breakBufATR
-    if na(locUBv) or na(locLBv)
-        // bootstrap (or re-acquire after an expansion left a side empty)
-        if na(locUBv)
-            [p, pr] = f_pickWall(close, 1)
-            locUBv := p
-            ubProven := pr
-        if na(locLBv)
-            [p, pr] = f_pickWall(close, -1)
-            locLBv := p
-            lbProven := pr
+if barstate.isconfirmed and (na(locUBv) or na(locLBv))
+    // bootstrap (or re-acquire after an expansion left a side empty) — safe on any bar,
+    // uses refClose so the seed already agrees across every chart at/below rangeTF
+    if na(locUBv)
+        [p, pr] = f_pickWall(refClose, 1)
+        locUBv := p
+        ubProven := pr
+    if na(locLBv)
+        [p, pr] = f_pickWall(refClose, -1)
+        locLBv := p
+        lbProven := pr
+    upCloses := 0
+    dnCloses := 0
+else if testNow
+    // ACCEPTANCE — count consecutive RANGE-TF closes beyond the buffer; one poke resets it.
+    // Gated to testNow so 1m/5m/15m charts all advance the counter on the SAME 15m closes
+    // instead of each chart counting its own bar closes (which made breakAccept's real-world
+    // meaning chart-dependent — "2 closes" was 2 minutes on a 1m chart, 2 days on a 1D chart).
+    buf = refAtr * breakBufATR
+    upCloses := refClose > locUBv + buf ? upCloses + 1 : 0
+    dnCloses := refClose < locLBv - buf ? dnCloses + 1 : 0
+    if upCloses >= breakAccept
+        locBrk := 1
+        locLBv := locUBv                 // broken ceiling becomes the new floor…
+        lbProven := ubProven             // …and keeps its proven status
+        [p, pr] = f_pickWall(refClose, 1)
+        locUBv := p
+        ubProven := pr
         upCloses := 0
         dnCloses := 0
-    else
-        // ACCEPTANCE — count consecutive closes beyond the buffer; a single poke resets it
-        upCloses := close > locUBv + buf ? upCloses + 1 : 0
-        dnCloses := close < locLBv - buf ? dnCloses + 1 : 0
-        if upCloses >= breakAccept
-            locBrk := 1
-            locLBv := locUBv                 // broken ceiling becomes the new floor…
-            lbProven := ubProven             // …and keeps its proven status
-            [p, pr] = f_pickWall(close, 1)
-            locUBv := p
-            ubProven := pr
-            upCloses := 0
-            dnCloses := 0
-        else if dnCloses >= breakAccept
-            locBrk := -1
-            locUBv := locLBv
-            ubProven := lbProven
-            [p, pr] = f_pickWall(close, -1)
-            locLBv := p
-            lbProven := pr
-            upCloses := 0
-            dnCloses := 0
+    else if dnCloses >= breakAccept
+        locBrk := -1
+        locUBv := locLBv
+        ubProven := lbProven
+        [p, pr] = f_pickWall(refClose, -1)
+        locLBv := p
+        lbProven := pr
+        upCloses := 0
+        dnCloses := 0
     // NO other branch: inside the range — touching, wicking, one poke — nothing moves.
 
 locUB = locUBv
 locLB = locLBv
 locEQ = na(locUB) or na(locLB) ? na : (locUB + locLB) / 2.0
 // sweep-aware invalidation: beyond the wall's band + an ATR buffer → past the stop-hunt zone
-invUB = na(locUB) ? na : locUB + locUB * bandPct / 100.0 + nz(drAtr) * sweepBufATR
-invLB = na(locLB) ? na : locLB - locLB * bandPct / 100.0 - nz(drAtr) * sweepBufATR
+invUB = na(locUB) ? na : locUB + locUB * bandPct / 100.0 + refAtr * sweepBufATR
+invLB = na(locLB) ? na : locLB - locLB * bandPct / 100.0 - refAtr * sweepBufATR
 locPremium = not na(locEQ) and close >= locEQ
 locRangeW  = na(locUB) or na(locLB) ? na : locUB - locLB
 // zone state: 0 INSIDE · 1 APPROACH_CEIL · 2 APPROACH_FLOOR · 3 EXPANSION_UP · 4 EXPANSION_DOWN · 5 UNDEFINED
@@ -654,6 +673,9 @@ plot(lbProven ? 1 : 0, "loc.floorProven",   display=display.data_window)
 plot(auctionVer, "loc.rangeVersion",       display=display.data_window)
 plot(auctionAge, "loc.rangeAge",           display=display.data_window)
 plot(locState,   "loc.zoneState",          display=display.data_window)
+// loc.mtfConsistent: 1 = this chart's walls are timed to rangeTF and match every other
+// chart at/below it. 0 = this chart is ABOVE rangeTF and times its own wider range.
+plot(rangeOn ? 1 : 0, "loc.mtfConsistent", display=display.data_window)
 alertcondition(auctionTrans != 0, "Auction transition", "IMIS Location Engine: active auction changed (new version)")
 
 // ── RENDER ───────────────────────────────────────────────────────────────────

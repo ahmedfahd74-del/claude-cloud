@@ -161,3 +161,105 @@ if __name__ == "__main__":
     print("  4 one poke != break · 5 wicks ignored · 6 acceptance break + ceiling→floor flip")
     print("  7 invalidation beyond the sweep zone · 8 the 5m PEPE whipsaw now holds")
     print("  all 8 claims PASS")
+
+    # ════════════════════════════════════════════════════════════════════════════
+    # MTF-CONSISTENT TIMING — proves the rangeTF anchor fix: the break/acceptance
+    # test used to run on each CHART's own bar closes, so a 1m/5m/15m chart looking
+    # at the SAME price action could break at three different moments (different
+    # floor/ceiling/Claude Line per chart). Now it's timed to ONE fixed timeframe
+    # (rangeTF)'s closed bars, so every chart at/below it agrees.
+    # ════════════════════════════════════════════════════════════════════════════
+    class LatchOld:
+        """pre-fix: acceptance counted on the VIEWER's own bar closes"""
+        def __init__(self, wall, buf, accept):
+            self.wall, self.buf, self.accept = wall, buf, accept
+            self.up, self.brk_at = 0, None
+
+        def feed(self, t, close):
+            if self.brk_at is not None:
+                return
+            self.up = self.up + 1 if close > self.wall + self.buf else 0
+            if self.up >= self.accept:
+                self.brk_at = t
+
+    class LatchNew:
+        """post-fix: acceptance counted ONLY on rangeTF-boundary closes, shared by
+        every viewer regardless of what timeframe they're charting"""
+        def __init__(self, wall, buf, accept, boundary_times):
+            self.wall, self.buf, self.accept = wall, buf, accept
+            self.boundary = set(boundary_times)
+            self.up, self.brk_at = 0, None
+
+        def feed(self, t, close):
+            if self.brk_at is not None or t not in self.boundary:
+                return
+            self.up = self.up + 1 if close > self.wall + self.buf else 0
+            if self.up >= self.accept:
+                self.brk_at = t
+
+    # one minute-by-minute price path, 60 minutes, ONE ceiling wall at 100, buffer=1
+    # (beyond = close > 101), acceptance = 2 consecutive closes beyond.
+    closes = {}
+    for m in range(1, 15):                              # minutes 1-14: quiet ramp, stays inside
+        closes[m] = 98.0 + (m - 1) * 0.1
+    closes[15] = 99.5                                    # 15m boundary #1 — inside
+    # minutes 16-20: a transient spike that breaks EARLY on fine granularities
+    closes.update({16: 100.5, 17: 101.2, 18: 101.5, 19: 101.6, 20: 101.7})
+    closes.update({21: 101.5, 22: 101.5, 23: 101.5, 24: 101.4, 25: 101.4})
+    closes.update({26: 100.9, 27: 100.6, 28: 100.4, 29: 100.3})
+    closes[30] = 100.3                                   # 15m boundary #2 — back inside
+    for m in range(31, 45):
+        closes[m] = 100.0                                # quiet stretch
+    closes[45] = 101.6                                   # 15m boundary #3 — beyond (count 1)
+    for m in range(46, 60):
+        closes[m] = 100.0                                # quiet stretch
+    closes[60] = 101.8                                   # 15m boundary #4 — beyond (count 2) -> BREAK
+
+    WALL, BUF, ACCEPT = 100.0, 1.0, 2
+
+    old_1m = LatchOld(WALL, BUF, ACCEPT)
+    old_5m = LatchOld(WALL, BUF, ACCEPT)
+    old_15m = LatchOld(WALL, BUF, ACCEPT)
+    for m in range(1, 61):
+        old_1m.feed(m, closes[m])
+        if m % 5 == 0:
+            old_5m.feed(m, closes[m])
+        if m % 15 == 0:
+            old_15m.feed(m, closes[m])
+
+    boundaries = [t for t in range(1, 61) if t % 15 == 0]
+    new_as_1m = LatchNew(WALL, BUF, ACCEPT, boundaries)
+    new_as_5m = LatchNew(WALL, BUF, ACCEPT, boundaries)
+    new_as_15m = LatchNew(WALL, BUF, ACCEPT, boundaries)
+    for m in range(1, 61):
+        new_as_1m.feed(m, closes[m])                     # fed every minute...
+        if m % 5 == 0:
+            new_as_5m.feed(m, closes[m])                 # ...or every 5 minutes...
+        if m % 15 == 0:
+            new_as_15m.feed(m, closes[m])                # ...or every 15 — doesn't matter,
+                                                           # LatchNew ignores non-boundary ticks
+
+    # ── CLAIM 9: pre-fix, three chart TFs looking at the SAME price break at
+    #    three DIFFERENT moments — the reported bug, reproduced exactly ──
+    assert old_1m.brk_at == 18, old_1m.brk_at
+    assert old_5m.brk_at == 25, old_5m.brk_at
+    assert old_15m.brk_at == 60, old_15m.brk_at
+    assert len({old_1m.brk_at, old_5m.brk_at, old_15m.brk_at}) == 3, \
+        "control: the three old chart-timed viewers should all disagree"
+
+    # ── CLAIM 10: post-fix, 1m/5m/15m viewers of the SAME rangeTF-anchored latch
+    #    converge on the identical break moment ──
+    assert new_as_1m.brk_at == new_as_5m.brk_at == new_as_15m.brk_at == 60, \
+        (new_as_1m.brk_at, new_as_5m.brk_at, new_as_15m.brk_at)
+
+    # ── CLAIM 11: the fix does not regress the native rangeTF chart itself —
+    #    a 15m chart under the OLD per-chart-bar logic already tested exactly the
+    #    15m boundaries, so it should match the NEW anchor result exactly ──
+    assert old_15m.brk_at == new_as_15m.brk_at == 60
+
+    print("\nMTF-CONSISTENT TIMING VALIDATED:")
+    print("  same 60-minute price path, ceiling=100, buffer=1, accept=2 consecutive closes")
+    print(f"    OLD (chart-timed)   1m breaks @ minute {old_1m.brk_at}   5m breaks @ minute {old_5m.brk_at}   15m breaks @ minute {old_15m.brk_at}   <- all disagree")
+    print(f"    NEW (range-anchored) 1m-viewer @ {new_as_1m.brk_at}   5m-viewer @ {new_as_5m.brk_at}   15m-viewer @ {new_as_15m.brk_at}   <- identical")
+    print("  9 old timing diverges by chart TF · 10 new timing converges · 11 no regression on the anchor TF")
+    print("  all 3 MTF claims PASS  (11/11 total)")
