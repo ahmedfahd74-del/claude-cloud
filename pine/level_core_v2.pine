@@ -464,22 +464,39 @@ f_statePrev() =>
 [stD, bvD, lnD, erDv] = request.security(syminfo.tickerid, "D",   f_statePrev(), lookahead=barmerge.lookahead_on)
 [st4, bv4, ln4, er4v] = request.security(syminfo.tickerid, "240", f_statePrev(), lookahead=barmerge.lookahead_on)
 
-// 2/3 CONFIRMATION of the state-derived votes (directional only from TREND/PULLBACK)
-bulls = (bvW == 1 ? 1 : 0) + (bvD == 1 ? 1 : 0) + (bv4 == 1 ? 1 : 0)
-bears = (bvW == -1 ? 1 : 0) + (bvD == -1 ? 1 : 0) + (bv4 == -1 ? 1 : 0)
-posDir   = bulls >= 2 ? 1 : bears >= 2 ? -1 : 0   // confirmed direction (else neutral)
+// Only count a bias TF when it is ≥ the chart TF. Reading a LOWER timeframe than the
+// chart via request.security (e.g. 4H/1D from a 1W chart) is degenerate, so neutralize
+// those votes. On any chart ≤ 4H all three are active → identical to before; only the
+// D and W charts change, where the sub-chart reads were previously misleading.
+biasWon = timeframe.in_seconds("W")   >= chartSec
+biasDon = timeframe.in_seconds("D")   >= chartSec
+bias4on = timeframe.in_seconds("240") >= chartSec
+stWe = biasWon ? stW : 0
+stDe = biasDon ? stD : 0
+st4e = bias4on ? st4 : 0
+bvWe = biasWon ? bvW : 0
+bvDe = biasDon ? bvD : 0
+bv4e = bias4on ? bv4 : 0
+nBias = (biasWon ? 1 : 0) + (biasDon ? 1 : 0) + (bias4on ? 1 : 0)
 
-// SYSTEM market state (precedence): confirmed dir → TRENDING if ≥2 agreeing HTFs are
+// CONFIRMATION among the ACTIVE bias TFs (directional only from TREND/PULLBACK).
+// 2 of 3 normally; when fewer than 3 are active, require all of them to agree.
+bulls = (bvWe == 1 ? 1 : 0) + (bvDe == 1 ? 1 : 0) + (bv4e == 1 ? 1 : 0)
+bears = (bvWe == -1 ? 1 : 0) + (bvDe == -1 ? 1 : 0) + (bv4e == -1 ? 1 : 0)
+needAgree = nBias >= 3 ? 2 : math.max(1, nBias)
+posDir   = bulls >= needAgree ? 1 : bears >= needAgree ? -1 : 0   // confirmed direction (else neutral)
+
+// SYSTEM market state (precedence): confirmed dir → TRENDING if enough agreeing HTFs are
 // TREND else PULLBACK; no confirmed dir → conflict=TRANSITION, else surface D/A, else RANGE
-trendAgree = posDir == 1 ? ((stW == 1 and bvW == 1 ? 1 : 0) + (stD == 1 and bvD == 1 ? 1 : 0) + (st4 == 1 and bv4 == 1 ? 1 : 0)) : posDir == -1 ? ((stW == 1 and bvW == -1 ? 1 : 0) + (stD == 1 and bvD == -1 ? 1 : 0) + (st4 == 1 and bv4 == -1 ? 1 : 0)) : 0
+trendAgree = posDir == 1 ? ((stWe == 1 and bvWe == 1 ? 1 : 0) + (stDe == 1 and bvDe == 1 ? 1 : 0) + (st4e == 1 and bv4e == 1 ? 1 : 0)) : posDir == -1 ? ((stWe == 1 and bvWe == -1 ? 1 : 0) + (stDe == 1 and bvDe == -1 ? 1 : 0) + (st4e == 1 and bv4e == -1 ? 1 : 0)) : 0
 int sysState = 0
 if posDir != 0
-    sysState := trendAgree >= 2 ? 1 : 2
+    sysState := trendAgree >= math.min(2, nBias) ? 1 : 2
 else if bulls > 0 and bears > 0
     sysState := 3
-else if stW == 4 or stD == 4 or st4 == 4
+else if stWe == 4 or stDe == 4 or st4e == 4
     sysState := 4
-else if stW == 5 or stD == 5 or st4 == 5
+else if stWe == 5 or stDe == 5 or st4e == 5
     sysState := 5
 else
     sysState := 0
