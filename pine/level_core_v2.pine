@@ -615,12 +615,18 @@ if barstate.islast
             if dOn and a < close and (close - a) < nbD
                 nbD := close - a
                 nbIdx := i
-    // confidence per level + rank: find the Nth-highest score = star threshold
-    float starThr = 1.0e20
-    if topN > 0 and array.size(book) > 0
-        confs = array.new_float()
+    // CONFIDENCE CACHE — score every level exactly ONCE per render, indexed by book
+    // position. Everything downstream (star rank, merge comparison, cluster tooltip)
+    // reads this array instead of re-scoring. Without it the merge loop re-ran a full
+    // f_audit for every pair of levels → O(book² × events) and a >500ms loop timeout.
+    lvlConf = array.new_float()
+    if array.size(book) > 0
         for i = 0 to array.size(book) - 1
-            array.push(confs, f_conf(array.get(book, i)))
+            array.push(lvlConf, f_conf(array.get(book, i)))
+    // rank: the Nth-highest score = star threshold
+    float starThr = 1.0e20
+    if topN > 0 and array.size(lvlConf) > 0
+        confs = array.copy(lvlConf)
         array.sort(confs, order.descending)
         idx = math.min(topN, array.size(confs)) - 1
         if idx >= 0
@@ -642,12 +648,9 @@ if barstate.islast
     if array.size(book) > 0
         for i = 0 to array.size(book) - 1
             L = array.get(book, i)
-            bounces = f_count(L, 2)
-            breaks  = f_count(L, 3)
-            retests = f_count(L, 4)
             events  = array.size(L.log)
             live = i == naIdx or i == nbIdx
-            [conf, winF, rejF, dispF, sweepF, sepF, evidF, provenF, degW, nEv, avgW, held, brk] = f_audit(L)
+            conf = array.get(lvlConf, i)          // cached — not re-scored
             starred = topN > 0 and conf >= starThr
             degOn = L.deg == 0 ? a1H : L.deg == 1 ? a4H : L.deg == 2 ? a1D : a1W   // display only degrees ≥ chart TF
             // only "All levels" draws the per-level touch book; Leading/Zone/Line-only are
@@ -656,6 +659,9 @@ if barstate.islast
             passView = zoneOnly ? false : (math.abs(L.anchor - close) <= distThr)
             liveShow = live and not zoneOnly
             if degOn and (conf >= minConf or liveShow) and (events >= minShow or liveShow) and (passView or liveShow)
+                bounces = f_count(L, 2)               // event-log walks only for drawn levels
+                breaks  = f_count(L, 3)
+                retests = f_count(L, 4)
                 // CONFLUENCE MERGE (inline, no parallel arrays → crash-proof): absorb this level
                 // if a stronger candidate sits within the merge band; else it's the cluster's line.
                 merged = false
@@ -665,7 +671,7 @@ if barstate.islast
                     for k = 0 to array.size(book) - 1
                         if k != i
                             Lk = array.get(book, k)
-                            ck = f_conf(Lk)
+                            ck = array.get(lvlConf, k)   // cached — was a full re-score per pair
                             livek = k == naIdx or k == nbIdx
                             candk = (ck >= minConf or livek) and (array.size(Lk.log) >= minShow or livek)
                             if candk and math.abs(Lk.anchor - L.anchor) <= bandM
@@ -701,6 +707,8 @@ if barstate.islast
                     wrtxt = decided > 0 ? str.tostring(math.round(bounces / decided * 100)) + "%" : "n/a"
                     // AUDIT breakdown (★ levels): every component's point-contribution, summing to CONF
                     if showAudit and starred
+                        // full breakdown scored here only — a handful of ★ levels, not the whole book
+                        [aConf, winF, rejF, dispF, sweepF, sepF, evidF, provenF, degW, nEv, avgW, held, brk] = f_audit(L)
                         wtot = wWin + wRej + wDisp + wSweep + wSep + wEvid + wProven
                         qual = f_qualified(L)
                         sub = f_pts(winF, wWin, wtot, 1.0) + f_pts(rejF, wRej, wtot, 1.0) + f_pts(dispF, wDisp, wtot, 1.0) + f_pts(sweepF, wSweep, wtot, 1.0) + f_pts(sepF, wSep, wtot, 1.0) + f_pts(evidF, wEvid, wtot, 1.0) + f_pts(provenF, wProven, wtot, 1.0)
@@ -723,7 +731,7 @@ if barstate.islast
                         for k = 0 to array.size(book) - 1
                             Lk = array.get(book, k)
                             if math.abs(Lk.anchor - L.anchor) <= L.anchor * mergeBandPct / 100.0
-                                tl := tl + "  " + str.tostring(Lk.anchor, format.mintick) + "  " + f_degTxt(Lk.deg) + " · CONF " + str.tostring(math.round(f_conf(Lk))) + " · " + str.tostring(array.size(Lk.log)) + " ev\n"
+                                tl := tl + "  " + str.tostring(Lk.anchor, format.mintick) + "  " + f_degTxt(Lk.deg) + " · CONF " + str.tostring(math.round(array.get(lvlConf, k))) + " · " + str.tostring(array.size(Lk.log)) + " ev\n"
                     ltag = (starred ? "★ " : "") + (live ? "◄ LIVE  " : "")
                     degPart  = showDegTag ? "  " + f_degTxt(L.deg) : ""
                     confPart = showConf ? (isCluster ? "  ·  STR " + str.tostring(math.round(clStr)) + " ⧉×" + str.tostring(clCount) : "  ·  CONF " + str.tostring(math.round(conf))) : ""
