@@ -34,9 +34,12 @@ MERGE_BAND_PCT = 0.80
 CONFL_BONUS = 6.0
 
 
-def select(levels, min_conf, min_events, merge_on, top_n, live_idx=None):
+def select(levels, min_conf, min_events, merge_on, top_n, live_idx=None,
+           reach_pct=None, cur_price=None):
     """levels: list of dicts {anchor, deg_on(bool), conf, events}. live_idx:
-    set of indices always force-shown. Returns (shown_idx_set, clCount, clStr)."""
+    set of indices always force-shown. reach_pct: optional % of price radius —
+    levels outside it are excluded from ranking (LIVE always bypasses).
+    Returns (shown_idx_set, clCount, clStr)."""
     n = len(levels)
     cl_count = [1] * n
     cl_str = [0.0] * n
@@ -46,7 +49,9 @@ def select(levels, min_conf, min_events, merge_on, top_n, live_idx=None):
     def eligible(i):
         L = levels[i]
         live = i in live_idx
-        return L["deg_on"] and (L["conf"] >= min_conf or live) and (L["events"] >= min_events or live)
+        in_reach = (reach_pct is None or cur_price is None or
+                    abs(L["anchor"] - cur_price) / cur_price * 100 <= reach_pct or live)
+        return L["deg_on"] and (L["conf"] >= min_conf or live) and (L["events"] >= min_events or live) and in_reach
 
     for i in range(n):
         if not eligible(i):
@@ -148,8 +153,49 @@ if __name__ == "__main__":
     shown5b, _, _ = select(tied, min_conf=0.0, min_events=1, merge_on=True, top_n=2)
     assert shown5 == shown5b, "non-deterministic selection"
 
+    # ── CLAIM 6: reach filter excludes archaeology; near-price structure wins ─
+    # Simulate a meme coin: current price 0.0012, 20 near-price levels within 30%,
+    # plus 5 ancient ATH levels at 0.006-0.009 (3x-7x above current — well outside 30%).
+    # Without reach limit, ancient ATH levels (high CONF from many old touches) would rank
+    # into the top-N ahead of current-market levels. With reach limit they don't compete.
+    cur_px = 0.0012
+    near_lvls = [{"anchor": cur_px * (1.0 + (i - 10) * 0.015), "deg_on": True, "conf": 30.0 + i * 2, "events": 3 + i}
+                 for i in range(20)]
+    ath_lvls = [{"anchor": cur_px * (4.0 + i), "deg_on": True, "conf": 90.0 - i, "events": 20 + i}
+                for i in range(5)]
+    all_lvls = near_lvls + ath_lvls  # indices 0-19 near, 20-24 ATH
+
+    # without reach limit: ATH levels (highest CONF) occupy the top slots
+    shown_no_reach, _, _ = select(all_lvls, min_conf=0.0, min_events=1, merge_on=False,
+                                  top_n=5, reach_pct=None, cur_price=cur_px)
+    ath_in_no_reach = [i for i in shown_no_reach if i >= 20]
+    assert len(ath_in_no_reach) > 0, "without reach limit ATH levels should dominate top-5 by CONF"
+
+    # with 30% reach limit: only near-price levels compete
+    shown_reach, _, _ = select(all_lvls, min_conf=0.0, min_events=1, merge_on=False,
+                               top_n=5, reach_pct=30.0, cur_price=cur_px)
+    ath_in_reach = [i for i in shown_reach if i >= 20]
+    assert len(ath_in_reach) == 0, f"reach filter must exclude ATH archaeology, got ATH indices {ath_in_reach}"
+    assert all(i < 20 for i in shown_reach), "all shown levels must be near-price"
+    assert len(shown_reach) == 5, "should still fill all N slots from near-price pool"
+
+    # ── CLAIM 7: reach bypass for LIVE — LIVE shown even if outside reach range ─
+    # LIVE nearest above happens to be a distant recovery level outside 30% reach.
+    ath_live_levels = [
+        {"anchor": cur_px * 0.95, "deg_on": True, "conf": 40.0, "events": 3},   # idx 0, near, strong-ish
+        {"anchor": cur_px * 1.05, "deg_on": True, "conf": 35.0, "events": 2},   # idx 1, near
+        {"anchor": cur_px * 5.0,  "deg_on": True, "conf": 20.0, "events": 1},   # idx 2, FAR, but LIVE
+    ]
+    live_far = {2}
+    shown7, _, _ = select(ath_live_levels, min_conf=0.0, min_events=1, merge_on=False,
+                          top_n=2, reach_pct=30.0, cur_price=cur_px, live_idx=live_far)
+    assert 2 in shown7, "LIVE level must show even when it is outside the reach range"
+    assert len(shown7) == 3, f"expected top-2 near + 1 forced LIVE = 3 total, got {len(shown7)}"
+
     print("ALL-LEVELS SELECTION VALIDATED:")
     print("  1 strength beats distance · 2 cross-degree duplicates collapse to 1 slot")
     print("  3 LIVE always forced in · 4 graceful degrade (no crash/padding)")
     print("  5 tie-break determinism (lower index wins)")
-    print("  all 5 claims PASS")
+    print("  6 reach filter excludes ancient archaeology before ranking")
+    print("  7 LIVE bypass overrides reach filter")
+    print("  all 7 claims PASS")
