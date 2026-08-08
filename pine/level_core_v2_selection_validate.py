@@ -192,10 +192,64 @@ if __name__ == "__main__":
     assert 2 in shown7, "LIVE level must show even when it is outside the reach range"
     assert len(shown7) == 3, f"expected top-2 near + 1 forced LIVE = 3 total, got {len(shown7)}"
 
+    # ── DEGREE BALANCE (Item 3) — round-robin quota then global-rank fill ────
+    # Runs AFTER the reach filter above: reach decides which levels enter the
+    # pool, degree balance decides how the pool's slots are shared across degrees.
+    # Mirrors the Pine rank: Phase 1 gives each active degree its top minPerDeg
+    # strongest reps, drafted round-robin (round 0 = every degree's #1, round 1
+    # = every degree's #2 …) so a tight cap stays balanced; Phase 2 fills the
+    # remaining slots by pure global strength. Tie -> lower book index (matches
+    # f_rankTop's strict '>').
+    def rank_balanced(reps, deg_of, clstr, want, min_per_deg):
+        degs = sorted(set(deg_of[r] for r in reps))
+        by_deg = {}
+        for d in degs:
+            lst = [r for r in reps if deg_of[r] == d]
+            lst.sort(key=lambda r: (-clstr[r], r))
+            by_deg[d] = lst
+        picked, seen = [], set()
+        for rnd in range(min_per_deg):                 # Phase 1: round-robin quota
+            for d in degs:
+                if rnd < len(by_deg[d]) and len(picked) < want:
+                    r = by_deg[d][rnd]
+                    if r not in seen:
+                        picked.append(r); seen.add(r)
+        rest = sorted([r for r in reps if r not in seen], key=lambda r: (-clstr[r], r))
+        for r in rest:                                 # Phase 2: global-rank fill
+            if len(picked) < want:
+                picked.append(r); seen.add(r)
+        return picked
+
+    # Scenario: 4 dominant HTF levels (1D/1W, conf 70-85) + 4 local levels
+    # (1H/4H, conf 30-45). All within reach. want=4.
+    deg_of = {0: 3, 1: 3, 2: 2, 3: 2, 4: 1, 5: 1, 6: 0, 7: 0}       # 3=1W 2=1D 1=4H 0=1H
+    clstr  = {0: 85.0, 1: 80.0, 2: 75.0, 3: 70.0, 4: 45.0, 5: 40.0, 6: 35.0, 7: 30.0}
+    reps   = list(range(8))
+
+    # ── CLAIM 8: WITHOUT quota, the top-4 is ALL 1D/1W — local structure starved ─
+    pure = rank_balanced(reps, deg_of, clstr, want=4, min_per_deg=0)
+    assert set(pure) == {0, 1, 2, 3}, f"pure-rank top4 should be the 4 HTF levels, got {pure}"
+    assert all(deg_of[r] >= 2 for r in pure), "pure rank starves 1H/4H — the exact problem"
+
+    # ── CLAIM 9: WITH quota (min_per_deg=1), each active degree gets its strongest ─
+    bal = rank_balanced(reps, deg_of, clstr, want=4, min_per_deg=1)
+    degs_in = {deg_of[r] for r in bal}
+    assert degs_in == {0, 1, 2, 3}, f"every active degree should be represented, got degrees {degs_in}"
+    # the guaranteed picks are each degree's strongest: 1W#0, 1D#2, 4H#4, 1H#6
+    assert set(bal) == {0, 2, 4, 6}, f"round-robin quota should pick each degree's #1, got {bal}"
+
+    # ── CLAIM 10: quota never exceeds the cap; extra slots go to global rank ─────
+    # want=6, min_per_deg=1 -> 4 quota picks (one per degree) + 2 strongest of the rest
+    bal2 = rank_balanced(reps, deg_of, clstr, want=6, min_per_deg=1)
+    assert len(bal2) == 6, f"must fill exactly the cap, got {len(bal2)}"
+    assert {0, 2, 4, 6}.issubset(set(bal2)), "the 4 quota picks must all be present"
+    # the 2 fill slots are the strongest remaining: idx1 (80) and idx3 (70)
+    assert set(bal2) - {0, 2, 4, 6} == {1, 3}, f"fill slots should be the strongest leftovers, got {set(bal2)-{0,2,4,6}}"
+
     print("ALL-LEVELS SELECTION VALIDATED:")
     print("  1 strength beats distance · 2 cross-degree duplicates collapse to 1 slot")
     print("  3 LIVE always forced in · 4 graceful degrade (no crash/padding)")
     print("  5 tie-break determinism (lower index wins)")
-    print("  6 reach filter excludes ancient archaeology before ranking")
-    print("  7 LIVE bypass overrides reach filter")
-    print("  all 7 claims PASS")
+    print("  6 reach filter excludes ancient archaeology before ranking · 7 LIVE bypass overrides reach")
+    print("  8 pure rank starves 1H/4H · 9 quota guarantees each degree · 10 cap respected, rest by rank")
+    print("  all 10 claims PASS")
