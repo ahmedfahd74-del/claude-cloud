@@ -16,8 +16,9 @@ indicator("Level Core v2 [multi-degree cross-TF]", overlay=true, max_lines_count
 gD = "Detection"
 pivLen  = input.int(5, "Swing size (pivot L/R, per degree)", minval=2, maxval=50, group=gD)
 bandPct = input.float(0.40, "Level band (% of price)", minval=0.02, maxval=5.0, step=0.02, group=gD)
-maxLvls = input.int(20, "Levels shown (top-N by strength, All levels view)", minval=5, maxval=60, group=gD, tooltip="'All levels' ranks every scored, post-merge level by confluence-adjusted CONF and shows only the strongest N — a solid core set instead of whatever happens to be nearest to price. The LIVE nearest support/resistance always shows regardless of rank.")
-maxEv   = input.int(40, "Timeline length (events per level)", minval=5, maxval=80, group=gD)
+maxLvls  = input.int(20, "Levels shown (top-N by strength, All levels view)", minval=5, maxval=60, group=gD, tooltip="'All levels' ranks every scored, post-merge level by confluence-adjusted CONF and shows only the strongest N — a solid core set instead of whatever happens to be nearest to price. The LIVE nearest support/resistance always shows regardless of rank.")
+reachPct = input.float(30.0, "Search range (% of price from current)", minval=5.0, maxval=200.0, step=5.0, group=gD, tooltip="Only levels within this % of current price enter the top-N ranking contest. Prevents ancient ATH/ATL archaeology (high touch-count but untradeable distance) from crowding out current tradeable structure. LIVE nearest support/resistance always shows regardless of reach limit.")
+maxEv    = input.int(40, "Timeline length (events per level)", minval=5, maxval=80, group=gD)
 minShow = input.int(1, "Min interactions to show (LIVE always shows)", minval=0, maxval=20, group=gD)
 
 gG = "Degrees"
@@ -764,7 +765,8 @@ if barstate.islast
             degOn = L.deg == 0 ? a1H : L.deg == 1 ? a4H : L.deg == 2 ? a1D : a1W
             live  = i == naIdx or i == nbIdx
             conf  = array.get(lvlConf, i)
-            if degOn and (conf >= minConf or live) and (array.size(L.log) >= minShow or live)
+            inReach = math.abs(L.anchor - close) / close * 100 <= reachPct
+            if degOn and (conf >= minConf or live) and (array.size(L.log) >= minShow or live) and (inReach or live)
                 merged = false
                 clCount = 1
                 if mergeOn
