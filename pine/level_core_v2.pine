@@ -1459,3 +1459,105 @@ plot(fvgAtOte ? 1 : 0,          "st.fvgAtOte",   display=display.data_window)
 plot(pocAtOte ? 1 : 0,          "st.pocAtOte",   display=display.data_window)
 plot(structBias,                "st.structBias", display=display.data_window)
 alertcondition(newBos, "SWINGTECH BOS", "SWINGTECH: new BOS leg formed")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TRADE SIGNALS (plan) — the execution layer. Turns the engine's ingredients
+// into a discrete, non-repainting signal + a concrete entry / SL / TP plan.
+//   ARM      dirVerdict (HTF true direction) must be non-zero — trade only in it.
+//   LOCATION price pulled to the bias-side PROVEN wall, in the right half:
+//              long  = discount (close ≤ Claude Line) AND the bar's low reached
+//                      within entryBandATR×ATR of the proven floor (locLB)
+//              short = premium  AND the bar's high reached the proven ceiling.
+//   STRUCTURE (optional) chart BOS leg agrees with HTF: legDir == dirVerdict.
+//   R:R      (Claude-Line target − entry) / (entry − invalidation) ≥ minRR.
+//   FIRE     rising edge of the ready state on a CONFIRMED bar → fires ONCE.
+//   PLAN     entry = close · SL = sweep-aware invalidation (invLB/invUB) ·
+//            TP1 = Claude Line (locEQ) · TP2 = opposing wall.
+// Only cheap, already-computed, non-repainting state is used (no per-bar FVG/VP
+// rescans), so the arrows are honest on history and never repaint intrabar.
+// ═══════════════════════════════════════════════════════════════════════════
+gSig = "Trade Signals (plan)"
+sigOn        = input.bool(true, "Show trade signals (arrows + active plan)", group=gSig, tooltip="Discrete LONG/SHORT triggers built from the HTF direction + the proven wall + structure. Off = no arrows/plan (the analysis engine still draws).")
+entryBandATR = input.float(0.5, "Entry zone: distance to the wall (× ATR)", minval=0.05, maxval=5.0, step=0.05, group=gSig, tooltip="How close the bar must reach to the proven floor/ceiling to count as 'at the wall'. Wider = earlier, looser entries.")
+reqStruct    = input.bool(true, "Require chart structure (BOS leg) to agree with HTF direction", group=gSig, tooltip="On = only fire when the chart's last BOS leg points the same way as the HTF bias (the SWINGTECH multi-TF alignment). Off = location + R:R alone.")
+minRR        = input.float(1.5, "Minimum reward : risk to fire (Claude-Line target)", minval=0.1, maxval=10.0, step=0.1, group=gSig, tooltip="Reward to the Claude Line vs risk to the invalidation. Filters entries that are already too close to fair value to be worth the stop.")
+showPlan     = input.bool(true, "Draw entry / SL / TP lines for the latest signal", group=gSig)
+sigCol1      = input.color(#26a69a, "Long", inline="sc", group=gSig)
+sigCol2      = input.color(#ef5350, "Short", inline="sc", group=gSig)
+
+sigAtr = drAtr
+
+// READINESS (non-repaint: all inputs are prior-closed HTF reads or latched walls)
+longLoc   = not na(locLB) and not na(locEQ) and close <= locEQ and (low - locLB) <= sigAtr * entryBandATR
+longStr   = not reqStruct or legDir == 1
+longRisk  = na(invLB) ? na : close - invLB
+longRR    = not na(longRisk) and longRisk > 0 ? (locEQ - close) / longRisk : 0.0
+longReady = sigOn and dirVerdict == 1 and longLoc and longStr and longRR >= minRR
+
+shortLoc   = not na(locUB) and not na(locEQ) and close >= locEQ and (locUB - high) <= sigAtr * entryBandATR
+shortStr   = not reqStruct or legDir == -1
+shortRisk  = na(invUB) ? na : invUB - close
+shortRR    = not na(shortRisk) and shortRisk > 0 ? (close - locEQ) / shortRisk : 0.0
+shortReady = sigOn and dirVerdict == -1 and shortLoc and shortStr and shortRR >= minRR
+
+longFire  = barstate.isconfirmed and longReady  and not longReady[1]
+shortFire = barstate.isconfirmed and shortReady and not shortReady[1]
+
+// latch the most recent plan (drawn once, on the last bar — bounded object count)
+var int   sigDir   = 0
+var float sigEntry = na
+var float sigSL    = na
+var float sigTP1   = na
+var float sigTP2   = na
+var float sigRR    = na
+var int   sigBar   = na
+if longFire
+    sigDir := 1
+    sigEntry := close
+    sigSL := invLB
+    sigTP1 := locEQ
+    sigTP2 := locUB
+    sigRR := longRR
+    sigBar := bar_index
+if shortFire
+    sigDir := -1
+    sigEntry := close
+    sigSL := invUB
+    sigTP1 := locEQ
+    sigTP2 := locLB
+    sigRR := shortRR
+    sigBar := bar_index
+
+// arrows mark EVERY historical trigger (cheap, unbounded)
+plotshape(longFire,  "Long signal",  shape.triangleup,   location.belowbar, color.new(sigCol1, 0), size=size.small, text="LONG")
+plotshape(shortFire, "Short signal", shape.triangledown, location.abovebar, color.new(sigCol2, 0), size=size.small, text="SHORT")
+alertcondition(longFire,  "Long signal",  "AI-MI: LONG — HTF bull + price at the proven floor + structure aligned")
+alertcondition(shortFire, "Short signal", "AI-MI: SHORT — HTF bear + price at the proven ceiling + structure aligned")
+plot(longFire ? 1 : shortFire ? -1 : 0, "sig.fire", display=display.data_window)
+plot(sigRR, "sig.plannedRR", display=display.data_window)
+
+// active plan — entry / SL / TP1 / TP2 lines + an R:R label, latest signal only
+var line  planE  = na
+var line  planS  = na
+var line  planT1 = na
+var line  planT2 = na
+var label planLb = na
+if barstate.islast
+    line.delete(planE)
+    line.delete(planS)
+    line.delete(planT1)
+    line.delete(planT2)
+    label.delete(planLb)
+    if showPlan and sigDir != 0 and not na(sigEntry)
+        pcol = sigDir == 1 ? sigCol1 : sigCol2
+        px1 = sigBar
+        px2 = bar_index + 20
+        planE  := line.new(px1, sigEntry, px2, sigEntry, xloc=xloc.bar_index, color=color.new(color.gray, 20), width=2)
+        if not na(sigSL)
+            planS := line.new(px1, sigSL, px2, sigSL, xloc=xloc.bar_index, color=color.new(sigCol2, 20), width=1, style=line.style_dashed)
+        if not na(sigTP1)
+            planT1 := line.new(px1, sigTP1, px2, sigTP1, xloc=xloc.bar_index, color=color.new(sigCol1, 20), width=1, style=line.style_dotted)
+        if not na(sigTP2)
+            planT2 := line.new(px1, sigTP2, px2, sigTP2, xloc=xloc.bar_index, color=color.new(sigCol1, 40), width=1, style=line.style_dashed)
+        planTxt = (sigDir == 1 ? "LONG PLAN" : "SHORT PLAN") + "  R:R " + str.tostring(sigRR, "#.0") + "→CL\nentry " + str.tostring(sigEntry, format.mintick) + "  SL " + str.tostring(sigSL, format.mintick) + "\nTP1 " + str.tostring(sigTP1, format.mintick) + " (Claude)  TP2 " + str.tostring(sigTP2, format.mintick) + " (wall)"
+        planLb := label.new(px2, sigEntry, planTxt, xloc=xloc.bar_index, style=label.style_label_left, color=color.new(pcol, 10), textcolor=color.white, size=size.small)
