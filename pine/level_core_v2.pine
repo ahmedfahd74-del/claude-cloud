@@ -1482,6 +1482,7 @@ entryBandATR = input.float(0.5, "Entry zone: distance to the wall (× ATR)", min
 reqStruct    = input.bool(true, "Require chart structure (BOS leg) to agree with HTF direction", group=gSig, tooltip="On = only fire when the chart's last BOS leg points the same way as the HTF bias (the SWINGTECH multi-TF alignment). Off = location + R:R alone.")
 minRR        = input.float(1.5, "Minimum reward : risk to fire (Claude-Line target)", minval=0.1, maxval=10.0, step=0.1, group=gSig, tooltip="Reward to the Claude Line vs risk to the invalidation. Filters entries that are already too close to fair value to be worth the stop.")
 showPlan     = input.bool(true, "Draw entry / SL / TP lines for the latest signal", group=gSig)
+showReason   = input.bool(true, "Show WHY (filter reason) readout", group=gSig, tooltip="States the FIRST gate blocking a signal — NO BIAS / NO WALL / not at wall / structure not aligned / R:R too low / READY / FIRED — so the chart explains its own silence instead of leaving you to guess. (Idea borrowed from a reviewed engine's filter-reason gauntlet.)")
 sigCol1      = input.color(#26a69a, "Long", inline="sc", group=gSig)
 sigCol2      = input.color(#ef5350, "Short", inline="sc", group=gSig)
 
@@ -1502,6 +1503,57 @@ shortReady = sigOn and dirVerdict == -1 and shortLoc and shortStr and shortRR >=
 
 longFire  = barstate.isconfirmed and longReady  and not longReady[1]
 shortFire = barstate.isconfirmed and shortReady and not shortReady[1]
+
+// ── WHY / filter reason — report the FIRST gate that blocks a signal, in order.
+// Borrowed from the reviewed sr_system brain.py, which states a reason for every
+// no-trade. Answers "why is it quiet?" directly instead of leaving you guessing.
+// codes: 0 fired-long · 1 fired-short · 2 no bias · 3 no wall · 4 not at wall ·
+//        5 structure not aligned · 6 R:R too low · 7 ready(armed) · -1 off
+sigWalls = not na(locLB) and not na(locUB) and not na(locEQ)
+legWord  = legDir == 1 ? "up" : legDir == -1 ? "down" : "flat"
+int    sigWhy = 7
+string sigWhyTxt = na
+if longFire
+    sigWhy := 0
+    sigWhyTxt := "✔ FIRED · LONG"
+else if shortFire
+    sigWhy := 1
+    sigWhyTxt := "✔ FIRED · SHORT"
+else if not sigOn
+    sigWhy := -1
+    sigWhyTxt := "signals off"
+else if dirVerdict == 0
+    sigWhy := 2
+    sigWhyTxt := "◻ NO BIAS · HTF range (stay out)"
+else if not sigWalls
+    sigWhy := 3
+    sigWhyTxt := "◻ NO WALL in reach"
+else if dirVerdict == 1
+    if not longLoc
+        sigWhy := 4
+        sigWhyTxt := "… WAIT · price not at the floor"
+    else if not longStr
+        sigWhy := 5
+        sigWhyTxt := "… WAIT · structure not aligned (leg " + legWord + ")"
+    else if longRR < minRR
+        sigWhy := 6
+        sigWhyTxt := "✖ SKIP · R:R " + str.tostring(longRR, "#.0") + " < " + str.tostring(minRR, "#.0")
+    else
+        sigWhy := 7
+        sigWhyTxt := "▲ READY · LONG (armed — fires on close)"
+else
+    if not shortLoc
+        sigWhy := 4
+        sigWhyTxt := "… WAIT · price not at the ceiling"
+    else if not shortStr
+        sigWhy := 5
+        sigWhyTxt := "… WAIT · structure not aligned (leg " + legWord + ")"
+    else if shortRR < minRR
+        sigWhy := 6
+        sigWhyTxt := "✖ SKIP · R:R " + str.tostring(shortRR, "#.0") + " < " + str.tostring(minRR, "#.0")
+    else
+        sigWhy := 7
+        sigWhyTxt := "▼ READY · SHORT (armed — fires on close)"
 
 // latch the most recent plan (drawn once, on the last bar — bounded object count)
 var int   sigDir   = 0
@@ -1535,6 +1587,7 @@ alertcondition(longFire,  "Long signal",  "AI-MI: LONG — HTF bull + price at t
 alertcondition(shortFire, "Short signal", "AI-MI: SHORT — HTF bear + price at the proven ceiling + structure aligned")
 plot(longFire ? 1 : shortFire ? -1 : 0, "sig.fire", display=display.data_window)
 plot(sigRR, "sig.plannedRR", display=display.data_window)
+plot(sigWhy, "sig.whyCode", display=display.data_window)
 
 // active plan — entry / SL / TP1 / TP2 lines + an R:R label, latest signal only
 var line  planE  = na
@@ -1542,12 +1595,18 @@ var line  planS  = na
 var line  planT1 = na
 var line  planT2 = na
 var label planLb = na
+var label reasonLb = na
 if barstate.islast
     line.delete(planE)
     line.delete(planS)
     line.delete(planT1)
     line.delete(planT2)
     label.delete(planLb)
+    label.delete(reasonLb)
+    // WHY readout — always shows the current gate state (green=ready/fired, orange=wait/skip, gray=no bias)
+    if showReason and sigOn and not na(sigWhyTxt)
+        rcol = sigWhy == 0 ? sigCol1 : sigWhy == 1 ? sigCol2 : sigWhy == 7 ? (dirVerdict == 1 ? sigCol1 : sigCol2) : (sigWhy >= 4 and sigWhy <= 6) ? color.new(#ff9800, 0) : color.new(color.gray, 0)
+        reasonLb := label.new(bar_index + 2, close, "WHY: " + sigWhyTxt, xloc=xloc.bar_index, style=label.style_label_left, color=color.new(rcol, 12), textcolor=color.white, size=size.small)
     if showPlan and sigDir != 0 and not na(sigEntry)
         pcol = sigDir == 1 ? sigCol1 : sigCol2
         px1 = sigBar
