@@ -1,0 +1,343 @@
+// This Pine Script® code is subject to the Mozilla Public License 2.0.
+// © Institutional S/R — Database Architecture
+//
+// INSTITUTIONAL S/R DATABASE ENGINE  (v3.0)
+// A ground-up replacement for the coupled detection/ranking/render engine.
+//
+// DETERMINISM BY CONSTRUCTION (the whole point):
+//   Each higher-timeframe book is built INSIDE its own request.security() call,
+//   so it is computed on that timeframe's OWN bars with that timeframe's OWN
+//   history — never on the chart's bars. request.security therefore returns the
+//   SAME finished book on every chart timeframe. The chart side only MERGES,
+//   RANKS ONCE, picks the Power Line, and DRAWS. The database is the single
+//   source of truth; the renderer is strictly read-only.
+//
+//   Workflow:  build W book → freeze → build D book → freeze → build 4H book →
+//              freeze → merge into one DB → rank once → Power Line from DB →
+//              renderer draws (Max Lines, colours, width, opacity, anchor,
+//              visibility all affect DRAWING ONLY, never the database).
+
+//@version=6
+indicator("Institutional S/R Database  [v3.0]", "IA-SR DB v3.0", overlay = true,
+     max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 5000)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 0 · INPUTS
+// ═══════════════════════════════════════════════════════════════════════════
+gSrc = "Source Timeframes (the institutional book)"
+useW   = input.bool(true,  "Weekly book",  group = gSrc)
+useD   = input.bool(true,  "Daily book",   group = gSrc)
+useH4  = input.bool(true,  "4H book",      group = gSrc)
+useH1  = input.bool(false, "1H book",      group = gSrc)
+tfW    = input.timeframe("W",   "Weekly resolution", group = gSrc)
+tfD    = input.timeframe("D",   "Daily resolution",  group = gSrc)
+tfH4   = input.timeframe("240", "4H resolution",     group = gSrc)
+tfH1   = input.timeframe("60",  "1H resolution",     group = gSrc)
+
+gDet = "Detection (pre-freeze; never moves a confirmed level)"
+pivLen   = input.int(5, "Swing strength (bars each side)", minval = 2, maxval = 30, group = gDet,
+     tooltip = "Fixed per-timeframe fractal leg. Detection is deterministic: a swing confirms pivLen bars after it prints and is then FROZEN. This is a simple constant, so it never repaints or shifts a confirmed level.")
+mergeATR = input.float(0.40, "Merge distance (× TF-ATR)", minval = 0.05, maxval = 2.0, step = 0.05, group = gDet,
+     tooltip = "Two swings within this fraction of the timeframe's own ATR are the SAME level (evidence added, price frozen at first confirmation).")
+brkATR   = input.float(0.30, "Break distance (× TF-ATR)", minval = 0.05, maxval = 2.0, step = 0.05, group = gDet,
+     tooltip = "A timeframe close beyond a level by this much invalidates it (computed on the level's own timeframe, identical on every chart).")
+keepBroken = input.bool(false, "Keep broken levels (dim)", group = gDet)
+
+gRank = "Ranking (computed once on the merged database)"
+wWeekly = input.float(1.00, "Weekly weight", minval = 0.1, maxval = 2.0, step = 0.05, group = gRank)
+wDaily  = input.float(0.80, "Daily weight",  minval = 0.1, maxval = 2.0, step = 0.05, group = gRank)
+wH4     = input.float(0.60, "4H weight",     minval = 0.1, maxval = 2.0, step = 0.05, group = gRank)
+wH1     = input.float(0.45, "1H weight",     minval = 0.1, maxval = 2.0, step = 0.05, group = gRank)
+
+// ─── Visualization (read-only — NEVER changes the database) ───
+gViz = "Display — Max Lines & visibility (read-only)"
+maxLines = input.int(12, "Max Lines (top-ranked drawn)", minval = 1, maxval = 60, group = gViz,
+     tooltip = "Draws the N highest-ranked levels from the database. Lowering it hides weaker lines; the remaining lines never move. The database is unchanged.")
+showW   = input.bool(true, "Show Weekly", inline = "v1", group = gViz)
+showD   = input.bool(true, "Show Daily",  inline = "v1", group = gViz)
+showH4  = input.bool(true, "Show 4H",     inline = "v2", group = gViz)
+showH1  = input.bool(true, "Show 1H",     inline = "v2", group = gViz)
+minRank = input.float(0.0, "Min strength to draw (0-100)", minval = 0.0, maxval = 100.0, group = gViz,
+     tooltip = "Visibility by strength: hide levels whose ranked strength is below this. Display only.")
+
+gStyle = "Display — Style (read-only)"
+colW    = input.color(#d32f2f, "Weekly colour", inline = "c1", group = gStyle)
+colD    = input.color(#ffd700, "Daily colour",  inline = "c1", group = gStyle)
+colH4   = input.color(#2962ff, "4H colour",     inline = "c2", group = gStyle)
+colH1   = input.color(#26a69a, "1H colour",     inline = "c2", group = gStyle)
+lineWid = input.int(2, "Line width", minval = 1, maxval = 6, group = gStyle)
+lineStyleS = input.string("Solid", "Line style", options = ["Solid", "Dashed", "Dotted"], group = gStyle)
+lineTr  = input.int(0, "Line transparency (0 solid, 90 faint)", minval = 0, maxval = 90, group = gStyle)
+anchorS = input.string("Wick", "Anchor (visual only)", options = ["Wick", "Mid", "Body"], group = gStyle,
+     tooltip = "Cosmetic only. Identity is always the wick extreme; this shifts where the line is drawn. Never changes the database, score or ranking.")
+extendS = input.string("Both", "Extend", options = ["Right", "Both", "None"], group = gStyle)
+showLbl = input.bool(true, "Show labels", group = gStyle)
+showZone = input.bool(false, "Zone fill", inline = "z", group = gStyle)
+zoneTr  = input.int(82, "Zone transparency", minval = 40, maxval = 98, inline = "z", group = gStyle)
+
+gPwr = "Power Line (the single controlling level)"
+showPower = input.bool(true, "Show Power Line", group = gPwr)
+colPower  = input.color(#ffffff, "Power Line colour", group = gPwr)
+pwrWid    = input.int(3, "Power Line width", minval = 1, maxval = 6, group = gPwr)
+
+gDash = "Dashboard"
+showDash = input.bool(true, "Show database dashboard", group = gDash)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 1 · PER-TIMEFRAME BOOK BUILDER  (runs INSIDE request.security on its own TF)
+// ═══════════════════════════════════════════════════════════════════════════
+// Detects swings on THIS timeframe's bars, merges them into a frozen level set
+// (price never moves after first confirmation), marks breaks on this TF's own
+// closes, and tracks touch evidence. Returns parallel arrays. Because it runs
+// in the security context, the result is identical regardless of chart TF.
+MAXBOOK = 24
+
+f_buildBook() =>
+    var array<float> bp = array.new<float>()   // frozen identity price (wick)
+    var array<float> bb = array.new<float>()   // body edge (display anchor only)
+    var array<int>   bs = array.new<int>()     // 1 = resistance, 0 = support
+    var array<float> bt = array.new<float>()   // touch evidence
+    var array<bool>  bk = array.new<bool>()    // broken
+    var array<int>   bi = array.new<int>()     // birth bar (this TF)
+    a  = ta.atr(14)
+    md = a * mergeATR
+    bf = a * brkATR
+    ph = ta.pivothigh(pivLen, pivLen)
+    pl = ta.pivotlow(pivLen, pivLen)
+    bodyHi = math.max(open[pivLen], close[pivLen])
+    bodyLo = math.min(open[pivLen], close[pivLen])
+    // add a confirmed swing high (resistance) — merge = evidence only, no move
+    if not na(ph)
+        merged = false
+        if bp.size() > 0
+            for i = 0 to bp.size() - 1
+                if bs.get(i) == 1 and not bk.get(i) and math.abs(bp.get(i) - ph) <= md
+                    bt.set(i, bt.get(i) + 1.0)
+                    merged := true
+                    break
+        if not merged
+            bp.push(ph), bb.push(bodyHi), bs.push(1), bt.push(1.0), bk.push(false), bi.push(bar_index)
+    if not na(pl)
+        merged = false
+        if bp.size() > 0
+            for i = 0 to bp.size() - 1
+                if bs.get(i) == 0 and not bk.get(i) and math.abs(bp.get(i) - pl) <= md
+                    bt.set(i, bt.get(i) + 1.0)
+                    merged := true
+                    break
+        if not merged
+            bp.push(pl), bb.push(bodyLo), bs.push(0), bt.push(1.0), bk.push(false), bi.push(bar_index)
+    // touches + breaks on THIS timeframe's bars (identical on every chart)
+    if bp.size() > 0
+        for i = 0 to bp.size() - 1
+            if not bk.get(i)
+                lvl = bp.get(i)
+                res = bs.get(i) == 1
+                // touch: wick reaches the level
+                if high >= lvl - bf and low <= lvl + bf
+                    bt.set(i, bt.get(i) + 0.25)
+                // break: close beyond by the buffer → invalidated on its own TF
+                if (res and close > lvl + bf) or (not res and close < lvl - bf)
+                    bk.set(i, true)
+    // bound memory: drop the weakest (fewest touches) broken/old level if over cap
+    if bp.size() > MAXBOOK
+        worst = 0
+        wv = 1.0e18
+        for i = 0 to bp.size() - 1
+            sc = bt.get(i) - (bk.get(i) ? 100.0 : 0.0)
+            if sc < wv
+                wv := sc
+                worst := i
+        bp.remove(worst), bb.remove(worst), bs.remove(worst), bt.remove(worst), bk.remove(worst), bi.remove(worst)
+    [bp, bb, bs, bt, bk]
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 2 · FETCH EACH FROZEN BOOK  (one security call per TF — chart-independent)
+// ═══════════════════════════════════════════════════════════════════════════
+[wP, wB, wS, wT, wK]     = request.security(syminfo.tickerid, tfW,  f_buildBook(), lookahead = barmerge.lookahead_off)
+[dP, dB, dS, dT, dK]     = request.security(syminfo.tickerid, tfD,  f_buildBook(), lookahead = barmerge.lookahead_off)
+[h4P, h4B, h4S, h4T, h4K] = request.security(syminfo.tickerid, tfH4, f_buildBook(), lookahead = barmerge.lookahead_off)
+[h1P, h1B, h1S, h1T, h1K] = request.security(syminfo.tickerid, tfH1, f_buildBook(), lookahead = barmerge.lookahead_off)
+
+// Chart-INDEPENDENT reference ATR for all database decisions (cross-TF merge,
+// Power-Line proximity, zone width). Read from the Daily timeframe via security
+// so it is identical on every chart — the DB never sees chart-timeframe ATR.
+atrDaily = request.security(syminfo.tickerid, tfD, ta.atr(14), lookahead = barmerge.lookahead_off)
+atrChart = ta.atr(14)
+atrRef   = na(atrDaily) or atrDaily <= 0 ? (na(atrChart) ? close * 0.005 : atrChart) : atrDaily
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 3 · MERGE INTO ONE DATABASE + RANK ONCE  (read-only; rebuilt each bar cheaply)
+// ═══════════════════════════════════════════════════════════════════════════
+// Merge order Weekly → Daily → 4H → 1H: a lower-TF level within merge distance
+// of an already-present higher-TF level is dropped (the HTF object wins). The
+// database therefore has one object per institutional level, ranked once.
+var array<float> DBp   = array.new<float>()
+var array<float> DBb   = array.new<float>()
+var array<int>   DBs   = array.new<int>()
+var array<float> DBrk  = array.new<float>()   // ranked strength 0-100
+var array<int>   DBtf  = array.new<int>()     // 3 W, 2 D, 1 H4, 0 H1
+var array<bool>  DBbk  = array.new<bool>()
+
+f_norm(float v) => v / (v + 3.0)
+
+f_dbHas(float px) =>
+    hit = false
+    if DBp.size() > 0
+        for i = 0 to DBp.size() - 1
+            if math.abs(DBp.get(i) - px) <= atrRef * mergeATR
+                hit := true
+                break
+    hit
+
+f_ingest(bool use, array<float> p, array<float> b, array<int> s, array<float> t, array<bool> k, float w, int tf) =>
+    if use and not na(p) and p.size() > 0
+        for i = 0 to p.size() - 1
+            px = p.get(i)
+            if not f_dbHas(px)
+                // ranked strength: touch evidence (0..~1) × TF weight → 0-100
+                rk = math.min(100.0, (0.35 + 0.65 * f_norm(t.get(i))) * w * 100.0)
+                DBp.push(px), DBb.push(b.get(i)), DBs.push(s.get(i))
+                DBrk.push(rk), DBtf.push(tf), DBbk.push(k.get(i))
+
+// Rebuild the merged DB each bar from the frozen HTF books (cheap, deterministic).
+DBp.clear(), DBb.clear(), DBs.clear(), DBrk.clear(), DBtf.clear(), DBbk.clear()
+f_ingest(useW,  wP,  wB,  wS,  wT,  wK,  wWeekly, 3)
+f_ingest(useD,  dP,  dB,  dS,  dT,  dK,  wDaily,  2)
+f_ingest(useH4, h4P, h4B, h4S, h4T, h4K, wH4,     1)
+f_ingest(useH1, h1P, h1B, h1S, h1T, h1K, wH1,     0)
+
+// Nth-highest rank threshold for the Max-Lines display filter (read-only).
+f_rankThresh(int n) =>
+    tmp = array.new<float>()
+    if DBp.size() > 0
+        for i = 0 to DBp.size() - 1
+            if not DBbk.get(i)
+                tmp.push(DBrk.get(i))
+    thr = -1.0
+    if tmp.size() > n and n > 0
+        tmp.sort(order.descending)
+        thr := tmp.get(n - 1)
+    thr
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 4 · POWER LINE  (the single controlling level, chosen from the database)
+// ═══════════════════════════════════════════════════════════════════════════
+// Highest institutional rank weighted by proximity to price — computed ONLY
+// from the frozen database, so it is the same line on every chart timeframe.
+f_power() =>
+    bestI = -1
+    bestV = -1.0
+    if DBp.size() > 0
+        for i = 0 to DBp.size() - 1
+            if not DBbk.get(i)
+                d = math.abs(close - DBp.get(i)) / atrRef
+                v = DBrk.get(i) * (1.0 / (1.0 + 0.15 * d))
+                if v > bestV
+                    bestV := v
+                    bestI := i
+    bestI
+powerI = f_power()
+powerPrice = powerI >= 0 ? DBp.get(powerI) : na
+powerRes   = powerI >= 0 ? DBs.get(powerI) == 1 : false
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 5 · RENDERER  (READ-ONLY — draws from the database; never mutates it)
+// ═══════════════════════════════════════════════════════════════════════════
+anchorA = anchorS == "Body" ? 1.0 : anchorS == "Mid" ? 0.5 : 0.0
+f_dispY(float px, float body, bool res) =>
+    px * (1.0 - anchorA) + body * anchorA
+f_lstyle(string s) => s == "Dashed" ? line.style_dashed : s == "Dotted" ? line.style_dotted : line.style_solid
+lStyle = f_lstyle(lineStyleS)
+extMode = extendS == "Both" ? extend.both : extendS == "Right" ? extend.right : extend.none
+f_tfCol(int tf) => tf == 3 ? colW : tf == 2 ? colD : tf == 1 ? colH4 : colH1
+f_tfShow(int tf) => tf == 3 ? showW : tf == 2 ? showD : tf == 1 ? showH4 : showH1
+
+var array<line>  drawn   = array.new<line>()
+var array<label> drawnLb = array.new<label>()
+var array<box>   drawnBx = array.new<box>()
+var line powerLn = na
+var label powerLb = na
+
+if barstate.islast
+    // clear previous frame (drawing objects only — DB untouched)
+    if drawn.size() > 0
+        for i = 0 to drawn.size() - 1
+            line.delete(drawn.get(i))
+    if drawnLb.size() > 0
+        for i = 0 to drawnLb.size() - 1
+            label.delete(drawnLb.get(i))
+    if drawnBx.size() > 0
+        for i = 0 to drawnBx.size() - 1
+            box.delete(drawnBx.get(i))
+    drawn.clear(), drawnLb.clear(), drawnBx.clear()
+
+    thr = f_rankThresh(maxLines)
+    x1 = bar_index - 1
+    x2 = bar_index + 1
+    if DBp.size() > 0
+        for i = 0 to DBp.size() - 1
+            broken = DBbk.get(i)
+            tf     = DBtf.get(i)
+            rk     = DBrk.get(i)
+            show   = f_tfShow(tf) and rk >= minRank and (thr < 0 or rk >= thr) and (not broken or keepBroken)
+            if show
+                lvl  = DBp.get(i)
+                dy   = f_dispY(lvl, DBb.get(i), DBs.get(i) == 1)
+                col  = broken ? color.new(color.gray, 40) : color.new(f_tfCol(tf), lineTr)
+                ln = line.new(x1, dy, x2, dy, xloc = xloc.bar_index, extend = extMode,
+                     color = col, width = lineWid, style = broken ? line.style_dashed : lStyle)
+                drawn.push(ln)
+                if showZone and not broken
+                    half = atrRef * 0.15
+                    bx = box.new(x1, lvl + half, x2, lvl - half, xloc = xloc.bar_index,
+                         extend = extMode, border_color = color.new(f_tfCol(tf), 100),
+                         bgcolor = color.new(f_tfCol(tf), zoneTr))
+                    drawnBx.push(bx)
+                if showLbl
+                    tag = (tf == 3 ? "W" : tf == 2 ? "D" : tf == 1 ? "4H" : "1H") + " " + (DBs.get(i) == 1 ? "R" : "S") + " " + str.tostring(math.round(rk))
+                    lb = label.new(x2, dy, tag, xloc = xloc.bar_index, style = label.style_label_left,
+                         color = color.new(f_tfCol(tf), 20), textcolor = color.white, size = size.small)
+                    drawnLb.push(lb)
+
+    // Power Line — single controlling level, drawn from the DB pick
+    if not na(powerLn)
+        line.delete(powerLn)
+        powerLn := na
+    if not na(powerLb)
+        label.delete(powerLb)
+        powerLb := na
+    if showPower and not na(powerPrice)
+        powerLn := line.new(x1, powerPrice, x2, powerPrice, xloc = xloc.bar_index, extend = extend.both,
+             color = colPower, width = pwrWid, style = line.style_solid)
+        powerLb := label.new(x2, powerPrice, "⚡ POWER " + str.tostring(powerPrice, format.mintick) + " · " + (powerRes ? "R" : "S"),
+             xloc = xloc.bar_index, style = label.style_label_left, color = colPower, textcolor = color.black, size = size.normal)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 6 · DASHBOARD  (reads the database — does not build anything)
+// ═══════════════════════════════════════════════════════════════════════════
+var table dash = table.new(position.top_right, 2, 6, bgcolor = color.new(#0a1a3a, 15),
+     border_width = 1, border_color = color.new(color.gray, 60))
+if showDash and barstate.islast
+    liveN = 0
+    if DBp.size() > 0
+        for i = 0 to DBp.size() - 1
+            if not DBbk.get(i)
+                liveN += 1
+    table.cell(dash, 0, 0, "IA-SR DB v3.0", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 0, str.tostring(liveN) + " levels", text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 1, "Weekly", text_color = colW, text_size = size.small)
+    table.cell(dash, 1, 1, str.tostring(na(wP) ? 0 : wP.size()), text_color = color.silver, text_size = size.small)
+    table.cell(dash, 0, 2, "Daily", text_color = colD, text_size = size.small)
+    table.cell(dash, 1, 2, str.tostring(na(dP) ? 0 : dP.size()), text_color = color.silver, text_size = size.small)
+    table.cell(dash, 0, 3, "4H", text_color = colH4, text_size = size.small)
+    table.cell(dash, 1, 3, str.tostring(na(h4P) ? 0 : h4P.size()), text_color = color.silver, text_size = size.small)
+    table.cell(dash, 0, 4, "Drawn ≤", text_color = color.gray, text_size = size.small)
+    table.cell(dash, 1, 4, str.tostring(maxLines), text_color = color.silver, text_size = size.small)
+    table.cell(dash, 0, 5, "Power", text_color = colPower, text_size = size.small)
+    table.cell(dash, 1, 5, na(powerPrice) ? "—" : str.tostring(powerPrice, format.mintick), text_color = color.white, text_size = size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 7 · ALERTS
+// ═══════════════════════════════════════════════════════════════════════════
+alertcondition(showPower and not na(powerPrice) and na(powerPrice[1]), "Power Line set", "Institutional Power Line established")

@@ -1,0 +1,8 @@
+# .claude_memory — pointer
+
+The full, maintained project state lives in:  **pine/PROJECT_STATE.md**
+
+Read that file first every session. It has: the 2 freeze-candidate files
+(pine/level_core_v2.pine, pine/ms_core.pine), each module's status, the
+validators, the frozen scoring/bias intent, open follow-ups, the desk/SMC
+glossary, and working agreements. Keep it updated as modules freeze.

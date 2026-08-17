@@ -1,0 +1,2860 @@
+//@version=6
+// =============================================================================
+//  INSTITUTIONAL ADAPTIVE SUPPORT & RESISTANCE ENGINE  —  Pine Script v6
+//  Modular institutional build. See sr_engine_ARCHITECTURE.md for the full map.
+// -----------------------------------------------------------------------------
+//  BUILD STATUS
+//    [x] Phase 1  Util + Adaptive Engine + Dashboard stub
+//    [x] Phase 2  Swing Engine (adaptive pivot) + HTF fetch   <-- THIS FILE
+//    [x] Phase 3  Level store + Support/Resistance + auto-clean   <-- THIS FILE
+//    [x] Phase 4  Scoring + Confluence + fade-by-score   <-- THIS FILE
+//    [x] Phase 5  Liquidity/SMC (EQH/EQL, sweeps, FVG, order blocks)   <-- THIS FILE
+//    [x] Phase 6  Visualization polish
+//    [x] Phase 7  Decision Engine (Market State classifier)
+//    [x] Phase 8  Probability & Trade-Quality Engine
+//    [x] Phase 9  Performance / Self-Review Engine
+//    [x] Phase 10 Professional Dashboard
+//    [x] Phase 14 Institutional Trade Execution Engine
+//    [x] Phase 15 Diagnostic + MTF/Multi-Symbol Scanners
+//    [x] Phase 16 Alert Engine + JSON Data Export (Pine → Python bridge)
+// -----------------------------------------------------------------------------
+//  CODE LAYERS (Python-migration boundaries)
+//    PURE CALC : Sections 2-5, 8-9 helpers  — stateless math, direct port
+//    DECISION  : Sections 10-12, 14 (plan)  — consumes calc outputs only
+//    VISUAL    : Sections 13, 14 (render), 15 — Pine-only, never ported
+// =============================================================================
+
+indicator("Institutional Adaptive S/R Engine  [v2.1.1 · 2026-07-06]", "IA-SR", overlay = true,
+     max_lines_count = 200, max_labels_count = 200, max_boxes_count = 250)
+
+// BUILD TAG — bumped every release. Shows in the indicator title on the chart
+// (top-left) and on the dashboard's top row, so you can always confirm the
+// running version. If this differs from the tag I quote in chat, you're on an
+// old copy — re-paste the file I attached. Keep this in sync with the title.
+BUILD = "v4.0.0-UNIDATA · 2026-07-17"
+
+// #############################################################################
+// # SECTION 1 — INPUTS
+// #############################################################################
+grpMode = "Engine Mode"
+engineMode = input.string("Adaptive (Auto)", "Market Sensitivity Mode", group = grpMode,
+     options = ["Adaptive (Auto)", "Conservative", "Balanced", "Aggressive", "Ultra Aggressive"],
+     tooltip = "Adaptive (Auto) derives strictness live from volatility, regime, liquidity and market noise — recommended. The named presets are manual overrides. Affects ONLY trade filtering and probability thresholds; S/R levels are never changed by this setting.")
+
+grpAdapt = "Adaptive Engine (auto — leave default)"
+sensBias = input.float(1.0, "Sensitivity Bias", minval = 0.5, maxval = 2.0, step = 0.1,
+     group = grpAdapt,
+     tooltip = "Global nudge on adaptive sensitivity. 1.0 = fully automatic. Only touch if you want the engine broadly tighter/looser.")
+
+grpSR2 = "S/R Engine (manual overrides — leave 1.0 for auto)"
+lvlSens    = input.float(1.0, "Level Sensitivity ×",              minval = 0.5,  maxval = 2.0, step = 0.1,  group = grpSR2, tooltip = "Higher = shorter adaptive pivot legs = more levels.")
+touchWMult = input.float(1.0, "Touch Weight ×",                   minval = 0.2,  maxval = 3.0, step = 0.1,  group = grpSR2)
+reactWMult = input.float(1.0, "Reaction Weight ×",                minval = 0.2,  maxval = 3.0, step = 0.1,  group = grpSR2)
+brkConf    = input.float(1.0, "Break Confirmation Strength ×",    minval = 0.5,  maxval = 2.5, step = 0.1,  group = grpSR2, tooltip = "Higher = a close must travel further beyond a level to count as a break.")
+zoneScale  = input.float(1.0, "Zone Width ×",                     minval = 0.3,  maxval = 3.0, step = 0.1,  group = grpSR2)
+decaySpd   = input.float(1.0, "Time Decay Speed ×",               minval = 0.25, maxval = 4.0, step = 0.25, group = grpSR2, tooltip = "Higher = untouched levels lose freshness faster.")
+htfInfl    = input.float(1.0, "HTF Confluence Influence ×",       minval = 0.3,  maxval = 2.5, step = 0.1,  group = grpSR2)
+ltfNoise   = input.float(1.0, "LTF Noise Filter ×",               minval = 0.5,  maxval = 2.0, step = 0.1,  group = grpSR2, tooltip = "Higher = 15m/5m levels carry less weight in scoring and confluence.")
+
+grpProb2 = "Probability Engine (manual overrides — leave 1.0 for auto)"
+wStruct = input.float(1.0, "Trend / Structure Weight ×",  minval = 0.0, maxval = 2.0, step = 0.1, group = grpProb2)
+wSRW    = input.float(1.0, "S/R Weight ×",                minval = 0.0, maxval = 2.0, step = 0.1, group = grpProb2)
+wLiq    = input.float(1.0, "Liquidity / SMC Weight ×",    minval = 0.0, maxval = 2.0, step = 0.1, group = grpProb2)
+wMom    = input.float(1.0, "Momentum Weight ×",           minval = 0.0, maxval = 2.0, step = 0.1, group = grpProb2)
+volAdjF = input.float(0.5, "Volatility Dampening",        minval = 0.0, maxval = 1.0, step = 0.1, group = grpProb2, tooltip = "Shrinks probability edge when volatility expands beyond normal (uncertainty discount).")
+
+// Detection sensitivity: MANUAL overrides only (sensBias × lvlSens). The
+// Engine Mode deliberately has no path into swing detection or the level
+// book — levels are facts; mode only changes filtering and probability.
+detSens   = sensBias * lvlSens
+
+grpTF = "Higher-Timeframe Sources"
+useMN = input.bool(false, "Monthly", group = grpTF, inline = "tf")
+useW  = input.bool(true,  "Weekly",  group = grpTF, inline = "tf")
+useD  = input.bool(true,  "Daily",   group = grpTF, inline = "tf")
+useH4 = input.bool(true,  "4 Hour",  group = grpTF, inline = "tf")
+useH1 = input.bool(true,  "1 Hour",  group = grpTF, inline = "tf")
+useM15 = input.bool(true, "15 Min",  group = grpTF, inline = "tf2")
+useM5  = input.bool(true, "5 Min",   group = grpTF, inline = "tf2")
+htfOnly = input.bool(true, "HTF-Only (hide timeframes below the chart)", group = grpTF,
+     tooltip = "On (default): only levels from the current chart TF and higher. TradingView SAMPLES sub-chart timeframe data (e.g. 15m data requested on a 1h chart), which creates phantom low-quality levels — keep this on unless you know why you need it off.")
+
+grpLvl = "Levels"
+maxRefLines  = input.int(12, "Max Reference Lines (strongest kept)", minval = 1, maxval = 12, group = grpLvl,
+     tooltip = "How many reference ZONES to draw. Nearby levels are first clustered into one zone (see Zone Cluster Width); zones are ranked by COMBINED test count and the strongest kept. Set to 1 to show only the single strongest zone.")
+clusterBandATR = input.float(0.5, "Zone Cluster Width (Daily ATR)", minval = 0.0, maxval = 3.0, step = 0.1, group = grpLvl,
+     tooltip = "Reference levels closer together than this (in native Daily ATR) are merged into ONE zone, drawn at the test-weighted center, with strength = the SUM of the cluster's touches — so a dense band of repeatedly-tested levels ranks as one strong zone. 0 = no clustering (each level separate).")
+// STRUCTURE vs LIQUIDITY styling. Structural = prior-period extremes (PDH/PWH/PML…),
+// the settled levels. Liquidity = the CURRENT period's developing high/low (CDH/CDL/
+// CWH…) — where resting stops sit and price gets drawn before continuing. Default:
+// structure solid, liquidity dotted → the lean "structure + dotted liquidity" look.
+showLiq      = input.bool(true, "Show liquidity lines (current-period H/L)", group = grpLvl,
+     tooltip = "Draws the developing period's high/low as liquidity lines. Off = only the settled structural levels (leanest view).")
+styleStruct  = input.string("Solid",  "Structural line style", options = ["Solid", "Dashed", "Dotted"], group = grpLvl)
+styleLiq     = input.string("Dotted", "Liquidity line style",  options = ["Solid", "Dashed", "Dotted"], group = grpLvl)
+maxLvl       = input.int(8, "Max Levels per Timeframe (detected book only)", minval = 1, maxval = 20, group = grpLvl,
+     tooltip = "Only affects the optional detected swing book (off by default). Does NOT limit the reference lines — use 'Max Reference Lines' above for those.")
+// Label clutter control (display only). Shortens label text and, for the reference
+// lines, horizontally staggers vertically-close labels so they never overlap.
+labelMode    = input.string("Compact", "Label Detail", options = ["Full", "Compact", "Price only", "Off"], group = grpLvl,
+     tooltip = "Full = grade/side/price/ICS/reasons. Compact = side + price (+ICS). Price only = just the price. Off = no text (lines only). Reduces clutter when many lines are shown.")
+labelDeclutter = input.bool(true, "Hide overlapping labels", group = grpLvl,
+     tooltip = "ON (default): all labels sit frozen at the same far-right column; any that would overlap a nearer one is hidden (its line still shows) so the labels never collide. OFF: show every label (may overlap when levels are close).")
+labelGapATR  = input.float(0.6, "Label Min Gap (Daily ATR)", minval = 0.1, maxval = 3.0, step = 0.1, group = grpLvl,
+     tooltip = "Labels closer together than this (in native Daily ATR) are collapsed — only the first is shown — so text never overlaps.")
+labelOffset  = input.int(10, "Label Right Offset (bars)", minval = 0, maxval = 200, group = grpLvl,
+     tooltip = "Pushes the on-line labels to the right of the last candle, into the chart margin. Higher = further right.")
+labelSize    = input.string("Small", "Label Size", options = ["Tiny", "Small", "Normal", "Large"], group = grpLvl)
+lblSz = labelSize == "Tiny" ? size.tiny : labelSize == "Normal" ? size.normal : labelSize == "Large" ? size.large : size.small
+// LEVEL ADJUSTMENT — refines only the DRAWN position of a line. It NEVER changes the
+// institutional level identity, the Power selection, merge logic, ICS, or the
+// deterministic cross-TF behaviour (the raw level is always what is selected/scored;
+// only where the line is painted is snapped, by a deterministic, chart-independent
+// function of the raw price). Default None = raw levels, unchanged.
+levelAdjust  = input.string("None", "Level Adjustment (drawn position only)", options = ["None", "Nearest Round Number", "Nearest Psychological Level", "Highest Touch Level"], group = grpLvl,
+     tooltip = "None = raw. Round/Psychological = snap the drawn line to the nearest round / .00-.50 level. Highest Touch = snap to the most-tested price within the window. Identity, selection, ICS and determinism are untouched — display only.")
+adjATRWin    = input.float(0.5, "Adjustment Window (Daily ATR)", minval = 0.1, maxval = 3.0, step = 0.1, group = grpLvl,
+     tooltip = "For 'Highest Touch Level': how far from the raw level (in native Daily ATR) to search for a more-tested price.")
+minTouches   = input.int(0, "Min Touches to Show Level", minval = 0, maxval = 20, group = grpLvl,
+     tooltip = "0 = show all. Higher = only show levels price has reacted to at least this many times (proven S/R).")
+anchorMode   = input.string("Wick", "Level Anchor (visual only)", options = ["Wick", "Wick/Body Mid", "Body"], group = grpLvl,
+     tooltip = "COSMETIC ONLY. The institutional level is always the wick extreme — its identity, score, ranking, confluence and the Power Line never change. This just shifts where the line is DRAWN toward the candle interior (Mid / Body). It can no longer create, move, or rebuild levels.")
+showZones    = input.bool(false, "Show Zones (bands around levels)", group = grpLvl,
+     tooltip = "Draws a faint supply/demand band around each level. Width scales with HTF ATR and the adaptive zone multiplier.")
+zoneWidthK   = input.float(0.15, "Zone Width × HTF-ATR", minval = 0.02, maxval = 1.0, step = 0.01, group = grpLvl)
+brkMode      = input.string("Keep", "Broken Level Behaviour", options = ["Keep", "Dim", "Remove"], group = grpLvl,
+     tooltip = "Keep = line never changes/disappears (stable). Dim = dashed grey after break. Remove = delete on break (auto-clean).")
+colBrk       = input.color(color.new(#787b86, 35), "Broken Level Color (Dim mode)", group = grpLvl)
+
+grpClar = "Chart Clarity (fewer, stronger, non-overlapping lines)"
+clarityOn   = input.bool(true, "Enable Chart Clarity", group = grpClar,
+     tooltip = "Display-only. Fills the level budget by RELEVANCE (strength × proximity) so a small count shows the levels that matter now, collapses nearby levels to the single strongest representative, and hides levels far from price. Never changes the level book, scores, or the hash.")
+clarNearK   = input.float(0.5,  "Proximity weight (relevance)", minval = 0.0, maxval = 3.0, step = 0.1, group = grpClar,
+     tooltip = "How strongly nearness to price is favoured when choosing which levels to draw. 0 = pure strength; higher = prefer levels close to price.")
+clusterATRk = input.float(0.50, "Cluster distance (× Daily ATR)", minval = 0.0, maxval = 3.0, step = 0.05, group = grpClar,
+     tooltip = "A level within this of an already-shown stronger / higher-timeframe level is hidden — nearby levels collapse to one representative. 0 = off.")
+hideFarATRk = input.float(6.0,  "Hide levels beyond (× Daily ATR)", minval = 0.0, maxval = 30.0, step = 0.5, group = grpClar,
+     tooltip = "Hide any level farther than this many Daily-ATR from current price. 0 = show every distance.")
+
+grpStyle = "Line Styles (per timeframe)"
+styleMN = input.string("Solid", "Monthly", options = ["Solid", "Dashed", "Dotted"], group = grpStyle, inline = "s1")
+styleW  = input.string("Solid", "Weekly",  options = ["Solid", "Dashed", "Dotted"], group = grpStyle, inline = "s1")
+styleD  = input.string("Solid", "Daily",   options = ["Solid", "Dashed", "Dotted"], group = grpStyle, inline = "s2")
+styleH4 = input.string("Solid", "4 Hour",  options = ["Solid", "Dashed", "Dotted"], group = grpStyle, inline = "s2")
+styleH1 = input.string("Solid", "1 Hour",  options = ["Solid", "Dashed", "Dotted"], group = grpStyle, inline = "s3")
+styleM15 = input.string("Solid", "15 Min", options = ["Solid", "Dashed", "Dotted"], group = grpStyle, inline = "s4")
+styleM5  = input.string("Solid", "5 Min",  options = ["Solid", "Dashed", "Dotted"], group = grpStyle, inline = "s4")
+
+// Global appearance — DISPLAY ONLY (never affects the level book or scoring).
+grpViz = "Line Appearance (visual only)"
+lineWidth   = input.int(2, "Line width", minval = 1, maxval = 6, group = grpViz)
+lineOpacity = input.int(0, "Line transparency (0 = solid, 90 = faint)", minval = 0, maxval = 95, group = grpViz)
+zoneOpacity = input.int(80, "Zone fill transparency", minval = 40, maxval = 98, group = grpViz,
+     tooltip = "Only applies when Show Zones is on. Higher = fainter fill.")
+
+grpPower = "Power Line"
+// INSTITUTIONAL REFERENCE LINES — the cross-TF-identical MTF set (prev D/W/M
+// extremes + confirmed HTF swings), drawn at their current single-security values.
+// On by default; the history-dependent detected swing book is OFF by default so
+// the chart shows only levels that are identical on every timeframe.
+showRefLines    = input.bool(true,  "Institutional reference lines (identical on every TF)", group = grpPower,
+     tooltip = "Draws PDH/PDL, PWH/PWL, PMH/PML and the last confirmed Daily/Weekly/Monthly swings at their exact prices. Each is a single higher-timeframe value, so these lines are byte-identical on a 1m and a 1D chart — the institutional MTF reference set.")
+showDetectedBook = input.bool(false, "Also show detected swing book (per-chart)", group = grpPower,
+     tooltip = "The auto-detected pivot levels. These depend on how much history each chart timeframe loads, so they are NOT identical across timeframes — off by default. Turn on for extra per-chart detail.")
+// PERFORMANCE: the detected-book pipeline (seed + per-bar merge scans + confluence
+// scoring across 7 stores) is the heavy part. It is DISABLED unless the book is
+// shown or the Determinism HUD (which needs the full history) is on — so the default
+// chart (reference lines + Power) is fast. Debug toggles default OFF for the same
+// reason; turn them on only when needed (they slow the recalc).
+showDetHUD   = input.bool(false, "DEBUG: Determinism HUD (heavy — needs book)", group = grpPower,
+     tooltip = "Read-only hash + freeze/replay test of the level identities. Requires the full book pipeline, so it slows the recalc. Off by default.")
+showPwrTrace = input.bool(false, "DEBUG: Power Decision trace", group = grpPower,
+     tooltip = "Per-stage fingerprints of the Power decision. Off by default.")
+bookActive   = showDetectedBook or showDetHUD
+colRefRes       = input.color(color.new(#ef5350, 0), "Line Color — ABOVE price", group = grpPower)
+colRefSup       = input.color(color.new(#26a69a, 0), "Line Color — BELOW price", group = grpPower)
+colorByPos      = input.bool(true, "Color lines by price position (red above / green below)", group = grpPower,
+     tooltip = "On: every line above current price is red and every line below is green, regardless of its type. Off: colour by type (resistance red / support green).")
+showPowerLine = input.bool(true, "Show Power Line", group = grpPower,
+     tooltip = "A single line marking the nearest turning point where price is expected to flip back into the dominant HTF trend. Overall bear → nearest resistance above; overall bull → nearest support below. Does not touch the main S/R lines.")
+colPower      = input.color(color.new(#ffd600, 0), "Power Line Color", group = grpPower)
+powerWidth    = input.int(2, "Power Line Width", minval = 1, maxval = 6, group = grpPower)
+// TOUCH / TEST STRENGTH — a level tested repeatedly (high/low many times across
+// recent D/W/M history) earns more Power. Counted from NATIVE, un-clamped period
+// extremes so the strength is identical on every chart TF (does not break the
+// cross-TF determinism). Toggle off for exact v3.0 selection.
+powerTouchOn   = input.bool(true,  "Weight Power by touches / tests", group = grpPower,
+     tooltip = "A candidate that has been a Daily/Weekly/Monthly high or low many times (a repeatedly tested level) is boosted. Counted from native period extremes, so it stays identical on every chart timeframe.")
+powerTouchInfl = input.float(0.6, "Touch Influence", minval = 0.0, maxval = 2.0, step = 0.1, group = grpPower,
+     tooltip = "How strongly the test count boosts the Power ranking. 0 = ignore touches (v3.0 behaviour); higher = a well-tested level dominates a merely-close one.")
+touchBandK     = input.float(0.25, "Touch Cluster Band (Daily ATR)", minval = 0.05, maxval = 1.0, step = 0.05, group = grpPower,
+     tooltip = "How close a historical high/low must be to a level to count as a test of it, in native Daily ATR.")
+powerRadius   = input.float(8.0, "Search Radius (Daily ATR)", minval = 1.0, maxval = 30.0, step = 0.5, group = grpPower,
+     tooltip = "How far from price the engine may look for its highest-confidence level. Measured in DAILY ATR so the Power Line is the same level on every chart timeframe.")
+powerMinSc    = input.int(60, "Min Level Score", minval = 0, maxval = 100, group = grpPower)
+powerShowStat = input.bool(true, "Show Status Intelligence", group = grpPower,
+     tooltip = "Adds respect / break-likely / retest-likely and next-action readout to the Power label.")
+powerTrendSide = input.bool(true, "Favor Trend-Side Level (bounce / retest logic)", group = grpPower,
+     tooltip = "On (default): with a BULL HTF bias the Power Line prefers the demand level BELOW price that a bounce launches from (breakout-retest); BEAR prefers the supply level above. Off: pure nearest-strongest regardless of side.")
+powerSideBias  = input.float(1.6, "Trend-Side Strength", minval = 1.0, maxval = 3.0, step = 0.1, group = grpPower,
+     tooltip = "How strongly the trend side is favored. 1.0 = no preference; higher = the launch level below (in a bull trend) wins even when an overhead level is closer.")
+
+grpSMC = "Liquidity / SMC"
+showFVGZones = input.bool(false, "Draw FVG (imbalance) Zones", group = grpSMC,
+     tooltip = "Off (default) keeps the chart clean — SMC still feeds the confidence score.")
+showOBZones  = input.bool(false, "Draw Order-Block Zones", group = grpSMC)
+colFVG       = input.color(color.new(#ffb300, 78), "FVG (imbalance) Zone", group = grpSMC)
+colOBbull    = input.color(color.new(#26a69a, 80), "Bullish Order Block",  group = grpSMC)
+colOBbear    = input.color(color.new(#ef5350, 80), "Bearish Order Block",  group = grpSMC)
+
+grpUI = "Interface"
+showPanel = input.bool(true, "Show Market-Structure Panel", group = grpUI)
+showLabel = input.bool(true, "Show Level Labels (side · price · score%)", group = grpUI)
+panelPos  = input.string("Top Right", "Panel Position", group = grpUI,
+     options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"])
+dashCompact   = input.bool(false, "Compact Dashboard", group = grpUI, tooltip = "Hides the adaptive/diagnostic detail rows; keeps regime, state, bias and scenario.")
+showEviPanel  = input.bool(true, "Dashboard: Evidence Rows", group = grpUI)
+showCalPanel  = input.bool(true, "Dashboard: Calibration Rows", group = grpUI)
+showPerfPanel = input.bool(true, "Dashboard: Performance Rows", group = grpUI)
+
+grpVizL = "Visibility — Levels"
+showStrongLvl = input.bool(true,  "Strong Levels (score ≥ 70)", group = grpVizL)
+showMedLvl    = input.bool(true,  "Medium Levels (50-69)",      group = grpVizL)
+showWeakLvl   = input.bool(true,  "Weak Levels (< 50)",         group = grpVizL)
+showBrokenLvl = input.bool(true,  "Broken Levels (Dim mode)",   group = grpVizL)
+showFlipMark  = input.bool(false, "Polarity Flip Markers",      group = grpVizL)
+
+grpVizS = "Visibility — Structure"
+showBOSMark   = input.bool(false, "BOS / CHOCH Markers",        group = grpVizS)
+sweepViz      = input.string("Lines", "Liquidity Sweeps", options = ["Off", "Cross Marks", "Lines", "Both"], group = grpVizS,
+     tooltip = "Lines start at the sweep wick extreme — the exact price where liquidity was harvested — and extend right while the pool stays unmitigated. A CLOSE through the line removes it (liquidity spent).")
+swpMaxLines   = input.int(10, "Max Sweep Lines", minval = 1, maxval = 40, group = grpVizS)
+colSweep      = input.color(color.new(#e040fb, 0), "Sweep Line Color", group = grpVizS)
+showSweepMark = sweepViz == "Cross Marks" or sweepViz == "Both"
+showSweepLine = sweepViz == "Lines" or sweepViz == "Both"
+
+grpVizT = "Visibility — Trade Plan"
+showEntryLn = input.bool(true, "Entry Line", group = grpVizT)
+showSLLn    = input.bool(true, "Stop Line",  group = grpVizT)
+showTPLn    = input.bool(true, "TP Lines",   group = grpVizT)
+showRiskBx  = input.bool(true, "Risk / Reward Boxes", group = grpVizT)
+
+// #############################################################################
+// # SECTION 2 — UTILITY FUNCTIONS   (single-responsibility helpers)
+// #############################################################################
+
+// Hard ceiling on adaptive pivot leg. Also the fixed swing-scan loop bound —
+// keeps the detector's cost constant regardless of the live (series) leg.
+MAXLEG = 14
+
+// Fixed INTERNAL book capacity per store. The level book always holds up to
+// this many confirmed levels — independent of the user's "Max Levels" display
+// setting — so changing Max Levels can never move or delete a stored level; it
+// only changes how many of the top-ranked ones are DRAWN (see f_scoreAndRender).
+MAXBOOK = 20
+
+// Fixed per-side HTF seed depth. The bar-1 history seed MUST NOT depend on the
+// user's "Max Levels" display setting, or changing that setting would re-seed a
+// different book — moving levels, scores and the Power Line (a determinism bug).
+// So the seed arrays are capped by this CONSTANT, never by maxLvl. 12/side ≥ the
+// book's useful depth (MAXBOOK); overflow is evicted deterministically.
+SEEDPERSIDE = 12
+
+// Level anchor blend: 0 = wick extreme, 0.5 = wick/body midpoint, 1 = body edge.
+anchorA = anchorMode == "Body" ? 1.0 : anchorMode == "Wick/Body Mid" ? 0.5 : 0.0
+
+// CROSS-TF CONFLUENCE RADIUS (frozen, × the level's OWN-TF ATR). The confluence
+// score factor — the heaviest weight (W_CONF) — must be identical on every chart
+// timeframe, exactly like the merge/break radii already are. So its band is
+// driven ONLY by the scored level's timeframe-native ATR (chart-independent) and
+// this frozen constant — never the chart-bar ATR or the per-bar regime
+// multiplier, both of which change with the chart TF and made the same level
+// score differently on 5m vs 1h (the drift the Power Line had to tolerate). A
+// touch wider than the 0.5 merge radius so confluence still catches near-but-
+// distinct HTF levels without merging them.
+CONF_BAND_K = 0.75
+
+// #############################################################################
+// # DETERMINISM VALIDATION LAYER — READ-ONLY (see docs/architecture/adr-001)
+// #   An append-only IDENTITY LOG that runs parallel to the display book but
+// #   never evicts and holds ONLY integers (tick-price, side, TF-code, birth
+// #   bar). It exists solely to hash / freeze-test the engine's REAL level
+// #   identities without disturbing them, and WITHOUT any request.security
+// #   replay (it is fed on the chart bar from f_addLevel). Rolling-capped so
+// #   memory stays bounded on deep-history LTF symbols. Nothing here can change
+// #   a level, score, ranking, the Power Line, a trade plan, or an alert.
+// #############################################################################
+DET_LOGCAP = 4000                              // > level count inside the freeze window
+var array<int> detKey   = array.new<int>()     // price in ticks — the frozen identity
+var array<int> detSide  = array.new<int>()     // 1 = resistance at birth, 0 = support
+var array<int> detTfC   = array.new<int>()     // coarse TF code = round(store weight * 100)
+var array<int> detBirth = array.new<int>()     // bar_index at creation (frozen)
+
+// Record one committed identity. Called from f_addLevel's creation branch only,
+// so it logs exactly what the engine commits, once, on confirmation.
+f_detLog(float px, bool isRes, float w) =>
+    if not na(px)
+        detKey.push(int(math.round(px / syminfo.mintick)))
+        detSide.push(isRes ? 1 : 0)
+        detTfC.push(int(math.round(w * 100)))
+        detBirth.push(bar_index)
+        if detKey.size() > DET_LOGCAP
+            detKey.shift(), detSide.shift(), detTfC.shift(), detBirth.shift()
+
+// Safe division — never returns na/inf on zero denominator.
+f_div(float a, float b) => b == 0 or na(b) ? 0.0 : a / b
+
+// Clamp x into [lo, hi].
+f_clamp(float x, float lo, float hi) => math.max(lo, math.min(hi, x))
+
+// Round a price to the instrument's tick — keeps exact-price contract clean.
+f_tick(float p) => na(p) ? p : math.round(p / syminfo.mintick) * syminfo.mintick
+
+// Price → display string, tick-formatted; em-dash when absent.
+f_px(float p) => na(p) ? "—" : str.tostring(p, format.mintick)
+
+// Float → JSON number string (tick precision); "null" when absent.
+f_jnum(float x) => na(x) ? "null" : str.tostring(x, format.mintick)
+
+// Map a style-name string to a line.style_* constant.
+f_lstyle(string s) => s == "Dashed" ? line.style_dashed : s == "Dotted" ? line.style_dotted : line.style_solid
+
+// Per-timeframe trend interpretation from a normalised EMA-slope value.
+f_trendSign(float tr)  => tr > 0.15 ? 1 : tr < -0.15 ? -1 : 0
+f_trendState(float tr) => tr > 0.15 ? "BULL" : tr < -0.15 ? "BEAR" : "RANGE"
+f_trendCol(float tr)   => tr > 0.15 ? color.lime : tr < -0.15 ? color.red : color.gray
+
+// Normalize a raw value into 0..1 by a soft scale k (k = value that maps ~0.5).
+f_norm01(float v, float k) => k == 0 ? 0.0 : f_clamp(v / (v + k), 0.0, 1.0)
+
+// Map a Panel-Position string to a table position constant.
+f_panelPos(string s) =>
+    s == "Top Left"     ? position.top_left     :
+     s == "Bottom Right" ? position.bottom_right :
+     s == "Bottom Left"  ? position.bottom_left  : position.top_right
+
+// #############################################################################
+// # SECTION 3 — ADAPTIVE ENGINE   (the "no manual tuning" core)
+// #   Classifies the regime from unitless, asset-agnostic signals, then emits
+// #   the parameters every downstream module consumes. Works FX/crypto/futures
+// #   /stocks/indices with no settings change.
+// #############################################################################
+
+// --- 3.1 Volatility regime -------------------------------------------------
+atrFast    = ta.atr(14)
+atrSlow    = ta.atr(50)
+volRegime  = f_div(atrFast, atrSlow)                 // >1 expanding, <1 compressing
+volMult    = f_clamp(volRegime, 0.5, 2.5)
+
+// Single safe-ATR used by every module (fallback before ta.atr(14) resolves).
+atrSafe    = na(atrFast) ? close * 0.001 : atrFast
+
+// VISUAL ANCHOR ONLY. Identity is always the wick; this shifts the DRAWN line
+// toward the candle interior for the Body / Mid options (resistance draws
+// downward from its high, support upward from its low). Bounded by the level's
+// own-TF ATR so it stays cosmetic and can never approach another level.
+f_anchorY(float price, bool isRes, float atrTF) =>
+    off = anchorA * math.max(atrTF, atrSafe) * 0.12
+    price + (isRes ? -off : off)
+
+// --- 3.2 Trend strength (normalized EMA slope in ATR units) ----------------
+emaTrend   = ta.ema(close, 34)
+slopeRaw   = f_div(emaTrend - emaTrend[10], atrFast)
+trendStr   = f_clamp(math.abs(slopeRaw), 0.0, 3.0)   // 0 flat .. >1 strong
+trendUp    = slopeRaw > 0
+isTrending = trendStr > 1.0
+
+// --- 3.3 Compression vs Expansion (Bollinger bandwidth vs own average) -----
+basis      = ta.sma(close, 20)
+bbWidth    = f_div(ta.stdev(close, 20), basis)
+bbWidthAvg = ta.sma(bbWidth, 100)
+isCompress = not na(bbWidthAvg) and bbWidth < bbWidthAvg * 0.80
+isExpand   = not na(bbWidthAvg) and bbWidth > bbWidthAvg * 1.20
+
+// --- 3.4 Liquidity proxy (participation) -----------------------------------
+volAvg     = ta.sma(volume, 20)
+volRatio   = f_div(volume, volAvg)
+highLiq    = volRatio > 1.3
+lowLiq     = volRatio < 0.6
+
+// --- 3.4b Market noise (Kaufman efficiency ratio: ~1 clean trend, ~0 chop) --
+effRatio   = f_clamp(f_div(math.abs(close - nz(close[20], close)), nz(math.sum(math.abs(close - nz(close[1], close)), 20), 1.0)), 0.0, 1.0)
+
+// --- 3.5 News / shock detection (ATR spike or gap) -------------------------
+atrSpike   = f_div(atrFast, atrFast[5]) > 1.6
+gapMove    = f_div(math.abs(open - close[1]), atrFast) > 0.8
+newsDriven = atrSpike or gapMove
+
+// --- 3.6 Regime classification (priority order) ----------------------------
+regimeTxt  = newsDriven ? "NEWS / SHOCK"          :
+     isExpand           ? "EXPANSION / BREAKOUT"  :
+     isCompress         ? "COMPRESSION / RANGE"   :
+     isTrending         ? "TREND " + (trendUp ? "UP" : "DOWN") : "NEUTRAL"
+
+// #############################################################################
+// # SECTION 4 — ADAPTIVE PARAMETER EMISSION
+// #   Every threshold below is derived, never hard-coded in pips/points.
+// #   These are the outputs Phases 2-8 will read.
+// #############################################################################
+
+// Swing sensitivity → pivot leg length. Choppy/high-vol → longer leg (fewer,
+// cleaner swings). Calm/low-vol → shorter leg (more responsive). Custom swing
+// detector in Phase 2 will consume this as a *series* int (impossible with
+// ta.pivothigh — that's why we roll our own).
+adPivotLen = int(f_clamp(math.round(5 * volMult / detSens), 3, MAXLEG))
+
+// Zone half-width multiplier (× HTF ATR). Wider in expansion, tighter in squeeze.
+adZoneMult = f_clamp(volMult * (isExpand ? 1.4 : isCompress ? 0.7 : 1.0) * detSens, 0.4, 3.0)
+
+// ATR multiplier for break/rejection thresholds.
+adAtrMult  = f_clamp(1.0 * volMult, 0.6, 2.5)
+
+// Reaction threshold (in ATR units) for what counts as a "strong" bounce.
+adReactThr = f_clamp(0.8 * volMult, 0.4, 2.0)
+
+// Confirmation rule: range needs 2 touches, trend accepts 1.
+adConfirmTouches = isTrending ? 1 : 2
+
+// Minimum score to stay visible — raised in noisy/low-liquidity conditions.
+adMinScore = int(f_clamp(45 + (newsDriven ? 20 : 0) + (lowLiq ? 10 : 0), 40, 80))
+
+// Merge distance multiplier (× chart ATR) — regime-scaled dedupe radius.
+adMergeMult = f_clamp(0.6 * volMult, 0.3, 1.5)
+
+// Chart timeframe in minutes — consumed by TF gating and level-store scaling.
+chartMin = timeframe.in_seconds() / 60.0
+
+// --- Mode tuning: ADAPTIVE FIRST. In Adaptive (Auto) the strictness shifts
+//     are derived live from regime, liquidity, volatility and market noise;
+//     the named presets are manual overrides. These values feed ONLY trade
+//     filtering, probability thresholds and sweep sensitivity — they have no
+//     path into swing detection or the level book (levels never change).
+autoStrict = f_clamp((newsDriven ? 6.0 : 0.0) + (lowLiq ? 3.0 : 0.0) + (isCompress ? 2.0 : 0.0) + (0.5 - effRatio) * 10.0 - (isTrending and highLiq ? 4.0 : 0.0), -10.0, 10.0)
+isAuto    = engineMode == "Adaptive (Auto)"
+mProbAdj  = isAuto ? autoStrict * 0.8 : engineMode == "Conservative" ? 5.0  : engineMode == "Balanced" ? 0.0 : engineMode == "Aggressive" ? -5.0  : -10.0
+mScoreAdj = isAuto ? autoStrict * 1.5 : engineMode == "Conservative" ? 10.0 : engineMode == "Balanced" ? 0.0 : engineMode == "Aggressive" ? -10.0 : -20.0
+mQualAdj  = isAuto ? autoStrict * 1.2 : engineMode == "Conservative" ? 8.0  : engineMode == "Balanced" ? 0.0 : engineMode == "Aggressive" ? -8.0  : -14.0
+mWick     = isAuto ? f_clamp(0.8 + autoStrict * 0.02, 0.6, 1.0) : engineMode == "Conservative" ? 1.0 : engineMode == "Balanced" ? 0.8 : engineMode == "Aggressive" ? 0.7 : 0.6
+
+// #############################################################################
+// # SECTION 5 — SWING ENGINE   (custom, series-length, non-repaint)
+// #   ta.pivothigh needs a *simple* int leg, so it can't adapt. We roll our own
+// #   detector: bar `leg` bars back is a swing if it's the extreme of the
+// #   [0 .. 2*leg] window. Loop bound is the FIXED 2*MAXLEG (constant cost);
+// #   the live series `leg` just gates which iterations count. A swing is
+// #   confirmed `leg` bars after it prints — no future data, no repaint.
+// #############################################################################
+
+// Returns [swingHighPrice, swingLowPrice] — non-na only on the confirmation bar.
+// IDENTITY IS THE WICK EXTREME, always. The anchor NEVER enters detection, so
+// the level book (identities, merges, scores, ranking, confluence, Power Line)
+// is 100% independent of the Wick/Body toggle. The toggle only shifts where
+// the line is drawn (see f_anchorY), it can no longer create or move a level.
+f_swing(int leg) =>
+    win     = 2 * leg
+    hi      = high[leg]
+    lo      = low[leg]
+    isHigh  = not na(hi)
+    isLow   = not na(lo)
+    for i = 0 to 2 * MAXLEG
+        if i > win or (not isHigh and not isLow)
+            break
+        if high[i] > hi
+            isHigh := false
+        if low[i] < lo
+            isLow := false
+    [isHigh ? hi : na, isLow ? lo : na]
+
+// True when v just became a fresh non-na value (edge detect for new swings).
+f_changed(float v) => not na(v) and (na(v[1]) or v != v[1])
+
+// #############################################################################
+// # SECTION 6 — HTF FETCH   (7 bundled, non-repaint request.security calls)
+// #   Each HTF computes its OWN regime → its OWN adaptive leg → its OWN swings,
+// #   so every timeframe is independent (per spec). One tuple per TF keeps us
+// #   at 7 security() calls total, well under the ~40 budget.
+// #############################################################################
+
+// Self-contained per-TF pack: adaptive leg + confirmed swings + ATR + leg +
+// that timeframe's own trend (normalised EMA slope). No extra security calls.
+f_htfPack() =>
+    aF   = ta.atr(14)
+    aS   = ta.atr(50)
+    vM   = f_clamp(f_div(aF, aS), 0.5, 2.5)
+    // FIXED INSTITUTIONAL LEG — the book's swing detection depends ONLY on the
+    // timeframe's own volatility (vM), never on the Sensitivity input. Moving
+    // Sensitivity therefore cannot re-detect or move a confirmed level; it now
+    // affects trade filtering only (see effMinScore/effMinProb).
+    leg  = int(f_clamp(math.round(5 * vM), 3, MAXLEG))
+    [ph, pl] = f_swing(leg)
+    // Hold last confirmed pivot + keep arrays of the last SEEDPERSIDE pivots per
+    // side. The arrays let the chart seed full HTF history on bar 1 regardless of
+    // how few bars are loaded (fixes missing HTF levels on 1M/5M/15M). Non-repaint.
+    // CAP IS A FIXED CONSTANT, never maxLvl — the seeded book must not depend on
+    // the display setting, or changing Max Levels would move stored levels.
+    var float lastH = na
+    var float lastL = na
+    // CROSS-TF IDENTITY: carry each pivot's OWN HTF bar-time (the pivot sits at
+    // [leg] bars back on this TF). Level age is anchored to this pivot time, not
+    // to the chart bar-time at which it happens to be ingested — so age-based
+    // eviction keeps the SAME newest-N levels on every chart timeframe. birthT is
+    // NOT part of the identity/DB hash, so this changes eviction only, never a
+    // frozen identity or the freeze/hash proof.
+    var int lastHT = na
+    var int lastLT = na
+    var array<float> hArr = array.new<float>()
+    var array<float> lArr = array.new<float>()
+    var array<int>   hArrT = array.new<int>()
+    var array<int>   lArrT = array.new<int>()
+    if not na(ph)
+        lastH  := ph
+        lastHT := time[leg]
+        hArr.push(ph)
+        hArrT.push(time[leg])
+        if hArr.size() > SEEDPERSIDE
+            hArr.shift()
+            hArrT.shift()
+    if not na(pl)
+        lastL  := pl
+        lastLT := time[leg]
+        lArr.push(pl)
+        lArrT.push(time[leg])
+        if lArr.size() > SEEDPERSIDE
+            lArr.shift()
+            lArrT.shift()
+    emaP = ta.ema(close, 34)
+    tr   = f_div(emaP - emaP[10], aF)
+    // Prev-period extremes (PDH/PDL, PWH/PWL, …): exact candle prices that
+    // exist even when the TF has too little history to confirm a swing —
+    // guarantees true Daily/Weekly lines on 1m/5m charts. Non-repaint ([1]).
+    pHi  = high[1]
+    pLo  = low[1]
+    pXT  = time[1]   // prev-period bar time — chart-independent birth for PDH/PDL
+    [lastH, lastL, hArr, lArr, aF, leg, tr, pHi, pLo, lastHT, lastLT, hArrT, lArrT, pXT]
+
+// SUB-CHART GUARD (fixes the 1W/1D + deep-history/forex runtime error). Requesting
+// a timeframe BELOW the chart TF forces request.security to replay that lower TF's
+// entire history inside a stateful pack — which blows TradingView's memory/time
+// limit (RE10139/RE10110) on 1D/1W charts (4H/1H/15/5 are sub-chart there) and on
+// deep-history forex even intraday. f_reqtf clamps each requested TF up to at least
+// the chart TF. Stores below the chart are NOT populated anyway (effUse* gates), so
+// their (now cheap, same-TF) data is unused — LEVEL IDENTITIES and the STRUCT HASH /
+// freeze test are byte-identical on every chart at/above each TF. The only change on
+// an intraday chart is that a sub-chart TREND row degrades to the chart TF, which an
+// HTF-context engine should not rely on regardless.
+f_reqtf(simple string tf) => timeframe.in_seconds(tf) < timeframe.in_seconds() ? timeframe.period : tf
+[phMN, plMN, hiMN, loMN, atrMN, legMN, trMN, pHiMN, pLoMN, phtMN, pltMN, hitMN, lotMN, pxtMN] = request.security(syminfo.tickerid, f_reqtf("M"),   f_htfPack(), lookahead = barmerge.lookahead_off)
+[phW,  plW,  hiW,  loW,  atrW,  legW,  trW,  pHiW,  pLoW,  phtW,  pltW,  hitW,  lotW,  pxtW ] = request.security(syminfo.tickerid, f_reqtf("W"),   f_htfPack(), lookahead = barmerge.lookahead_off)
+[phD,  plD,  hiD,  loD,  atrD,  legD,  trD,  pHiD,  pLoD,  phtD,  pltD,  hitD,  lotD,  pxtD ] = request.security(syminfo.tickerid, f_reqtf("D"),   f_htfPack(), lookahead = barmerge.lookahead_off)
+[phH4, plH4, hiH4, loH4, atrH4, legH4, trH4, pHiH4, pLoH4, phtH4, pltH4, hitH4, lotH4, pxtH4] = request.security(syminfo.tickerid, f_reqtf("240"), f_htfPack(), lookahead = barmerge.lookahead_off)
+[phH1, plH1, hiH1, loH1, atrH1, legH1, trH1, pHiH1, pLoH1, phtH1, pltH1, hitH1, lotH1, pxtH1] = request.security(syminfo.tickerid, f_reqtf("60"),  f_htfPack(), lookahead = barmerge.lookahead_off)
+[phM15, plM15, hiM15, loM15, atrM15, legM15, trM15, pHiM15, pLoM15, phtM15, pltM15, hitM15, lotM15, pxtM15] = request.security(syminfo.tickerid, f_reqtf("15"), f_htfPack(), lookahead = barmerge.lookahead_off)
+[phM5,  plM5,  hiM5,  loM5,  atrM5,  legM5,  trM5,  pHiM5,  pLoM5,  phtM5,  pltM5,  hitM5,  lotM5,  pxtM5 ] = request.security(syminfo.tickerid, f_reqtf("5"),  f_htfPack(), lookahead = barmerge.lookahead_off)
+
+// ── SINGLE DETERMINISTIC REFERENCE DATASET — ONE Daily fetch, W/M derived ────
+// The ENTIRE institutional anchor set (prev/current Day, Week AND Month highs &
+// lows) is produced by ONE request.security to the DAILY timeframe. The Weekly /
+// Monthly extremes are AGGREGATED FROM THE DAILY BARS inside that same call — the
+// running high/low resets on each calendar week / month boundary. This is the
+// permanent cross-timeframe fix, and it matters for a concrete reason:
+//   • A Daily series is back-loaded to the SAME deep calendar history on every
+//     chart timeframe (1m → 1M). It is the resolution TradingView fills most
+//     reliably — which is exactly why "previous week/month" tools work on a 1m
+//     chart. Separate "W"/"M" requests, by contrast, are back-loaded to DIFFERENT
+//     depths on shallow intraday charts, so a prior-period Weekly/Monthly extreme
+//     could be present on a 4H chart yet missing on a 15m chart. That was the
+//     residual MTF divergence: different inputs per chart, not a downstream bug.
+//   • Deriving W/M from the one Daily dataset means EVERY timeframe reads the SAME
+//     twelve numbers. Everything downstream (clusters, zones, Power, reference
+//     lines) is a pure function of them, so the readings are identical on every
+//     TF by construction — no per-chart dataset can exist.
+//   • Lightweight (bounded k-loop + ta.change + ta.atr, no swing/ema over full
+//     history), so a sub-chart request cannot trigger RE10110; native/un-clamped,
+//     so the values do not depend on the chart TF.
+f_refData() =>
+    hiE = array.new<float>()
+    loE = array.new<float>()
+    for k = 1 to 8
+        if not na(high[k])
+            hiE.push(high[k])
+        if not na(low[k])
+            loE.push(low[k])
+    // WEEK aggregation from Daily bars — reset the running extreme on a new ISO week.
+    var float cwH = na
+    var float cwL = na
+    var float pwH = na
+    var float pwL = na
+    if ta.change(weekofyear) != 0
+        pwH := cwH
+        pwL := cwL
+        cwH := high
+        cwL := low
+    else
+        cwH := na(cwH) ? high : math.max(cwH, high)
+        cwL := na(cwL) ? low  : math.min(cwL, low)
+    // MONTH aggregation from Daily bars — reset the running extreme on a new month.
+    var float cmH = na
+    var float cmL = na
+    var float pmH = na
+    var float pmL = na
+    if ta.change(month) != 0
+        pmH := cmH
+        pmL := cmL
+        cmH := high
+        cmL := low
+    else
+        cmH := na(cmH) ? high : math.max(cmH, high)
+        cmL := na(cmL) ? low  : math.min(cmL, low)
+    [pmH, pmL, cmH, cmL, pwH, pwL, cwH, cwL, high[1], low[1], high, low, close[1], ta.atr(14), hiE, loE]
+[nPMH, nPML, nCMH, nCML, nPWH, nPWL, nCWH, nCWL, nPDH, nPDL, nCDH, nCDL, nDref, nDatr, dHiE, dLoE] = request.security(syminfo.tickerid, "D", f_refData(), lookahead = barmerge.lookahead_off)
+
+// REFERENCE DATASET FINGERPRINT — a deterministic hash of the 12 native anchors,
+// each quantised to mintick units. Because the anchors are all Daily-derived, this
+// hash is IDENTICAL on every chart timeframe. It is shown bottom-right beside the
+// BUILD so cross-TF identity is provable at a glance: put the indicator on 1m and
+// on 1D — the DS hash MUST match. If it ever differs, the dataset itself diverged,
+// which is the only thing that can move a reading across timeframes.
+f_anchorHash() =>
+    a = array.from(nPMH, nPML, nCMH, nCML, nPWH, nPWL, nCWH, nCWL, nPDH, nPDL, nCDH, nCDL)
+    int h = 17
+    for i = 0 to a.size() - 1
+        v = a.get(i)
+        k = na(v) ? 0 : int(math.round(v / syminfo.mintick))
+        h := ((h * 131 + k) % 1000000007 + 1000000007) % 1000000007
+    h
+
+// Count of recent DAILY extremes within `band` of a level. DAILY ONLY on purpose:
+// daily history loads on every chart from 1m up (a 1m chart still sees the last week+
+// of daily bars), so the count — and therefore every zone's strength, weighted centre
+// and rank — is IDENTICAL on every timeframe. The old version also summed Weekly and
+// Monthly extremes, but a 1m chart cannot load 6 weeks / 4 months of history, so those
+// arrays truncated and broke MTF consistency. Weekly/Monthly confluence is already
+// captured because PWH/PWL/PMH/PML are among the clustered reference anchors.
+f_touchCount(float lvl, float band) =>
+    float c = 0.0
+    if not na(lvl) and band > 0
+        if not na(dHiE) and dHiE.size() > 0
+            for i = 0 to dHiE.size() - 1
+                c += math.abs(dHiE.get(i) - lvl) <= band ? 1.0 : 0.0
+        if not na(dLoE) and dLoE.size() > 0
+            for i = 0 to dLoE.size() - 1
+                c += math.abs(dLoE.get(i) - lvl) <= band ? 1.0 : 0.0
+    c
+
+// LEVEL ADJUSTMENT (display only). Returns a snapped DRAW position for a raw level.
+// Pure function of the raw price + native Daily ATR (both chart-independent), so the
+// adjusted value is identical on every chart TF — determinism preserved. The raw
+// price is what the engine selects/scores/merges; this only moves where it is drawn.
+f_bestTouch(float px, float atr) =>
+    band = atr * touchBandK
+    win  = atr * adjATRWin
+    float bestP = px
+    float bestC = f_touchCount(px, band)
+    // Candidate snap targets = the Daily extreme set (same single chart-independent
+    // source as the touch count). Weekly/Monthly context already lives in the anchor
+    // clustering; keeping this Daily-only is what guarantees an identical snap on
+    // every timeframe (a shallow chart cannot load Weekly/Monthly extreme arrays).
+    all = array.new<float>()
+    if not na(dHiE)
+        all.concat(dHiE)
+    if not na(dLoE)
+        all.concat(dLoE)
+    if all.size() > 0
+        for i = 0 to all.size() - 1
+            v = all.get(i)
+            if math.abs(v - px) <= win
+                cc = f_touchCount(v, band)
+                // ONE CLEAR WINNER, deterministic: higher test count wins; on a tie
+                // the price CLOSER to the raw level wins; on a further tie the HIGHER
+                // price wins. No order-dependence → identical result on every chart TF.
+                better = cc > bestC or (cc == bestC and (math.abs(v - px) < math.abs(bestP - px) or (math.abs(v - px) == math.abs(bestP - px) and v > bestP)))
+                if better
+                    bestC := cc
+                    bestP := v
+    bestP
+
+// Institutional psychological increment PER MARKET (not arbitrary rounding).
+// Forex trades a 50-pip big-figure grid (…00 / …50); JPY pairs use 0.01 pips.
+// Everything else (crypto / indices / metals) uses the natural big-figure grid for
+// its price scale (10^floor(log10 price)/10) — BTC→1000, ETH→100, SOL→10, XAU→100,
+// NAS100/US30→1000. Deterministic function of price + syminfo.type only.
+f_psychStep(float px) =>
+    float step = na
+    if syminfo.type == "forex"
+        pip  = px >= 20.0 ? 0.01 : 0.0001          // JPY-quoted vs standard majors
+        step := pip * 50.0                          // 50-pip institutional grid
+    else
+        mag  = math.pow(10.0, math.floor(math.log10(math.max(math.abs(px), syminfo.mintick))))
+        step := mag / 10.0
+    step
+
+f_adjust(float px, float atr) =>
+    float outp = px
+    if not na(px) and levelAdjust != "None"
+        if levelAdjust == "Highest Touch Level"
+            outp := f_bestTouch(px, atr)
+        else
+            mag  = math.pow(10.0, math.floor(math.log10(math.max(math.abs(px), syminfo.mintick))))
+            // Round Number = fine grid (mag/100). Psychological = per-market institutional grid.
+            step = levelAdjust == "Nearest Psychological Level" ? f_psychStep(px) : mag / 100.0
+            outp := step > 0 ? math.round(px / step) * step : px
+    outp
+
+// Add a fixed anchor to a draw list, de-duplicated within the native Daily ATR so a
+// swing sitting on a prev-period extreme shows once. Shared by the reference display
+// and the Power's zone finder, so both cluster the SAME candidate set.
+f_refAdd(array<float> px, array<string> tag, array<bool> res, array<int> wd, float p, string t, bool r, int w) =>
+    if not na(p)
+        dup = false
+        md  = nDatr * 0.15
+        if px.size() > 0
+            for i = 0 to px.size() - 1
+                if math.abs(px.get(i) - p) <= md
+                    dup := true
+                    break
+        if not dup
+            px.push(p)
+            tag.push(t)
+            res.push(r)
+            wd.push(w)
+
+// STRONGEST ZONE — cluster the 12 native reference anchors (single-linkage by price
+// gap ≤ clusterBandATR·nDatr) and return the zone with the greatest COMBINED test
+// count: [centre price, isResistance, strength]. This is the single most institutionally
+// significant level = the Power Line's target. Chart-independent (native anchors +
+// touch + ATR) → identical on every TF. Returns na when no anchors exist.
+f_topZone() =>
+    px = array.new<float>()
+    tg = array.new<string>()
+    rs = array.new<bool>()
+    wd = array.new<int>()
+    f_refAdd(px, tg, rs, wd, nPMH, "PMH", true,  3)
+    f_refAdd(px, tg, rs, wd, nPML, "PML", false, 3)
+    f_refAdd(px, tg, rs, wd, nCMH, "CMH", true,  3)
+    f_refAdd(px, tg, rs, wd, nCML, "CML", false, 3)
+    f_refAdd(px, tg, rs, wd, nPWH, "PWH", true,  2)
+    f_refAdd(px, tg, rs, wd, nPWL, "PWL", false, 2)
+    f_refAdd(px, tg, rs, wd, nCWH, "CWH", true,  2)
+    f_refAdd(px, tg, rs, wd, nCWL, "CWL", false, 2)
+    f_refAdd(px, tg, rs, wd, nPDH, "PDH", true,  1)
+    f_refAdd(px, tg, rs, wd, nPDL, "PDL", false, 1)
+    f_refAdd(px, tg, rs, wd, nCDH, "CDH", true,  1)
+    f_refAdd(px, tg, rs, wd, nCDL, "CDL", false, 1)
+    float bestPx = na
+    bool  bestRes = false
+    float bestStr = -1.0
+    if px.size() > 0
+        ord = px.sort_indices(order.ascending)
+        band = nDatr * clusterBandATR
+        float cW = 0.0
+        float cT = 0.0
+        float cA = 0.0
+        float lastP = na
+        for oi = 0 to ord.size() - 1
+            i  = ord.get(oi)
+            pv = px.get(i)
+            tv = math.max(f_touchCount(pv, nDatr * touchBandK), 0.01)
+            if not na(lastP) and (pv - lastP) > band and cT > 0
+                if cT > bestStr
+                    bestStr := cT
+                    bestPx  := cW / cT
+                    bestRes := cA >= cT * 0.5
+                cW := 0.0, cT := 0.0, cA := 0.0
+            cW += pv * tv
+            cT += tv
+            cA += rs.get(i) ? tv : 0.0
+            lastP := pv
+        if cT > bestStr
+            bestStr := cT
+            bestPx  := cW / cT
+            bestRes := cA >= cT * 0.5
+    [bestPx, bestRes, bestStr]
+
+// --- Hold last confirmed swing per TF (verification preview for Phase 2) ----
+// Phase 3 replaces these single held values with managed, scored level arrays.
+var float lastPhMN = na
+var float lastPlMN = na
+var float lastPhW  = na
+var float lastPlW  = na
+var float lastPhD  = na
+var float lastPlD  = na
+var float lastPhH4 = na
+var float lastPlH4 = na
+var float lastPhH1 = na
+var float lastPlH1 = na
+
+// Edge-detect once per bar (globals) — avoids history-dependent calls in ifs.
+chgPhMN = f_changed(phMN)
+chgPlMN = f_changed(plMN)
+chgPhW  = f_changed(phW)
+chgPlW  = f_changed(plW)
+chgPhD  = f_changed(phD)
+chgPlD  = f_changed(plD)
+chgPhH4 = f_changed(phH4)
+chgPlH4 = f_changed(plH4)
+chgPhH1 = f_changed(phH1)
+chgPlH1 = f_changed(plH1)
+chgPhM15 = f_changed(phM15)
+chgPlM15 = f_changed(plM15)
+chgPhM5  = f_changed(phM5)
+chgPlM5  = f_changed(plM5)
+// Prev-period extreme edges — a new value means that TF just closed a candle.
+chgXhMN = f_changed(pHiMN)
+chgXlMN = f_changed(pLoMN)
+chgXhW  = f_changed(pHiW)
+chgXlW  = f_changed(pLoW)
+chgXhD  = f_changed(pHiD)
+chgXlD  = f_changed(pLoD)
+chgXhH4 = f_changed(pHiH4)
+chgXlH4 = f_changed(pLoH4)
+chgXhH1 = f_changed(pHiH1)
+chgXlH1 = f_changed(pLoH1)
+
+if chgPhMN
+    lastPhMN := f_tick(phMN)
+if chgPlMN
+    lastPlMN := f_tick(plMN)
+if chgPhW
+    lastPhW := f_tick(phW)
+if chgPlW
+    lastPlW := f_tick(plW)
+if chgPhD
+    lastPhD := f_tick(phD)
+if chgPlD
+    lastPlD := f_tick(plD)
+if chgPhH4
+    lastPhH4 := f_tick(phH4)
+if chgPlH4
+    lastPlH4 := f_tick(plH4)
+if chgPhH1
+    lastPhH1 := f_tick(phH1)
+if chgPlH1
+    lastPlH1 := f_tick(plH1)
+
+// Timeframe color hierarchy (Weekly boldest).
+colMN = color.new(#8e24aa, 0)
+colW  = color.new(#d32f2f, 0)
+colD  = color.new(#1e88e5, 0)
+colH4 = color.new(#43a047, 0)
+colH1 = color.new(#fb8c00, 0)
+colM15 = color.new(#00bcd4, 0)
+colM5  = color.new(#ec407a, 0)
+
+// Per-TF line styles resolved once (consumed by seeding + level commits).
+lsMN  = f_lstyle(styleMN)
+lsW   = f_lstyle(styleW)
+lsD   = f_lstyle(styleD)
+lsH4  = f_lstyle(styleH4)
+lsH1  = f_lstyle(styleH1)
+lsM15 = f_lstyle(styleM15)
+lsM5  = f_lstyle(styleM5)
+
+// --- Performance / self-review state (Phase 9) ------------------------------
+FB_WIN   = 10
+PRED_WIN = 20
+var int gHolds  = 0
+var int gBreaks = 0
+var int gFalse  = 0
+var array<float> fbPrice = array.new<float>()
+var array<int>   fbDir   = array.new<int>()
+var array<int>   fbBar   = array.new<int>()
+// Polarity-flip markers (Keep mode), capped at 20 on-chart labels.
+var array<label> flipMarks = array.new<label>()
+var int   predTotal   = 0
+var int   predWins    = 0
+var float predProbSum = 0.0
+var int   lastPredBar = -1000
+var array<float> pPrice = array.new<float>()
+var array<float> pProb  = array.new<float>()
+var array<int>   pBar   = array.new<int>()
+var array<int>   pDir   = array.new<int>()
+// Calibration buckets: predicted <70 / 70-80 / 80+ vs realised win rate.
+var array<int>   calN = array.new<int>(3, 0)
+var array<int>   calW = array.new<int>(3, 0)
+var array<float> calP = array.new<float>(3, 0.0)
+
+// #############################################################################
+// # SECTION 7 — LEVEL STORE + SCORING   (managed, scored multi-level arrays)
+// #   Each store holds parallel arrays per level: price, line, side, and the
+// #   running stats that feed the 0-100 confidence score. `w` = the store's
+// #   timeframe importance weight (Weekly/Monthly top, 4H lowest).
+// #############################################################################
+
+type Store
+    array<float> price       // the exact level price
+    array<line>  ln          // its horizontal line
+    array<box>   bx          // its zone band (optional)
+    array<label> lb          // its score label
+    array<bool>  isRes       // resistance (true) vs support (false)
+    array<float> touches     // GRAVITY-WEIGHTED touch mass (prox × rejection × momentum)
+    array<float> reactSum    // sum of rejection strength (ATR units)
+    array<float> volSum      // sum of volume ratio at touches
+    array<int>   lastTouch   // bar_index of last activity (also birth)
+    array<float> score       // current 0-100 confidence
+    array<int>   sweeps       // # liquidity sweeps / stop-hunts at this level
+    array<int>   breaks       // break-quality mass: clean close-through=2, marginal/wick=1
+    array<bool>  broken       // broken & kept (dash-dim mode) → frozen from scoring
+    array<string> why        // per-level reason codes (top ICS contributors) — display only
+    array<int>   birthT      // creation TIME (ms) — chart-independent, drives cross-TF-stable eviction
+    float        w           // timeframe importance weight
+    float        atrTF       // this store's OWN timeframe ATR (updated each bar)
+    float        fhor        // freshness horizon in chart bars (TF-scaled)
+
+f_newStore(float w, float tfMin) =>
+    Store.new(array.new<float>(), array.new<line>(), array.new<box>(), array.new<label>(),
+         array.new<bool>(), array.new<float>(), array.new<float>(),
+         array.new<float>(), array.new<int>(), array.new<float>(), array.new<int>(),
+         array.new<int>(), array.new<bool>(), array.new<string>(), array.new<int>(), w, 0.0, f_clamp(500.0 * tfMin / math.max(chartMin, 1.0), 500.0, 5000.0))
+
+// Remove a level from every parallel array at index i (keeps them in lockstep).
+f_removeAt(Store s, int i) =>
+    line.delete(s.ln.get(i))
+    bxo = s.bx.get(i)
+    if not na(bxo)
+        box.delete(bxo)
+    lbo = s.lb.get(i)
+    if not na(lbo)
+        label.delete(lbo)
+    s.price.remove(i)
+    s.ln.remove(i)
+    s.bx.remove(i)
+    s.lb.remove(i)
+    s.isRes.remove(i)
+    s.touches.remove(i)
+    s.reactSum.remove(i)
+    s.volSum.remove(i)
+    s.lastTouch.remove(i)
+    s.score.remove(i)
+    s.sweeps.remove(i)
+    s.breaks.remove(i)
+    s.broken.remove(i)
+    s.why.remove(i)
+    s.birthT.remove(i)
+
+// Add a confirmed swing: skip if within adaptive merge distance; else draw a
+// line, seed its stats, and evict the WEAKEST level beyond the cap (broken
+// first, then lowest score — proven institutional levels persist, unlike FIFO).
+// Merge radius scales with the level's OWN timeframe ATR, so a store behaves
+// identically on every chart timeframe.
+f_addLevel(Store s, float p, bool isRes, color col, int wdt, string lstyle, int birthTime) =>
+    if not na(p)
+        // TF-NATIVE MERGE (deterministic): the merge radius depends ONLY on
+        // this store's own timeframe ATR — never the chart/base-bar ATR or the
+        // per-bar regime multiplier — so whether two swings are the same
+        // institutional object is identical on every chart timeframe.
+        md  = (s.atrTF > 0 ? s.atrTF : atrSafe) * 0.5
+        dup = false
+        if s.price.size() > 0
+            for i = 0 to s.price.size() - 1
+                if math.abs(s.price.get(i) - p) <= md
+                    dup := true
+                    // FROZEN IDENTITY: a same-side swing inside the merge radius
+                    // is the SAME level — it adds touch evidence only. The
+                    // price is NEVER moved (no snap-to-extreme, no drift), so a
+                    // confirmed W/D/4H level is permanent across all timeframes.
+                    if s.isRes.get(i) == isRes and not s.broken.get(i)
+                        s.touches.set(i, s.touches.get(i) + 0.5 * touchWMult)
+                        s.lastTouch.set(i, bar_index)
+                    break
+        if not dup
+            // Identity is the WICK price p; the drawn Y is anchor-adjusted only.
+            dy = f_anchorY(p, isRes, s.atrTF)
+            ln = line.new(bar_index - 1, dy, bar_index, dy, xloc = xloc.bar_index,
+                 extend = extend.both, color = col, width = wdt, style = lstyle)
+            bx = showZones ? box.new(bar_index - 1, p, bar_index, p, xloc = xloc.bar_index,
+                 extend = extend.both, border_width = 0, border_color = color.new(col, 100), bgcolor = color.new(col, 80)) : na
+            lb = showLabel ? label.new(bar_index, dy, "", xloc = xloc.bar_index,
+                 style = label.style_none,
+                 textcolor = color.white, size = size.small) : na
+            s.price.unshift(p)
+            s.ln.unshift(ln)
+            s.bx.unshift(bx)
+            s.lb.unshift(lb)
+            s.isRes.unshift(isRes)
+            s.touches.unshift(0.0)
+            s.reactSum.unshift(0.0)
+            s.volSum.unshift(0.0)
+            s.lastTouch.unshift(bar_index)
+            s.score.unshift(50.0)
+            s.sweeps.unshift(0)
+            s.breaks.unshift(0)
+            s.broken.unshift(false)
+            s.why.unshift("")
+            // Chart-INDEPENDENT age: the pivot's own HTF bar time. Falls back to
+            // chart time only if a caller has no pivot time (never, in practice).
+            s.birthT.unshift(na(birthTime) ? time : birthTime)
+            // DETERMINISM LOG (read-only): record this frozen identity. Append-only
+            // and independent of the display eviction below, so the hash reflects
+            // the true identity set, immune to chart-dependent eviction.
+            f_detLog(p, isRes, s.w)
+            while s.price.size() > MAXBOOK
+                // PURE RECENCY EVICTION (cross-TF identity, v2.5): evict broken
+                // levels first, then the OLDEST surviving level by its PIVOT TIME
+                // (birthT is now the pivot's own HTF bar-time — chart-independent).
+                // The old structural-extreme protection (keep highest/lowest price)
+                // is REMOVED: it pinned a chart-DEPENDENT all-time extreme — a
+                // deeper-history chart sees a different highest/lowest pivot and
+                // protected it forever, so two chart TFs held different books at
+                // equal count (the measured D-store divergence). With pure recency,
+                // any two charts that see the same newest-MAXBOOK pivots hold a
+                // byte-identical book. Prev-period extremes (PDH/PWH/PMH) are
+                // re-added every period, so major reference levels persist as recent
+                // regardless. Index 0 (the just-added level) is never evicted.
+                worst = 1
+                ws    = 1.0e18
+                for j = 1 to s.price.size() - 1
+                    cs = s.broken.get(j) ? -1.0 : float(s.birthT.get(j))
+                    if cs <= ws
+                        ws := cs
+                        worst := j
+                f_removeAt(s, worst)
+
+// Seed a store from HTF pivot arrays (oldest→newest so newest survives the cap).
+// hisT/losT are the parallel pivot TIMES (chart-independent birth) kept in
+// lockstep with his/los in f_htfPack, so each seeded level ages by its own pivot.
+f_seed(Store s, array<float> his, array<float> los, array<int> hisT, array<int> losT, bool use, color col, int wdt, string sty) =>
+    if use and not na(his) and not na(los)
+        n = math.max(his.size(), los.size())
+        if n > 0
+            for i = 0 to n - 1
+                if i < his.size()
+                    f_addLevel(s, f_tick(his.get(i)), true,  col, wdt, sty, hisT.get(i))
+                if i < los.size()
+                    f_addLevel(s, f_tick(los.get(i)), false, col, wdt, sty, losT.get(i))
+
+// Detect a close-through; remove it (clean) or freeze it as a dash-dim line.
+f_updateBreaks(Store s) =>
+    bc = 0
+    if s.price.size() > 0
+        i = s.price.size() - 1
+        while i >= 0
+            if not s.broken.get(i)
+                lvl     = s.price.get(i)
+                // Break buffer is PURELY the level's own timeframe scale — no
+                // chart ATR, no chart-regime multiplier — so a level's broken
+                // state is identical on every chart (it can no longer be broken
+                // on a 5m chart yet alive on 1h). This is core to cross-TF parity.
+                buf     = s.atrTF * 0.30 * brkConf
+                crossed = math.abs(close - lvl) > buf and math.sign(close - lvl) != math.sign(close[1] - lvl)
+                if crossed
+                    // Debounced stats: one event per level per 3 bars, and a
+                    // break-bar can't also register as a hold (runs pre-touch).
+                    if barstate.isconfirmed and bar_index - s.lastTouch.get(i) >= 3
+                        bc += 1
+                        s.lastTouch.set(i, bar_index)
+                        // Break quality: decisive close-through (2) vs marginal/wick break (1).
+                        s.breaks.set(i, s.breaks.get(i) + (f_div(math.abs(close - lvl), atrFast) > 0.6 ? 2 : 1))
+                        fbPrice.push(lvl)
+                        fbDir.push(close > lvl ? 1 : -1)
+                        fbBar.push(bar_index)
+                        if fbBar.size() > 60
+                            fbPrice.shift()
+                            fbDir.shift()
+                            fbBar.shift()
+                    if brkMode == "Remove"
+                        f_removeAt(s, i)
+                    else if brkMode == "Keep"
+                        // Institutional polarity flip: broken support acts as
+                        // resistance from now on, and vice versa. History kept.
+                        flipped = s.isRes.get(i) != (close < lvl)
+                        s.isRes.set(i, close < lvl)
+                        if flipped and showFlipMark and barstate.isconfirmed
+                            fm = label.new(bar_index, lvl, "⇄", xloc = xloc.bar_index,
+                                 style = close < lvl ? label.style_label_up : label.style_label_down,
+                                 color = color.new(color.gray, 55), textcolor = color.white, size = size.tiny)
+                            flipMarks.unshift(fm)
+                            if flipMarks.size() > 20
+                                label.delete(flipMarks.pop())
+                    else if brkMode == "Dim"
+                        s.broken.set(i, true)
+                        line.set_color(s.ln.get(i), showBrokenLvl ? colBrk : color.new(colBrk, 100))
+                        line.set_style(s.ln.get(i), line.style_dashed)
+                        line.set_width(s.ln.get(i), 1)
+                        lbo = s.lb.get(i)
+                        if not na(lbo)
+                            label.set_text(lbo, "")
+                            label.set_color(lbo, color.new(color.white, 100))
+                        bxo = s.bx.get(i)
+                        if not na(bxo)
+                            box.delete(bxo)
+                            s.bx.set(i, na)
+            i := i - 1
+    bc
+
+// Count levels in another store within `band` of price p (confluence helper).
+f_nearCount(Store o, float p, float band) =>
+    c = 0
+    if o.price.size() > 0
+        for i = 0 to o.price.size() - 1
+            if math.abs(o.price.get(i) - p) <= band
+                c += 1
+    c
+
+// TOUCH GRAVITY (v2 core mechanic): every interaction adds weighted touch
+// mass instead of a raw count. Weight = proximity (near-misses are partial
+// touches) × rejection strength (rejections matter more than touches) ×
+// momentum at interaction (defended against fast tape = stronger level).
+// Debounced by 3 bars per level.
+f_touchUpdate(Store s) =>
+    hc = 0
+    momX = f_clamp(f_div(math.abs(close - close[3]), atrFast), 0.0, 2.0)
+    if s.price.size() > 0
+        for i = 0 to s.price.size() - 1
+            lvl = s.price.get(i)
+            if not s.broken.get(i)
+                buf  = atrSafe * adReactThr
+                hit  = high >= lvl - buf and low <= lvl + buf
+                dist = math.min(math.abs(high - lvl), math.abs(low - lvl))
+                near = not hit and dist <= buf * 2.0
+                if (hit or near) and bar_index - s.lastTouch.get(i) >= 3
+                    res   = s.isRes.get(i)
+                    rej   = res ? high - close : close - low
+                    react = f_clamp(f_div(rej, atrFast), 0.0, 3.0)
+                    prox  = hit ? 1.0 : f_clamp(1.0 - (dist - buf) / buf, 0.2, 0.6)
+                    tw    = prox * (1.0 + 0.5 * f_clamp(react, 0.0, 1.0)) * (0.75 + 0.25 * momX) * touchWMult
+                    s.touches.set(i, s.touches.get(i) + tw)
+                    s.reactSum.set(i, s.reactSum.get(i) + react * (hit ? 1.0 : 0.4) * reactWMult)
+                    s.volSum.set(i, s.volSum.get(i) + volRatio * prox)
+                    s.lastTouch.set(i, bar_index)
+                    if barstate.isconfirmed and hit
+                        hc += 1
+                    // Liquidity sweep / stop-hunt: wick pierces, close rejects.
+                    if hit and (res ? high > lvl + buf and close < lvl : low < lvl - buf and close > lvl)
+                        s.sweeps.set(i, s.sweeps.get(i) + 1)
+    hc
+
+// #############################################################################
+// # SECTION 8 — LIQUIDITY / SMC ENGINE   (feeds the score; optional zone draw)
+// #   All detectors use CONFIRMED bars (offsets ≥1) → non-repaint. They mainly
+// #   boost the confidence of levels that sit on institutional footprints;
+// #   drawing the zones is optional (off by default for a clean chart).
+// #############################################################################
+
+// --- Unfilled Fair Value Gaps (3-bar imbalance), tracked until filled --------
+var array<float> fvgTop  = array.new<float>()
+var array<float> fvgBot  = array.new<float>()
+var array<bool>  fvgBull = array.new<bool>()
+var array<box>   fvgBx   = array.new<box>()
+
+// --- Most-recent Order Block zone per side (last opposite candle before a
+//     displacement move). Held as simple bounds + optional box. --------------
+var float obBullTop = na
+var float obBullBot = na
+var float obBearTop = na
+var float obBearBot = na
+var box   obBullBx  = na
+var box   obBearBx  = na
+
+// 3-bar FVG on confirmed bars [1],[2],[3]; bar[2] is the middle.
+bullFVG = low[1] > high[3]
+bearFVG = high[1] < low[3]
+if bullFVG or bearFVG
+    tp = bullFVG ? low[1]  : low[3]
+    bt = bullFVG ? high[3] : high[1]
+    fvgTop.unshift(tp)
+    fvgBot.unshift(bt)
+    fvgBull.unshift(bullFVG)
+    bx = showFVGZones ? box.new(bar_index - 3, tp, bar_index, bt, xloc = xloc.bar_index, border_width = 0, border_color = color.new(colFVG, 100), bgcolor = colFVG) : na
+    fvgBx.unshift(bx)
+    while fvgTop.size() > 30
+        b = fvgBx.pop()
+        if not na(b)
+            box.delete(b)
+        fvgTop.pop()
+        fvgBot.pop()
+        fvgBull.pop()
+
+// Remove FVGs once price fills them (bull filled on low≤bot, bear on high≥top).
+if fvgTop.size() > 0
+    fi = fvgTop.size() - 1
+    while fi >= 0
+        filled = fvgBull.get(fi) ? low <= fvgBot.get(fi) : high >= fvgTop.get(fi)
+        if filled
+            b = fvgBx.get(fi)
+            if not na(b)
+                box.delete(b)
+            fvgTop.remove(fi)
+            fvgBot.remove(fi)
+            fvgBull.remove(fi)
+            fvgBx.remove(fi)
+        fi := fi - 1
+
+// Order Block: displacement on bar[1]; OB candle is the opposite bar[2].
+body1     = math.abs(close[1] - open[1])
+disp      = body1 > atrSafe * 1.2
+if disp and close[1] > open[1] and close[2] < open[2]
+    obBullTop := high[2]
+    obBullBot := low[2]
+    if showOBZones
+        if not na(obBullBx)
+            box.delete(obBullBx)
+        obBullBx := box.new(bar_index - 2, obBullTop, bar_index + 3, obBullBot, xloc = xloc.bar_index, border_width = 0, border_color = color.new(colOBbull, 100), bgcolor = colOBbull)
+if disp and close[1] < open[1] and close[2] > open[2]
+    obBearTop := high[2]
+    obBearBot := low[2]
+    if showOBZones
+        if not na(obBearBx)
+            box.delete(obBearBx)
+        obBearBx := box.new(bar_index - 2, obBearTop, bar_index + 3, obBearBot, xloc = xloc.bar_index, border_width = 0, border_color = color.new(colOBbear, 100), bgcolor = colOBbear)
+
+// SMC bonus 0..1 for a level price: inside an unfilled FVG or an order block.
+f_smcBonus(float price) =>
+    b = 0.0
+    if fvgTop.size() > 0
+        for i = 0 to fvgTop.size() - 1
+            if price <= fvgTop.get(i) and price >= fvgBot.get(i)
+                b := math.max(b, 0.6)
+                break
+    inBull = not na(obBullTop) and price <= obBullTop and price >= obBullBot
+    inBear = not na(obBearTop) and price <= obBearTop and price >= obBearBot
+    if inBull or inBear
+        b := math.max(b, 0.7)
+    b
+
+// Equal highs/lows: count same-side levels near p (excluding self) = liq pool.
+f_sameSideNear(Store s, float p, bool res, float tol, int selfIdx) =>
+    c = 0
+    if s.price.size() > 0
+        for i = 0 to s.price.size() - 1
+            if i != selfIdx and s.isRes.get(i) == res and math.abs(s.price.get(i) - p) <= tol
+                c += 1
+    c
+
+// #############################################################################
+// # SECTION 9 — SCORING + CONFLUENCE + FADE   (0-100 institutional confidence)
+// #   Weighted blend of touches, reaction, HTF confluence, trend alignment,
+// #   volume, freshness, sweeps and SMC footprint, scaled by timeframe weight.
+// #   Score drives labels + optional zones only; lines stay solid & visible.
+// #############################################################################
+
+// Factor weights (sum = 1.0). Confluence is heaviest — HTF agreement is the
+// strongest institutional signal; sweeps + SMC footprint add the smart-money edge.
+// ── INSTITUTIONAL CONFIDENCE SCORE (ICS) weights — our framework (ADR-002 / I1,
+//    microstructure-audit rubric). The per-level score IS the ICS: a 0–100
+//    institutional confidence, not a cosmetic blend. It lives in s.score (which is
+//    NOT part of the STRUCT/DB hash), so replacing the old flat blend changes no
+//    identity and leaves the freeze/hash determinism proof intact. The Auction
+//    factor (Dalton) is weight 0 until I3 adds volume/TPO; the rest sum to 1.0.
+ICS_STRUCT = 0.14   // structural significance — range boundary / external extreme (Murphy)
+ICS_LIQ    = 0.16   // institutional liquidity — sweeps + SMC/EQ footprint (Harris/O'Hara)
+ICS_REACTQ = 0.16   // reaction quality — bounce/break respect-rate + wick rejection (Weis)
+ICS_TOUCH  = 0.12   // multiple historical reactions — touch mass (Murphy)
+ICS_CONF   = 0.18   // multi-timeframe confluence — TF-native (Murphy)
+ICS_FRESH  = 0.08   // freshness — wall-clock-invariant decay
+ICS_MITIG  = 0.08   // mitigation integrity — not consumed/broken through
+ICS_TREND  = 0.08   // structure/trend alignment context
+ICS_AUCTION = 0.0   // auction behavior (Dalton) — held at 0 until I3 (volume/TPO)
+
+// Score threshold for the top-n levels by score (display filter). Returns -1
+// when the store holds <= n live levels (draw all). Pure read — never mutates.
+f_rankThresh(Store s, int n) =>
+    tmp = array.new<float>()
+    if s.price.size() > 0
+        for i = 0 to s.price.size() - 1
+            if not s.broken.get(i)
+                tmp.push(s.score.get(i))
+    thr = -1.0
+    if tmp.size() > n and n > 0
+        tmp.sort(order.descending)
+        thr := tmp.get(n - 1)
+    thr
+
+// ── CHART CLARITY helpers (display-only; never touch the book, scores, or hash) ─
+// Daily-ATR reference for all clarity distances — chart-TF independent.
+clarATR = math.max(nz(atrD, atrFast), syminfo.mintick)
+// Relevance = strength discounted by distance to price, so a small display budget
+// shows the levels that matter NOW instead of distant high-score ones.
+f_rel(float sc, float lvl) => sc / (1.0 + clarNearK * f_div(math.abs(close - lvl), clarATR))
+// Registry of level prices already drawn THIS bar. HTF stores render first, so a
+// lower-priority level within the cluster distance of one already shown is hidden
+// — nearby levels collapse to the single strongest representative.
+var array<float> gShownPx = array.new<float>()
+var array<float> gShownSc = array.new<float>()   // shown level's ICS (for strongest-wins merge)
+var array<line>  gShownLn = array.new<line>()    // its line ref (to hide the weaker on collision)
+var array<label> gShownLb = array.new<label>()   // its label ref
+// Relevance-ranked display threshold: the n-th highest relevance among live levels.
+f_relThresh(Store s, int n) =>
+    tmp = array.new<float>()
+    if s.price.size() > 0
+        for i = 0 to s.price.size() - 1
+            if not s.broken.get(i)
+                tmp.push(f_rel(s.score.get(i), s.price.get(i)))
+    thr = -1.0
+    if tmp.size() > n and n > 0
+        tmp.sort(order.descending)
+        thr := tmp.get(n - 1)
+    thr
+
+// Two passes: (1) compute every live level's score, (2) render. Scoring NEVER
+// touches price/identity. Max Levels + strength + timeframe visibility are all
+// applied in pass 2 as pure display filters — a hidden level keeps its exact
+// frozen position and reappears unchanged when shown again.
+f_scoreAndRender(Store s, color baseCol, Store o1, Store o2, Store o3, Store o4, Store o5, Store o6, bool drawOK) =>
+    if s.price.size() > 0
+        // TF-NATIVE confluence scale — own-TF ATR only (chart-independent), so the
+        // confluence count and the equal-level tolerance below are identical on
+        // every chart TF. Was math.max(atrSafe, atrTF·0.5)·adMergeMult·1.5, which
+        // mixed chart-bar ATR and the per-bar regime multiplier into the score.
+        atrRef = s.atrTF > 0 ? s.atrTF : atrSafe
+        band   = atrRef * CONF_BAND_K
+        // Structural significance needs the store's range boundaries: the highest
+        // and lowest UNBROKEN level are the external extremes (Murphy) — the levels
+        // that define the range and matter most. Computed once per store per bar.
+        hiP = -1.0e18
+        loP =  1.0e18
+        for e = 0 to s.price.size() - 1
+            if not s.broken.get(e)
+                pv = s.price.get(e)
+                hiP := math.max(hiP, pv)
+                loP := math.min(loP, pv)
+        // --- PASS 1: score every live level (no rendering, no mutation of price)
+        for i = 0 to s.price.size() - 1
+            if not s.broken.get(i)
+                lvl      = s.price.get(i)
+                res      = s.isRes.get(i)
+                t        = s.touches.get(i)
+                avgReact = t > 0 ? s.reactSum.get(i) / t : 0.0
+                avgVol   = t > 0 ? s.volSum.get(i) / t : 0.0
+                recency  = bar_index - s.lastTouch.get(i)
+                conf     = o1.w * f_nearCount(o1, lvl, band) + o2.w * f_nearCount(o2, lvl, band) + o3.w * f_nearCount(o3, lvl, band) + o4.w * f_nearCount(o4, lvl, band) + o5.w * f_nearCount(o5, lvl, band) + o6.w * f_nearCount(o6, lvl, band)
+                aligned  = res ? not trendUp : trendUp
+                eqCount  = f_sameSideNear(s, lvl, res, atrRef * 0.2, i)
+                fTouch   = f_norm01(t, 3)
+                fReact   = f_norm01(avgReact, 1.0)
+                fConf    = f_norm01(conf * htfInfl, 2.0)
+                fTrend   = isTrending ? (aligned ? 1.0 : 0.35) : 0.6
+                fVol     = f_norm01(avgVol, 1.0)
+                fFresh   = f_clamp(1.0 - recency * decaySpd / s.fhor, 0.0, 1.0)
+                fSweep   = f_norm01(s.sweeps.get(i), 2)
+                fSMC     = f_clamp(f_smcBonus(lvl) + f_norm01(eqCount, 1) * 0.5, 0.0, 1.0)
+                // ── ICS institutional factors (deterministic, from existing stats) ──
+                // Structural: the store's range boundaries score full; interior half.
+                fStruct  = (lvl >= hiP or lvl <= loP) ? 1.0 : 0.5
+                // Liquidity: sweep footprint + SMC/equal-level pools.
+                fLiq     = f_clamp(0.6 * fSweep + 0.7 * fSMC, 0.0, 1.0)
+                // Reaction quality: respect-rate (bounce vs break — teardown idea,
+                // our own frozen-identity implementation) blended with wick rejection.
+                // touches = respected mass; breaks = break-quality mass. A level never
+                // broken → respect ~1; heavily broken → low.
+                breaksM  = s.breaks.get(i)
+                fRespect = (t + breaksM) > 0 ? t / (t + 1.5 * breaksM) : 0.5
+                fReactQ  = f_clamp(0.5 * fRespect + 0.3 * fReact + 0.2 * fVol, 0.0, 1.0)
+                // Mitigation integrity: a level partially broken through is less intact.
+                fMitig   = f_clamp(1.0 - 0.20 * breaksM, 0.3, 1.0)
+                icsRaw   = ICS_STRUCT * fStruct + ICS_LIQ * fLiq + ICS_REACTQ * fReactQ + ICS_TOUCH * fTouch + ICS_CONF * fConf + ICS_FRESH * fFresh + ICS_MITIG * fMitig + ICS_TREND * fTrend + ICS_AUCTION * 0.0
+                // TF importance nudges (0.7..1.0) — a Weekly level outranks a 5m one at
+                // equal evidence, but low-TF levels are not crushed.
+                sc       = f_clamp(100.0 * icsRaw * (0.7 + 0.3 * s.w), 0.0, 100.0)
+                s.score.set(i, sc)
+                // REASON CODES — the qualities this level actually has (each above a
+                // meaningful threshold), so every displayed level justifies its ICS.
+                whyStr = (fStruct >= 0.99 ? "EXT " : "") + (fConf >= 0.5 ? "MTF " : "") + (fLiq >= 0.5 ? "LIQ " : "") + (fReactQ >= 0.6 ? "RESP " : "") + (fTouch >= 0.5 ? "TCH " : "") + (fMitig < 0.9 ? "BRK " : "")
+                s.why.set(i, whyStr)
+        // Max Levels is a DISPLAY filter. With Chart Clarity on, the budget is
+        // filled by RELEVANCE (strength × proximity) rather than raw score, so a
+        // small count shows the near, strong levels — not distant high-score ones.
+        thr = clarityOn ? f_relThresh(s, maxLvl) : f_rankThresh(s, maxLvl)
+        // --- PASS 2: render (all gating here is visual; positions never move)
+        for i = 0 to s.price.size() - 1
+            if not s.broken.get(i)
+                lvl   = s.price.get(i)
+                res   = s.isRes.get(i)
+                t     = s.touches.get(i)
+                sc    = s.score.get(i)
+                weak  = sc < adMinScore
+                clsStrong = sc >= 70
+                clsMed    = sc >= 50 and sc < 70
+                vizOK  = clsStrong ? showStrongLvl : clsMed ? showMedLvl : showWeakLvl
+                metric = clarityOn ? f_rel(sc, lvl) : sc
+                rankOK = thr < 0 or metric >= thr
+                // CHART CLARITY display gates (visual only):
+                distA  = f_div(math.abs(close - lvl), clarATR)
+                farOK  = not clarityOn or hideFarATRk <= 0 or distA <= hideFarATRk
+                // MIN-SEPARATION MERGE — strongest wins. A candidate that passes the
+                // other gates is hidden if a STRONGER already-shown level sits within
+                // clusterATRk×Daily-ATR; otherwise it hides every WEAKER shown level
+                // in that band (retroactively) and takes their place. Order-
+                // independent: the highest-ICS level in each cluster is the survivor.
+                clustOK = true
+                gatesOK = drawOK and t >= minTouches and vizOK and rankOK and farOK
+                minSep  = clusterATRk * clarATR
+                if clarityOn and clusterATRk > 0 and gatesOK and gShownPx.size() > 0
+                    for gi = 0 to gShownPx.size() - 1
+                        // dominant = strictly higher ICS, or equal ICS with a
+                        // deterministic price tiebreak (higher price wins) so the
+                        // survivor is order-independent even on ties.
+                        domin = gShownSc.get(gi) > sc + 0.0001 or (math.abs(gShownSc.get(gi) - sc) <= 0.0001 and gShownPx.get(gi) >= lvl)
+                        if math.abs(gShownPx.get(gi) - lvl) <= minSep and domin
+                            clustOK := false
+                            break
+                    if clustOK
+                        gj = gShownPx.size() - 1
+                        while gj >= 0
+                            if math.abs(gShownPx.get(gj) - lvl) <= minSep
+                                lnw = gShownLn.get(gj)
+                                if not na(lnw)
+                                    line.set_color(lnw, color.new(color.gray, 100))
+                                lbw = gShownLb.get(gj)
+                                if not na(lbw)
+                                    label.set_text(lbw, "")
+                                    label.set_color(lbw, color.new(color.white, 100))
+                                gShownPx.remove(gj), gShownSc.remove(gj), gShownLn.remove(gj), gShownLb.remove(gj)
+                            gj := gj - 1
+                show   = gatesOK and clustOK
+                if show and clarityOn
+                    gShownPx.push(lvl), gShownSc.push(sc), gShownLn.push(s.ln.get(i)), gShownLb.push(s.lb.get(i))
+                posCol = colorByPos ? (lvl >= close ? colRefRes : colRefSup) : baseCol
+                lnCol  = color.new(posCol, show ? lineOpacity : 100)
+                line.set_color(s.ln.get(i), lnCol)
+                line.set_width(s.ln.get(i), lineWidth)
+                bxo = s.bx.get(i)
+                if not na(bxo)
+                    if show and showZones
+                        half = math.max(atrSafe, s.atrTF * 0.5) * zoneWidthK * zoneScale
+                        box.set_top(bxo, lvl + half)
+                        box.set_bottom(bxo, lvl - half)
+                        box.set_bgcolor(bxo, color.new(baseCol, zoneOpacity))
+                    else
+                        box.set_bgcolor(bxo, color.new(baseCol, 100))
+                lb = s.lb.get(i)
+                if not na(lb)
+                    if showLabel and not weak and show and labelMode != "Off"
+                        grade = sc >= 90 ? "A+" : sc >= 80 ? "A" : sc >= 70 ? "B" : sc >= 55 ? "C" : "D"
+                        label.set_xy(lb, bar_index + labelOffset, f_anchorY(lvl, res, s.atrTF))
+                        label.set_size(lb, lblSz)
+                        wy = s.why.get(i)
+                        ltxt = labelMode == "Price only" ? f_px(lvl) :
+                             labelMode == "Compact" ? (res ? "R" : "S") + " " + f_px(lvl) + "  " + str.tostring(math.round(sc)) :
+                             grade + "  " + (res ? "R" : "S") + "  " + f_px(lvl) + "  ICS " + str.tostring(math.round(sc)) + (wy == "" ? "" : "  · " + wy)
+                        label.set_text(lb, ltxt)
+                        label.set_textcolor(lb, color.new(posCol, sc >= 80 ? 0 : 30))
+                    else
+                        label.set_text(lb, "")
+                        label.set_color(lb, color.new(color.white, 100))
+
+// --- Per-timeframe stores (w = importance, tfMin = TF minutes) + new swings -
+var Store stMN = f_newStore(1.00, 43200)
+var Store stW  = f_newStore(1.00, 10080)
+var Store stD  = f_newStore(0.80, 1440)
+var Store stH4 = f_newStore(0.60, 240)
+var Store stH1 = f_newStore(0.45, 60)
+var Store stM15 = f_newStore(0.35 * f_clamp(1.0 / ltfNoise, 0.5, 2.0), 15)
+var Store stM5  = f_newStore(0.30 * f_clamp(1.0 / ltfNoise, 0.5, 2.0), 5)
+
+// POPULATION vs DISPLAY (the core cross-TF-parity fix).
+// A store is POPULATED whenever its timeframe is at or above the chart — i.e.
+// whenever request.security can read it RELIABLY (a sub-chart request returns
+// sampled/phantom data and is correctly skipped). This makes the book depend
+// only on the level's own timeframe data, never on the user's source toggles
+// or Max Levels — so Weekly / Daily / 4H are IDENTICAL on every execution
+// chart at or below their TF. The source toggles + htfOnly are DISPLAY-only
+// (draw*), passed to the renderer: hiding a timeframe hides its lines without
+// touching the book or the Power Line.
+// PERFORMANCE GATE: fold bookActive in here so the whole book pipeline (seed,
+// per-bar f_addLevel merge scans, breaks, touches, and the 7× confluence scoring)
+// is skipped entirely when the book is not shown and no debug HUD needs it. The
+// reference lines + Power Line use NATIVE anchors, not these stores, so nothing on
+// the default chart depends on the book — it just stops computing when hidden.
+effUseMN  = bookActive and 43200 >= chartMin
+effUseW   = bookActive and 10080 >= chartMin
+effUseD   = bookActive and 1440  >= chartMin
+effUseH4  = bookActive and 240   >= chartMin
+effUseH1  = bookActive and 60    >= chartMin
+effUseM15 = bookActive and 15    >= chartMin
+effUseM5  = bookActive and 5     >= chartMin
+// The detected swing book renders only when explicitly enabled — by default the
+// chart shows the cross-TF-identical reference lines instead of the per-chart book.
+f_eff(bool use, float tfMin) => showDetectedBook and use and (not htfOnly or tfMin >= chartMin)
+drawMN  = effUseMN  and f_eff(useMN,  43200)
+drawW   = effUseW   and f_eff(useW,   10080)
+drawD   = effUseD   and f_eff(useD,   1440)
+drawH4  = effUseH4  and f_eff(useH4,  240)
+drawH1  = effUseH1  and f_eff(useH1,  60)
+drawM15 = effUseM15 and f_eff(useM15, 15)
+drawM5  = effUseM5  and f_eff(useM5,  5)
+
+// Keep each store's own-TF ATR current (drives merge/zone/break/confluence).
+stMN.atrTF  := nz(atrMN,  atrSafe)
+stW.atrTF   := nz(atrW,   atrSafe)
+stD.atrTF   := nz(atrD,   atrSafe)
+stH4.atrTF  := nz(atrH4,  atrSafe)
+stH1.atrTF  := nz(atrH1,  atrSafe)
+stM15.atrTF := nz(atrM15, atrSafe)
+stM5.atrTF  := nz(atrM5,  atrSafe)
+
+// Seed full HTF pivot history. request.security data for high timeframes can
+// resolve LATE on very low chart TFs (the old bar<=3 window silently missed
+// Weekly/Daily levels on 1m charts). Each store retries every bar through the
+// first 50 until its pivot arrays actually deliver; a per-store flag (NOT
+// store emptiness — period-extreme levels land from bar 1) marks completion.
+var bool sdMN  = false
+var bool sdW   = false
+var bool sdD   = false
+var bool sdH4  = false
+var bool sdH1  = false
+var bool sdM15 = false
+var bool sdM5  = false
+if bar_index <= 50 and bookActive
+    if not sdMN and not na(hiMN) and hiMN.size() + loMN.size() > 0
+        f_seed(stMN,  hiMN,  loMN,  hitMN,  lotMN,  effUseMN,  colMN,  2, lsMN)
+        sdMN := true
+    if not sdW and not na(hiW) and hiW.size() + loW.size() > 0
+        f_seed(stW,   hiW,   loW,   hitW,   lotW,   effUseW,   colW,   3, lsW)
+        sdW := true
+    if not sdD and not na(hiD) and hiD.size() + loD.size() > 0
+        f_seed(stD,   hiD,   loD,   hitD,   lotD,   effUseD,   colD,   2, lsD)
+        sdD := true
+    if not sdH4 and not na(hiH4) and hiH4.size() + loH4.size() > 0
+        f_seed(stH4,  hiH4,  loH4,  hitH4,  lotH4,  effUseH4,  colH4,  1, lsH4)
+        sdH4 := true
+    if not sdH1 and not na(hiH1) and hiH1.size() + loH1.size() > 0
+        f_seed(stH1,  hiH1,  loH1,  hitH1,  lotH1,  effUseH1,  colH1,  1, lsH1)
+        sdH1 := true
+    if not sdM15 and not na(hiM15) and hiM15.size() + loM15.size() > 0
+        f_seed(stM15, hiM15, loM15, hitM15, lotM15, effUseM15, colM15, 1, lsM15)
+        sdM15 := true
+    if not sdM5 and not na(hiM5) and hiM5.size() + loM5.size() > 0
+        f_seed(stM5,  hiM5,  loM5,  hitM5,  lotM5,  effUseM5,  colM5,  1, lsM5)
+        sdM5 := true
+
+// Line style per timeframe — user controlled (defaults all solid).
+if effUseMN and chgPhMN
+    f_addLevel(stMN, f_tick(phMN), true,  colMN, 2, lsMN, phtMN)
+if effUseMN and chgPlMN
+    f_addLevel(stMN, f_tick(plMN), false, colMN, 2, lsMN, pltMN)
+if effUseW and chgPhW
+    f_addLevel(stW, f_tick(phW), true,  colW, 3, lsW, phtW)
+if effUseW and chgPlW
+    f_addLevel(stW, f_tick(plW), false, colW, 3, lsW, pltW)
+if effUseD and chgPhD
+    f_addLevel(stD, f_tick(phD), true,  colD, 2, lsD, phtD)
+if effUseD and chgPlD
+    f_addLevel(stD, f_tick(plD), false, colD, 2, lsD, pltD)
+if effUseH4 and chgPhH4
+    f_addLevel(stH4, f_tick(phH4), true,  colH4, 1, lsH4, phtH4)
+if effUseH4 and chgPlH4
+    f_addLevel(stH4, f_tick(plH4), false, colH4, 1, lsH4, pltH4)
+if effUseH1 and chgPhH1
+    f_addLevel(stH1, f_tick(phH1), true,  colH1, 1, lsH1, phtH1)
+if effUseH1 and chgPlH1
+    f_addLevel(stH1, f_tick(plH1), false, colH1, 1, lsH1, pltH1)
+if effUseM15 and chgPhM15
+    f_addLevel(stM15, f_tick(phM15), true,  colM15, 1, lsM15, phtM15)
+if effUseM15 and chgPlM15
+    f_addLevel(stM15, f_tick(plM15), false, colM15, 1, lsM15, pltM15)
+if effUseM5 and chgPhM5
+    f_addLevel(stM5, f_tick(phM5), true,  colM5, 1, lsM5, phtM5)
+if effUseM5 and chgPlM5
+    f_addLevel(stM5, f_tick(plM5), false, colM5, 1, lsM5, pltM5)
+
+// Prev-period extremes (PMH/PML, PWH/PWL, PDH/PDL, prev-4H/1H H/L): committed
+// as first-class levels. These are the exact prices institutions defend, they
+// exist from the 2nd bar of every timeframe (no swing confirmation needed), and
+// merge-refine snaps any nearby swing level onto the true candle extreme.
+if effUseMN and chgXhMN
+    f_addLevel(stMN, f_tick(pHiMN), true,  colMN, 2, lsMN, pxtMN)
+if effUseMN and chgXlMN
+    f_addLevel(stMN, f_tick(pLoMN), false, colMN, 2, lsMN, pxtMN)
+if effUseW and chgXhW
+    f_addLevel(stW, f_tick(pHiW), true,  colW, 3, lsW, pxtW)
+if effUseW and chgXlW
+    f_addLevel(stW, f_tick(pLoW), false, colW, 3, lsW, pxtW)
+if effUseD and chgXhD
+    f_addLevel(stD, f_tick(pHiD), true,  colD, 2, lsD, pxtD)
+if effUseD and chgXlD
+    f_addLevel(stD, f_tick(pLoD), false, colD, 2, lsD, pxtD)
+if effUseH4 and chgXhH4
+    f_addLevel(stH4, f_tick(pHiH4), true,  colH4, 1, lsH4, pxtH4)
+if effUseH4 and chgXlH4
+    f_addLevel(stH4, f_tick(pLoH4), false, colH4, 1, lsH4, pxtH4)
+if effUseH1 and chgXhH1
+    f_addLevel(stH1, f_tick(pHiH1), true,  colH1, 1, lsH1, pxtH1)
+if effUseH1 and chgXlH1
+    f_addLevel(stH1, f_tick(pLoH1), false, colH1, 1, lsH1, pxtH1)
+
+// Break handling → touch stats → score + render (order matters). Per-bar event
+// counts are kept as globals so the Alert Engine reuses them without rescans.
+brkEvents = f_updateBreaks(stMN) + f_updateBreaks(stW) + f_updateBreaks(stD) + f_updateBreaks(stH4) + f_updateBreaks(stH1) + f_updateBreaks(stM15) + f_updateBreaks(stM5)
+touchEvents = f_touchUpdate(stMN) + f_touchUpdate(stW) + f_touchUpdate(stD) + f_touchUpdate(stH4) + f_touchUpdate(stH1) + f_touchUpdate(stM15) + f_touchUpdate(stM5)
+gBreaks += brkEvents
+gHolds  += touchEvents
+
+// Clear the clarity registry each bar; HTF stores render first so they claim
+// clusters before lower-timeframe levels (which collapse into them).
+gShownPx.clear(), gShownSc.clear(), gShownLn.clear(), gShownLb.clear()
+f_scoreAndRender(stMN,  colMN,  stW,  stD,  stH4, stH1, stM15, stM5,  drawMN)
+f_scoreAndRender(stW,   colW,   stMN, stD,  stH4, stH1, stM15, stM5,  drawW)
+f_scoreAndRender(stD,   colD,   stMN, stW,  stH4, stH1, stM15, stM5,  drawD)
+f_scoreAndRender(stH4,  colH4,  stMN, stW,  stD,  stH1, stM15, stM5,  drawH4)
+f_scoreAndRender(stH1,  colH1,  stMN, stW,  stD,  stH4, stM15, stM5,  drawH1)
+f_scoreAndRender(stM15, colM15, stMN, stW,  stD,  stH4, stH1,  stM5,  drawM15)
+f_scoreAndRender(stM5,  colM5,  stMN, stW,  stD,  stH4, stH1,  stM15, drawM5)
+
+// #############################################################################
+// # SECTION 10 — DECISION ENGINE   (evaluates the whole environment → State)
+// #   Reads ONLY what the earlier engines already produced (scores, regime,
+// #   SMC, swings) and derives reusable decision metrics + a Market State.
+// #   Nothing here repaints: all inputs are confirmed / current-bar reads.
+// #############################################################################
+
+// All stores in one collection for whole-book scans (populated once).
+var array<Store> allSt = array.new<Store>()
+if allSt.size() == 0
+    allSt.push(stMN)
+    allSt.push(stW)
+    allSt.push(stD)
+    allSt.push(stH4)
+    allSt.push(stH1)
+    allSt.push(stM15)
+    allSt.push(stM5)
+
+// Store timeframe minutes, parallel to allSt (index-matched).
+var array<float> allStMin = array.from(43200.0, 10080.0, 1440.0, 240.0, 60.0, 15.0, 5.0)
+
+// Nearest un-broken level above and below a price, with its confidence score.
+// Returns [distAbove, scoreAbove, distBelow, scoreBelow].
+f_nearest(float px) =>
+    dAbove = 1000000000.0
+    sAbove = 0.0
+    dBelow = 1000000000.0
+    sBelow = 0.0
+    for si = 0 to allSt.size() - 1
+        st = allSt.get(si)
+        if st.price.size() > 0
+            for i = 0 to st.price.size() - 1
+                if not st.broken.get(i)
+                    p  = st.price.get(i)
+                    sc = st.score.get(i)
+                    if p >= px
+                        if p - px < dAbove
+                            dAbove := p - px
+                            sAbove := sc
+                    else
+                        if px - p < dBelow
+                            dBelow := px - p
+                            sBelow := sc
+    [dAbove, sAbove, dBelow, sBelow]
+
+// --- Decision metrics (reused by Phases 8-11) -------------------------------
+[distRes, scoreRes, distSup, scoreSup] = f_nearest(close)
+distResATR = f_div(distRes, atrFast)
+distSupATR = f_div(distSup, atrFast)
+nearRes    = distResATR < 0.5
+nearSup    = distSupATR < 0.5
+
+// Overall HTF trend = alignment of the Weekly / Daily / 4H trends.
+htfAlign   = f_trendSign(trW) + f_trendSign(trD) + f_trendSign(trH4)
+htfBull    = htfAlign > 0
+htfBear    = htfAlign < 0
+
+mom        = f_div(close - close[10], atrFast)
+momPrev    = f_div(close[5] - close[15], atrFast)
+decel      = math.abs(mom) < math.abs(momPrev)
+
+rngHi      = ta.highest(high, 20)
+rngLo      = ta.lowest(low, 20)
+pos        = f_div(close - rngLo, rngHi - rngLo)
+rangeEnv   = not isTrending and not isExpand
+accumCond  = rangeEnv and pos < 0.40 and highLiq
+distCond   = rangeEnv and pos > 0.60 and highLiq
+
+wickUp     = f_div(high - math.max(open, close), atrFast)
+wickDn     = f_div(math.min(open, close) - low, atrFast)
+// SWEEP PRECISION (audit fix). A sweep is not merely a big wick NEAR a level — it
+// must (1) actually PIERCE the level (take the liquidity resting beyond it) and
+// (2) CLOSE BACK across it with rejection (closed in the far half of the bar).
+// The old test flagged any large wick within 0.5 ATR, so continuation bars that
+// closed THROUGH the level, and bars that never reached it, registered as false
+// sweeps. Requiring pierce + reclaim removes those false positives. rng guards
+// divide-by-zero on doji/empty bars.
+rng        = high - low
+resPx      = close + distRes          // nearest unbroken resistance above
+supPx      = close - distSup          // nearest unbroken support below
+piercedRes = high >= resPx            // wick took buy-side liquidity above
+piercedSup = low  <= supPx            // wick took sell-side liquidity below
+rejDown    = rng > 0 and (high - close) / rng >= 0.5   // closed in lower half → rejected up-move
+rejUp      = rng > 0 and (close - low)  / rng >= 0.5   // closed in upper half → rejected down-move
+sweepRes   = wickUp > mWick and nearRes and piercedRes and close < resPx and rejDown
+sweepSup   = wickDn > mWick and nearSup and piercedSup and close > supPx and rejUp
+sweepBar   = sweepRes or sweepSup
+
+// Sweep LINES: anchored at the wick extreme (the exact harvested-liquidity
+// price) and extended right while the pool stays unmitigated. A confirmed
+// CLOSE through the line means that liquidity is spent → line removed.
+var array<line>  swpLn = array.new<line>()
+var array<float> swpPx = array.new<float>()
+var array<bool>  swpUp = array.new<bool>()
+if swpLn.size() > 0
+    swj = swpLn.size() - 1
+    while swj >= 0
+        mitig = swpUp.get(swj) ? close > swpPx.get(swj) : close < swpPx.get(swj)
+        if mitig and barstate.isconfirmed
+            line.delete(swpLn.get(swj))
+            swpLn.remove(swj)
+            swpPx.remove(swj)
+            swpUp.remove(swj)
+        swj -= 1
+if showSweepLine and sweepBar and barstate.isconfirmed
+    swPx = sweepRes ? high : low
+    dupSw = false
+    if swpPx.size() > 0
+        for k = 0 to swpPx.size() - 1
+            if math.abs(swpPx.get(k) - swPx) <= atrFast * 0.15
+                dupSw := true
+                break
+    if not dupSw
+        swpLn.push(line.new(bar_index, swPx, bar_index + 1, swPx, xloc = xloc.bar_index,
+             extend = extend.right, color = colSweep, width = 1, style = line.style_dashed))
+        swpPx.push(swPx)
+        swpUp.push(sweepRes)
+        if swpLn.size() > swpMaxLines
+            line.delete(swpLn.shift())
+            swpPx.shift()
+            swpUp.shift()
+
+// Structure shifts from the held 1H swings (same level data — no re-detection).
+bosUp   = not na(lastPhH1) and close > lastPhH1 and close[1] <= lastPhH1
+bosDn   = not na(lastPlH1) and close < lastPlH1 and close[1] >= lastPlH1
+chochUp = bosUp and htfBear   // break AGAINST the HTF trend = character change
+chochDn = bosDn and htfBull
+plotchar(showBOSMark and bosUp and not chochUp, "BOS up",    "▲", location.belowbar, color.lime,    size = size.tiny)
+plotchar(showBOSMark and bosDn and not chochDn, "BOS down",  "▼", location.abovebar, color.red,     size = size.tiny)
+plotchar(showBOSMark and chochUp,               "CHoCH up",  "◆", location.belowbar, color.orange,  size = size.tiny)
+plotchar(showBOSMark and chochDn,               "CHoCH down","◆", location.abovebar, color.orange,  size = size.tiny)
+plotchar(showSweepMark and sweepBar,            "Sweep",     "×", location.abovebar, color.fuchsia, size = size.tiny)
+
+// --- Market State classification (priority-ordered, all explainable) --------
+marketState = "Range"
+if newsDriven and sweepBar
+    marketState := "Liquidity Hunt"
+else if isCompress
+    marketState := "Breakout Preparation"
+else if isExpand and isTrending
+    marketState := "Trend Expansion"
+else if isTrending and decel
+    marketState := "Trend Exhaustion"
+else if isTrending
+    marketState := "Momentum Continuation"
+else if accumCond
+    marketState := "Accumulation"
+else if distCond
+    marketState := "Distribution"
+else if (nearRes and htfBear and scoreRes >= adMinScore) or (nearSup and htfBull and scoreSup >= adMinScore)
+    marketState := "Reversal Risk"
+
+stateCol = marketState == "Trend Expansion" or marketState == "Momentum Continuation" ? (htfBull ? color.lime : color.red) :
+     marketState == "Accumulation"         ? color.teal    :
+     marketState == "Distribution"         ? color.maroon  :
+     marketState == "Breakout Preparation" ? color.yellow  :
+     marketState == "Liquidity Hunt"       ? color.fuchsia :
+     marketState == "Trend Exhaustion" or marketState == "Reversal Risk" ? color.orange : color.silver
+
+// --- POWER LINE v2.1: the level the market is INTERACTING with -------------
+// THE one line to keep if all others are hidden. Distances are measured in
+// DAILY ATR (chart-TF independent), so the pick — and its status — is the
+// SAME line on every chart from 1m to 1M. Ranking puts interaction first:
+// proximity dominates, a level price is trading at right now qualifies even
+// before its score matures, and score × TF importance breaks the tie so a
+// Daily/Weekly line beats a 5m line at similar distance. Falls back to the
+// nearest live level, then to the dominant HTF trend swing (empty book).
+pATR = math.max(nz(atrD, atrFast), syminfo.mintick)
+// CHART-INDEPENDENT price anchor for the Power Line pick: the Daily close is the
+// SAME value on a 1m and a 1D chart at the same instant, so ranking distance from
+// it (instead of the chart's own close, which differs per timeframe) makes the
+// pick identical across timeframes.
+dRef = nz(request.security(syminfo.tickerid, f_reqtf("D"), close, lookahead = barmerge.lookahead_off), close)
+// STABLE + FULLY NATIVE Power-ranking reference and distance scale. pRefS is the
+// PRIOR confirmed Daily close (nDref) — fixed for the session (no intraday jitter)
+// AND requested WITHOUT the sub-chart clamp, so it is identical even on a 1W/1M
+// chart (where the clamped f_reqtf("D") would have returned the Weekly close).
+// pATRn is the native Daily ATR (nDatr) used ONLY to normalise the Power ranking
+// distance, so the ranking scale is the same on every chart TF too. Both fall back
+// to the clamped values if the native request is unavailable.
+pRefS = nz(nDref, nz(request.security(syminfo.tickerid, f_reqtf("D"), close[1], lookahead = barmerge.lookahead_off), dRef))
+pATRn = math.max(nz(nDatr, nz(atrD, atrFast)), syminfo.mintick)
+
+// POWER DECISION ENGINE. The engine continuously re-evaluates every candidate; the
+// drawn line is only the OUTPUT of that decision. STABILITY: a new candidate does
+// NOT replace the current Power Decision just for ranking marginally higher — it
+// must EITHER decisively out-rank the incumbent now (POWER_MARGIN×) OR remain the
+// instantaneous winner for `powerDwell` CONFIRMED bars. This removes flicker and
+// switching between near-equal candidates. All state on confirmed bars (non-repaint,
+// display/decision only — not in the STRUCT hash).
+powerDwell   = input.int(5, "Power Decision: dwell bars to switch", minval = 1, maxval = 50, group = grpPower,
+     tooltip = "A challenger must stay the top candidate for this many confirmed bars before it replaces the current Power Decision (unless it decisively out-ranks it). Higher = steadier line.")
+POWER_MARGIN = 1.5
+var float pwrDecision = na    // committed Power Decision (what the line draws)
+var float pwrCand     = na    // challenger currently being timed
+var int   pwrCandBars = 0     // confirmed bars the challenger has led
+
+// Look up the chart-book ICS score nearest a fixed anchor price — DISPLAY ONLY.
+// The anchor PRICE is authoritative and chart-independent; its score is not (touch
+// mass accrues on chart bars), so it is shown as evidence, never used to select.
+f_bookScore(float px) =>
+    float best = na
+    bd = pATR * 0.20
+    for si = 0 to allSt.size() - 1
+        st = allSt.get(si)
+        if st.price.size() > 0
+            for i = 0 to st.price.size() - 1
+                if not st.broken.get(i) and math.abs(st.price.get(i) - px) <= bd
+                    if na(best) or st.score.get(i) > best
+                        best := st.score.get(i)
+    na(best) ? 50.0 : best
+
+// Push one fixed anchor (price, TF-weight, side, tag) into the candidate pool if
+// it exists. Shared by the Power decision and its trace — one source of truth.
+f_anchPush(array<float> px, array<float> w, array<bool> rs, array<string> tg, float p, float wt, bool r, string t) =>
+    if not na(p)
+        px.push(p)
+        w.push(wt)
+        rs.push(r)
+        tg.push(t)
+
+// FIXED INSTITUTIONAL ANCHORS (Phase 2) — the Power candidate pool is a fixed set
+// of last-confirmed HTF swings + prev-period extremes, each a SINGLE security value,
+// byte-identical on every chart TF. Built ONCE at global scope (below) so the Power
+// decision AND the Power-Decision Trace read the exact same candidate list. Ranking
+// is proximity (to the stable prior-Daily-close pRefS) × TF-importance × trend-side.
+f_powerDecision(float heldPrice, array<float> aPx, array<float> aW, array<bool> aRs, array<float> aTch) =>
+    float bp = na
+    float bs = na
+    bool  br = false
+    float bRank = -1.0
+    float fnP = na
+    float fnS = na
+    bool  fnR = false
+    nbest = 1.0e18
+    bool  heldFound = false
+    float heldS = na
+    bool  heldR = false
+    float heldRank = -1.0
+    if aPx.size() > 0
+        for i = 0 to aPx.size() - 1
+            p  = aPx.get(i)
+            w  = aW.get(i)
+            sc = f_bookScore(p)
+            d  = f_div(math.abs(pRefS - p), pATRn)  // distance from the native prior-Daily-close, native-ATR scaled
+            if d < nbest
+                nbest := d
+                fnP := p
+                fnS := sc
+                fnR := aRs.get(i)
+            if d <= powerRadius
+                prox = 1.0 / (0.30 + d)
+                tfw  = math.pow(0.55 + 0.45 * w, 2.0)
+                // CHART-INDEPENDENT + INTRADAY-STABLE selection: proximity to the
+                // fixed prior-Daily-close × TF-importance × trend-side, all identical
+                // on every chart TF and unchanging within a session. Score is NOT in
+                // the rank — it is chart-influenced.
+                below = p < pRefS
+                sideW = not powerTrendSide ? 1.0 :
+                     htfBull ? (below ? powerSideBias : 1.0 / powerSideBias) :
+                     htfBear ? (below ? 1.0 / powerSideBias : powerSideBias) : 1.0
+                // TOUCH BOOST: a repeatedly-tested level (many coincident D/W/M
+                // extremes) earns more Power. Chart-independent (aTch comes from the
+                // native extreme set), so the ranking stays identical on every TF.
+                tchMul = powerTouchOn ? 1.0 + powerTouchInfl * math.min(aTch.get(i) / 4.0, 1.5) : 1.0
+                rank = prox * tfw * sideW * tchMul
+                if rank > bRank
+                    bRank := rank
+                    bp := p
+                    bs := sc
+                    br := aRs.get(i)
+                // Track the currently-displayed (held) level's LIVE rank so the
+                // stability layer can compare challenger vs incumbent.
+                if not na(heldPrice) and math.abs(p - heldPrice) <= pATRn * 0.05
+                    heldFound := true
+                    heldS := sc
+                    heldR := aRs.get(i)
+                    heldRank := rank
+    // Nothing inside the radius → the market's nearest live level IS the raw pick.
+    if na(bp)
+        bp := fnP
+        bs := fnS
+        br := fnR
+    [bp, bs, br, bRank, heldFound, heldS, heldR, heldRank]
+
+// ── Build the fixed anchor candidate pool ONCE — the single source of truth for
+//    both the Power decision and the Power-Decision Trace. Order is fixed (ties in
+//    the decision resolve first-wins), so the trace mirrors the decision exactly.
+var array<float>  aPx  = array.new<float>()
+var array<float>  aW   = array.new<float>()
+var array<bool>   aRs  = array.new<bool>()
+var array<string> aTag = array.new<string>()
+// The pool is the 6 NATIVE prev-period extremes only (PMH/PML, PWH/PWL, PDH/PDL) —
+// each un-clamped, so byte-identical on every chart TF incl. 1W/1M. Confirmed swings
+// were dropped: they are noisier and were clamped (the old 1W divergence). This is
+// exactly the institutional reference set (prev D/W/M highs & lows).
+aPx.clear(), aW.clear(), aRs.clear(), aTag.clear()
+f_anchPush(aPx, aW, aRs, aTag, nPMH, 1.00, true,  "PMH")
+f_anchPush(aPx, aW, aRs, aTag, nPML, 1.00, false, "PML")
+f_anchPush(aPx, aW, aRs, aTag, nPWH, 0.85, true,  "PWH")
+f_anchPush(aPx, aW, aRs, aTag, nPWL, 0.85, false, "PWL")
+f_anchPush(aPx, aW, aRs, aTag, nPDH, 0.70, true,  "PDH")
+f_anchPush(aPx, aW, aRs, aTag, nPDL, 0.70, false, "PDL")
+// Per-anchor test count (chart-independent), parallel to aPx — how many recent
+// D/W/M extremes cluster on each anchor. Feeds the Power touch boost + the trace.
+var array<float> aTch = array.new<float>()
+aTch.clear()
+if aPx.size() > 0
+    for ai = 0 to aPx.size() - 1
+        aTch.push(f_touchCount(aPx.get(ai), pATRn * touchBandK))
+[rawP, rawS, rawR, rawRank, heldFound, heldS, heldR, heldRank] = f_powerDecision(pwrDecision, aPx, aW, aRs, aTch)
+
+// ── POWER DECISION TRACE — per-stage commutative fingerprints. Two chart TFs must
+//    produce identical hashes at every stage BEFORE the winner can match. Stages:
+//    S1 count · S2 prices(+side)=candidate identity · S3 TF-weights · S4 book score
+//    (display-only, NOT used to select) · S5 trend-side factor (a real select input).
+//    The FIRST stage that differs across TFs is the root cause. S6 = winner.
+//    Computed ONLY on the last bar (the table is last-bar) to avoid per-bar cost.
+pwrCount = aPx.size()
+var int trPxH = 0
+var int trWH  = 0
+var int trScH = 0
+var int trSdH = 0
+var string trWinTag = "—"
+if barstate.islast
+    trPxH := 0, trWH := 0, trScH := 0, trSdH := 0, trWinTag := "—"
+    if pwrCount > 0
+        for ti = 0 to pwrCount - 1
+            pT     = aPx.get(ti)
+            tickP  = int(math.round(pT / syminfo.mintick))
+            trPxH := int(math.abs((trPxH + tickP * 131 + (aRs.get(ti) ? 17 : 3)) % 99999989))
+            trWH  := int(math.abs((trWH + int(math.round(aW.get(ti) * 100)) * 7) % 99999989))
+            trScH := int(math.abs((trScH + int(math.round(f_bookScore(pT))) * 9) % 99999989))
+            belowT = pT < pRefS
+            sideT  = not powerTrendSide ? 1.0 : htfBull ? (belowT ? powerSideBias : 1.0 / powerSideBias) : htfBear ? (belowT ? 1.0 / powerSideBias : powerSideBias) : 1.0
+            trSdH := int(math.abs((trSdH + tickP + int(math.round(sideT * 1000))) % 99999989))
+            if not na(rawP) and math.abs(pT - rawP) <= pATRn * 0.05
+                trWinTag := aTag.get(ti)
+
+// STABILITY DECISION: commit a switch only on first pick, if the committed level is
+// gone, if the challenger DECISIVELY out-ranks the incumbent now (POWER_MARGIN×), or
+// if the same challenger has led for `powerDwell` confirmed bars. Otherwise HOLD.
+// DETERMINISTIC OUTPUT (v2.9): the drawn Power Line IS the raw argmax of the fixed
+// anchor pool — a pure function of chart-independent inputs (fixed anchors + the
+// prior-Daily-close reference pRefS + trend side). It is identical on every chart
+// timeframe and naturally stable within a session (the inputs only change when a
+// new Daily/Weekly/Monthly level prints), so NO chart-bar dwell/commit is needed.
+// The old stability layer committed a value that was PATH-DEPENDENT on each chart's
+// own bar sequence — two timeframes locked onto different anchors from the SAME
+// pool. That path dependence WAS the cross-TF divergence; it is removed here.
+// (pwrDecision / pwrCand / powerDwell are retained but inert — kept only so the
+// input and the held-rank tracking in f_powerDecision compile unchanged.)
+pwrDecision := rawP
+// POWER LINE = the STRONGEST ZONE (the single most-tested institutional level, from
+// f_topZone) — the "main level" the market respects, the same one that wins the
+// reference display's top-1. Computed ONLY on the last bar (the line only draws there)
+// to avoid per-bar cost. Falls back to the raw anchor pick if no zone exists.
+var float pwrTZp = na
+var bool  pwrTZr = false
+var float pwrTZs = -1.0
+if barstate.islast
+    [tzp, tzr, tzs] = f_topZone()
+    pwrTZp := tzp
+    pwrTZr := tzr
+    pwrTZs := tzs
+powerPrice = na(pwrTZp) ? rawP : pwrTZp
+pwrScore   = na(pwrTZp) ? rawS : pwrTZs
+powerIsRes = na(pwrTZp) ? rawR : pwrTZr
+pdist      = na(powerPrice) ? na : f_div(math.abs(close - powerPrice), pATR)
+
+// ═══ POWER DECISION TRACE (temporary) — prove the decision is deterministic ══
+// Per-STAGE commutative fingerprints of the Power candidate pipeline. Two chart
+// TFs must produce identical hashes at every stage BEFORE the winner can match;
+// the FIRST stage that differs is the root cause. Below the stages, every
+// candidate is listed (idx · tag · price · score · sideW) so the exact diverging
+// candidate is visible. Screenshot on two TFs and compare row-by-row:
+//   S1 count   — same number of candidates?
+//   S2 px+id   — same candidate PRICES + sides (candidate identity)?  [selection]
+//   S3 weight  — same TF-importance weights?                          [selection]
+//   S4 score*  — book ICS lookup — DISPLAY ONLY, NOT used to select (may differ)
+//   S5 side    — trend-side factor (htfBull/htfBear × side)           [selection]
+//   S6 WIN     — the selected anchor (tag + price). If S1/S2/S3/S5 all PASS, S6
+//                MUST match; if S6 differs, one of them differs above.
+var table dbgT = table.new(position.top_center, 5, 24, border_width = 1, frame_color = color.new(#00e676, 0), bgcolor = color.new(#0a0e14, 0))
+if showPwrTrace and barstate.islast
+    table.cell(dbgT, 0, 0, "POWER TRACE", text_color = color.white, text_size = size.tiny)
+    table.cell(dbgT, 1, 0, "S1 count", text_color = color.yellow, text_size = size.tiny)
+    table.cell(dbgT, 2, 0, str.tostring(pwrCount), text_color = color.yellow, text_size = size.tiny)
+    table.cell(dbgT, 3, 0, "S2 px+id", text_color = color.yellow, text_size = size.tiny)
+    table.cell(dbgT, 4, 0, str.tostring(trPxH), text_color = color.yellow, text_size = size.tiny)
+    table.cell(dbgT, 0, 1, "S3 weight", text_color = color.yellow, text_size = size.tiny)
+    table.cell(dbgT, 1, 1, str.tostring(trWH), text_color = color.yellow, text_size = size.tiny)
+    table.cell(dbgT, 2, 1, "S4 score*", text_color = color.gray, text_size = size.tiny)
+    table.cell(dbgT, 3, 1, str.tostring(trScH), text_color = color.gray, text_size = size.tiny)
+    table.cell(dbgT, 4, 1, "", text_color = color.gray, text_size = size.tiny)
+    table.cell(dbgT, 0, 2, "S5 side", text_color = color.yellow, text_size = size.tiny)
+    table.cell(dbgT, 1, 2, str.tostring(trSdH), text_color = color.yellow, text_size = size.tiny)
+    table.cell(dbgT, 2, 2, "S6 WIN", text_color = color.aqua, text_size = size.tiny)
+    table.cell(dbgT, 3, 2, trWinTag + " " + f_px(rawP), text_color = color.aqua, text_size = size.tiny)
+    table.cell(dbgT, 4, 2, (htfBull ? "BULL" : htfBear ? "BEAR" : "NEUT") + " cM" + str.tostring(int(chartMin)), text_color = color.aqua, text_size = size.tiny)
+    table.cell(dbgT, 0, 3, "#",     text_color = color.white, text_size = size.tiny)
+    table.cell(dbgT, 1, 3, "tag",   text_color = color.white, text_size = size.tiny)
+    table.cell(dbgT, 2, 3, "price", text_color = color.white, text_size = size.tiny)
+    table.cell(dbgT, 3, 3, "tch",   text_color = color.white, text_size = size.tiny)
+    table.cell(dbgT, 4, 3, "sideW", text_color = color.white, text_size = size.tiny)
+    if pwrCount > 0
+        for ci = 0 to pwrCount - 1
+            pc     = aPx.get(ci)
+            belowc = pc < pRefS
+            sidec  = not powerTrendSide ? 1.0 : htfBull ? (belowc ? powerSideBias : 1.0 / powerSideBias) : htfBear ? (belowc ? 1.0 / powerSideBias : powerSideBias) : 1.0
+            win    = not na(rawP) and math.abs(pc - rawP) <= pATRn * 0.05
+            cc     = win ? color.new(#00e676, 0) : color.silver
+            rr     = ci + 4
+            table.cell(dbgT, 0, rr, str.tostring(ci) + (win ? "◄" : ""), text_color = cc, text_size = size.tiny)
+            table.cell(dbgT, 1, rr, aTag.get(ci), text_color = cc, text_size = size.tiny)
+            table.cell(dbgT, 2, rr, f_px(pc), text_color = cc, text_size = size.tiny)
+            table.cell(dbgT, 3, rr, str.tostring(aTch.get(ci), "#.#"), text_color = cc, text_size = size.tiny)
+            table.cell(dbgT, 4, rr, str.tostring(sidec, "#.##"), text_color = cc, text_size = size.tiny)
+
+// Status intelligence — what the engine expects at this line (existing
+// globals only: htfAlign, momentum, side; no recomputation).
+pwrWrongSide = not na(powerPrice) and (powerIsRes ? close > powerPrice : close < powerPrice)
+pwrPressing  = not na(pdist) and pdist < 0.5
+pwrBreaking  = pwrPressing and (powerIsRes ? htfBull and mom > 0.2 : htfBear and mom < -0.2)
+pwrStatus    = na(powerPrice) ? "" :
+     pwrWrongSide and pdist < 1.5 ? "RETEST LIKELY" :
+     pwrWrongSide                 ? "BROKEN — new side" :
+     pwrBreaking                  ? "BREAK LIKELY" :
+     pwrPressing                  ? "RESPECT EXPECTED" : "HOLDING"
+
+// The Power Line snaps with Level Adjustment (e.g. Nearest Round Number) like the
+// reference lines, so it can sit on a clean round level. It is still immune to the
+// cosmetic settings (colour, labels, min-touches, max-lines) — only its own Power
+// inputs and the shared Level Adjustment move it.
+powerDraw = f_adjust(powerPrice, pATRn)
+var line  powerLn = na
+var label powerLb = na
+if showPowerLine and not na(powerDraw)
+    if na(powerLn)
+        powerLn := line.new(bar_index - 1, powerDraw, bar_index, powerDraw, xloc = xloc.bar_index,
+             extend = extend.both, color = colPower, width = powerWidth, style = line.style_solid)
+        powerLb := label.new(bar_index + labelOffset, powerDraw, "", xloc = xloc.bar_index,
+             style = label.style_none, textcolor = colPower, size = lblSz)
+    else
+        line.set_xy1(powerLn, bar_index - 1, powerDraw)
+        line.set_xy2(powerLn, bar_index, powerDraw)
+        line.set_color(powerLn, colPower)
+        line.set_width(powerLn, powerWidth)
+        label.set_xy(powerLb, bar_index + labelOffset, powerDraw)
+    // SHORT label: ⚡ price + trend arrow (▲ bull / ▼ bear) + expected state.
+    ptxt = "⚡ " + f_px(powerDraw) + (htfBull ? " ▲" : htfBear ? " ▼" : " ▬") + (powerShowStat and pwrStatus != "" ? "  " + pwrStatus : "")
+    label.set_text(powerLb, ptxt)
+    label.set_textcolor(powerLb, colPower)
+else
+    if not na(powerLn)
+        line.delete(powerLn)
+        label.delete(powerLb)
+        powerLn := na
+        powerLb := na
+
+// Tiny always-on version marker (bottom-right) — replaces the version that used to
+// sit in the Power label, so a stale paste is still catchable at a glance.
+var table verT = table.new(position.bottom_right, 1, 2)
+if barstate.islast
+    table.cell(verT, 0, 0, BUILD, text_color = color.new(color.gray, 35), text_size = size.tiny)
+    // Cross-TF proof: this DS fingerprint must be identical on every chart timeframe.
+    table.cell(verT, 0, 1, "DS " + str.tostring(f_anchorHash()), text_color = color.new(color.gray, 45), text_size = size.tiny)
+
+// ═══ INSTITUTIONAL REFERENCE LINES — cross-TF-identical MTF display ══════════
+// Draw the fixed anchors (prev D/W/M extremes + last confirmed D/W/M swings) at
+// their CURRENT single-security values — byte-identical on every chart TF and on
+// any token, independent of the history-dependent detected book. Rebuilt on the
+// last bar; strongest (Monthly) first so nearer weaker anchors merge into it.
+var array<line>  refLns = array.new<line>()
+var array<label> refLbs = array.new<label>()
+if showRefLines and barstate.islast
+    if refLns.size() > 0
+        for i = 0 to refLns.size() - 1
+            line.delete(refLns.get(i))
+    if refLbs.size() > 0
+        for i = 0 to refLbs.size() - 1
+            label.delete(refLbs.get(i))
+    refLns.clear()
+    refLbs.clear()
+    rpx  = array.new<float>()
+    rtag = array.new<string>()
+    rres = array.new<bool>()
+    rwd  = array.new<int>()
+    // NATIVE prev-period + current-period extremes (un-clamped) — identical on every
+    // chart TF. Prev-period first so a current extreme sitting on it merges cleanly.
+    f_refAdd(rpx, rtag, rres, rwd, nPMH, "PMH", true,  3)
+    f_refAdd(rpx, rtag, rres, rwd, nPML, "PML", false, 3)
+    f_refAdd(rpx, rtag, rres, rwd, nCMH, "CMH", true,  3)
+    f_refAdd(rpx, rtag, rres, rwd, nCML, "CML", false, 3)
+    f_refAdd(rpx, rtag, rres, rwd, nPWH, "PWH", true,  2)
+    f_refAdd(rpx, rtag, rres, rwd, nPWL, "PWL", false, 2)
+    f_refAdd(rpx, rtag, rres, rwd, nCWH, "CWH", true,  2)
+    f_refAdd(rpx, rtag, rres, rwd, nCWL, "CWL", false, 2)
+    f_refAdd(rpx, rtag, rres, rwd, nPDH, "PDH", true,  1)
+    f_refAdd(rpx, rtag, rres, rwd, nPDL, "PDL", false, 1)
+    f_refAdd(rpx, rtag, rres, rwd, nCDH, "CDH", true,  1)
+    f_refAdd(rpx, rtag, rres, rwd, nCDL, "CDL", false, 1)
+    if rpx.size() > 0
+        // ── CLUSTER nearby levels into ZONES ────────────────────────────────────
+        // Walk the levels in price order; levels within `clusterBandATR` (native Daily
+        // ATR) of the running cluster join it. Each zone's PRICE = the test-weighted
+        // centre of its members, its STRENGTH = the SUM of their test counts, its TAG =
+        // the strongest member. So a dense band price has hit many times (e.g. the
+        // 1824/1841/1849/1862 cluster) becomes ONE strong zone at ~its centre. All
+        // inputs are native (touch count, ATR, price) → identical on every chart TF.
+        ord = rpx.sort_indices(order.ascending)
+        zPx  = array.new<float>()      // zone drawn price (test-weighted centre)
+        zStr = array.new<float>()      // zone strength (sum of member touches)
+        zTag = array.new<string>()     // strongest member's tag
+        zRes = array.new<bool>()       // majority side (by touch)
+        band = nDatr * clusterBandATR
+        float cW = 0.0                 // Σ price·touch
+        float cT = 0.0                 // Σ touch
+        float cA = 0.0                 // Σ touch of resistance members
+        float cBest = -1.0
+        string cTag = ""
+        float lastP = na
+        for oi = 0 to ord.size() - 1
+            i  = ord.get(oi)
+            pv = rpx.get(i)
+            tv = math.max(f_touchCount(pv, pATRn * touchBandK), 0.01)
+            if not na(lastP) and (pv - lastP) > band and cT > 0
+                zPx.push(cW / cT), zStr.push(cT), zTag.push(cTag), zRes.push(cA >= cT * 0.5)
+                cW := 0.0, cT := 0.0, cA := 0.0, cBest := -1.0, cTag := ""
+            cW += pv * tv
+            cT += tv
+            cA += rres.get(i) ? tv : 0.0
+            if tv > cBest
+                cBest := tv
+                cTag  := rtag.get(i)
+            lastP := pv
+        if cT > 0
+            zPx.push(cW / cT), zStr.push(cT), zTag.push(cTag), zRes.push(cA >= cT * 0.5)
+        // ── keep the strongest maxRefLines ZONES ────────────────────────────────
+        rankIdx = zStr.sort_indices(order.descending)
+        keepN = math.min(maxRefLines, rankIdx.size())
+        keepIdx = array.new<int>()
+        for kk = 0 to keepN - 1
+            keepIdx.push(rankIdx.get(kk))
+        // Render in PRICE order; labels pinned to (far-right column, their zone price),
+        // overlaps suppressed so they never collide/drift.
+        zord = zPx.sort_indices(order.ascending)
+        float lastLbl = na
+        for oi = 0 to zord.size() - 1
+            i = zord.get(oi)
+            if not keepIdx.includes(i)
+                continue
+            if minTouches > 0 and zStr.get(i) < minTouches
+                continue
+            p   = f_adjust(zPx.get(i), pATRn)        // drawn position (snapped); zone centre stays raw
+            // The strongest zone IS the Power Line — don't draw a duplicate here.
+            if showPowerLine and not na(powerDraw) and math.abs(p - powerDraw) <= pATRn * 0.1
+                continue
+            // STRUCTURE vs LIQUIDITY: a zone whose dominant member is a CURRENT-period
+            // extreme (tag starts "C") is a liquidity line (dotted); prior-period is
+            // structural (solid). Liquidity lines are hidden when Show Liquidity is off.
+            isLiq = str.startswith(zTag.get(i), "C")
+            if isLiq and not showLiq
+                continue
+            col = colorByPos ? (p >= close ? colRefRes : colRefSup) : (zRes.get(i) ? colRefRes : colRefSup)
+            ln = line.new(bar_index - 1, p, bar_index, p, xloc = xloc.bar_index,
+                 extend = extend.both, color = col, width = isLiq ? 1 : 2, style = f_lstyle(isLiq ? styleLiq : styleStruct))
+            refLns.push(ln)
+            crowded = labelDeclutter and not na(lastLbl) and math.abs(p - lastLbl) < pATRn * labelGapATR
+            if labelMode != "Off" and not crowded
+                lastLbl := p
+                // Full = tag + price + ×strength · Compact = price + ×strength · Price only = price.
+                ltxt = labelMode == "Price only" ? f_px(p) : labelMode == "Compact" ? f_px(p) + "  ×" + str.tostring(math.round(zStr.get(i))) : zTag.get(i) + "  " + f_px(p) + "  ×" + str.tostring(math.round(zStr.get(i)))
+                lb = label.new(bar_index + labelOffset, p, ltxt, xloc = xloc.bar_index,
+                     style = label.style_none, textcolor = col, size = lblSz)
+                refLbs.push(lb)
+
+// #############################################################################
+// # SECTION 11 — PROBABILITY & TRADE-QUALITY ENGINE (weighted, explainable)
+// #   Every point comes from an existing signal; no hardcoded probabilities.
+// #############################################################################
+obBullNear = not na(obBullTop) and low <= obBullTop and high >= obBullBot
+obBearNear = not na(obBearTop) and low <= obBearTop and high >= obBearBot
+fvgBullNear = false
+fvgBearNear = false
+if fvgTop.size() > 0
+    for i = 0 to fvgTop.size() - 1
+        if close <= fvgTop.get(i) and close >= fvgBot.get(i)
+            if fvgBull.get(i)
+                fvgBullNear := true
+            else
+                fvgBearNear := true
+            break
+
+// Weighted signed evidence toward bullish (negative = bearish).
+// sweepSup / sweepRes come from the Decision Engine (Section 10) — one source.
+netBull = (18.0 * f_trendSign(trW) + 15.0 * f_trendSign(trD) + 12.0 * f_trendSign(trH4) + 6.0 * f_trendSign(trH1)) * wStruct
+netBull += nearSup ? scoreSup * 0.14 * wSRW : 0.0
+netBull -= nearRes ? scoreRes * 0.14 * wSRW : 0.0
+netBull += obBullNear ? 10.0 * wLiq : 0.0
+netBull -= obBearNear ? 10.0 * wLiq : 0.0
+netBull += fvgBullNear ? 9.0 * wLiq : 0.0
+netBull -= fvgBearNear ? 9.0 * wLiq : 0.0
+netBull += sweepSup ? 12.0 * wLiq : 0.0
+netBull -= sweepRes ? 12.0 * wLiq : 0.0
+netBull += 10.0 * wMom * f_clamp(mom, -1.0, 1.0)
+netBull += accumCond ? 8.0 * wStruct : 0.0
+netBull -= distCond ? 8.0 * wStruct : 0.0
+
+// Volatility dampening: expanding volatility discounts the probability edge.
+probScale = f_clamp(1.0 - volAdjF * math.max(volRegime - 1.3, 0.0), 0.5, 1.0)
+bullProb = f_clamp(50.0 + netBull * 0.6 * probScale, 2.0, 98.0)
+bearProb = 100.0 - bullProb
+
+edge      = math.abs(bullProb - 50.0)
+confl     = math.max(scoreSup, scoreRes)
+badRegime = newsDriven or (marketState == "Range" and edge < 15)
+// Holistic quality: prob edge + confluence + HTF alignment (not extreme-edge only).
+qPts      = badRegime ? 0.0 : edge * 0.9 + confl * 0.35 + math.abs(htfAlign) * 7.0
+tradeQuality = qPts < 18 ? "No Trade" : qPts < 30 ? "Poor" : qPts < 45 ? "Average" : qPts < 62 ? "Good" : qPts < 80 ? "High Quality" : "Excellent"
+qualCol   = qPts < 20 ? color.gray : qPts < 50 ? color.orange : qPts < 65 ? color.yellow : color.lime
+bias      = bullProb >= 58 ? "LONG" : bullProb <= 42 ? "SHORT" : "NEUTRAL"
+// Mode-shifted quality bar — the ONE tradeable-quality test every consumer
+// (trade gate, prediction logger, scanner) reads. 62 = High Quality boundary.
+qualityHQ = qPts >= 62 + mQualAdj
+
+// Explainable evidence — formats the SAME signals/weights that build netBull.
+// Single source for the dashboard, trade panel, journal and predictions.
+f_evidence(string sep) =>
+    e = f_trendSign(trW) > 0 ? "+" + str.tostring(math.round(18 * wStruct)) + " Weekly bull" + sep : f_trendSign(trW) < 0 ? "-" + str.tostring(math.round(18 * wStruct)) + " Weekly bear" + sep : ""
+    e += f_trendSign(trD) > 0 ? "+" + str.tostring(math.round(15 * wStruct)) + " Daily bull" + sep : f_trendSign(trD) < 0 ? "-" + str.tostring(math.round(15 * wStruct)) + " Daily bear" + sep : ""
+    e += f_trendSign(trH4) > 0 ? "+" + str.tostring(math.round(12 * wStruct)) + " 4H bull" + sep : f_trendSign(trH4) < 0 ? "-" + str.tostring(math.round(12 * wStruct)) + " 4H bear" + sep : ""
+    e += f_trendSign(trH1) > 0 ? "+" + str.tostring(math.round(6 * wStruct)) + " 1H bull" + sep : f_trendSign(trH1) < 0 ? "-" + str.tostring(math.round(6 * wStruct)) + " 1H bear" + sep : ""
+    e += nearSup ? "+" + str.tostring(math.round(scoreSup * 0.14 * wSRW)) + " Support(" + str.tostring(math.round(scoreSup)) + ")" + sep : ""
+    e += nearRes ? "-" + str.tostring(math.round(scoreRes * 0.14 * wSRW)) + " Resistance(" + str.tostring(math.round(scoreRes)) + ")" + sep : ""
+    e += obBullNear ? "+" + str.tostring(math.round(10 * wLiq)) + " Bull OB" + sep : ""
+    e += obBearNear ? "-" + str.tostring(math.round(10 * wLiq)) + " Bear OB" + sep : ""
+    e += fvgBullNear ? "+" + str.tostring(math.round(9 * wLiq)) + " Bull FVG" + sep : ""
+    e += fvgBearNear ? "-" + str.tostring(math.round(9 * wLiq)) + " Bear FVG" + sep : ""
+    e += sweepSup ? "+" + str.tostring(math.round(12 * wLiq)) + " Sweep down" + sep : ""
+    e += sweepRes ? "-" + str.tostring(math.round(12 * wLiq)) + " Sweep up" + sep : ""
+    e += mom > 0.3 ? "+" + str.tostring(math.round(10 * wMom * f_clamp(mom, -1, 1))) + " Momentum" + sep : mom < -0.3 ? str.tostring(math.round(10 * wMom * f_clamp(mom, -1, 1))) + " Momentum" + sep : ""
+    e += accumCond ? "+" + str.tostring(math.round(8 * wStruct)) + " Accumulation" + sep : ""
+    e += distCond ? "-" + str.tostring(math.round(8 * wStruct)) + " Distribution" + sep : ""
+    str.length(e) >= str.length(sep) and str.length(e) > 0 ? str.substring(e, 0, str.length(e) - str.length(sep)) : e
+
+// #############################################################################
+// # SECTION 12 — PERFORMANCE / SELF-REVIEW ENGINE
+// #   Compares predictions against outcomes. Predictions logged on confirmed
+// #   bars only; arrays self-prune → non-repaint and low cost.
+// #############################################################################
+// Resolve false breaks: did price close back across within FB_WIN bars?
+if fbBar.size() > 0
+    fi = fbBar.size() - 1
+    while fi >= 0
+        if bar_index - fbBar.get(fi) >= FB_WIN
+            back = fbDir.get(fi) == 1 ? close < fbPrice.get(fi) : close > fbPrice.get(fi)
+            if back
+                gFalse += 1
+            fbPrice.remove(fi)
+            fbDir.remove(fi)
+            fbBar.remove(fi)
+        fi := fi - 1
+
+// Log a high-quality directional prediction (one per PRED_WIN window).
+if barstate.isconfirmed and qualityHQ and bias != "NEUTRAL" and bar_index - lastPredBar >= PRED_WIN
+    pPrice.push(close)
+    pProb.push(bias == "LONG" ? bullProb : bearProb)
+    pBar.push(bar_index)
+    pDir.push(bias == "LONG" ? 1 : -1)
+    lastPredBar := bar_index
+
+// Resolve predictions after PRED_WIN bars: moved ≥ 1 ATR in predicted dir = win.
+if pBar.size() > 0
+    pi = pBar.size() - 1
+    while pi >= 0
+        if bar_index - pBar.get(pi) >= PRED_WIN
+            moved = (close - pPrice.get(pi)) * pDir.get(pi)
+            prob  = pProb.get(pi)
+            bkt   = prob >= 80 ? 2 : prob >= 70 ? 1 : 0
+            predTotal   += 1
+            predProbSum += prob
+            calN.set(bkt, calN.get(bkt) + 1)
+            calP.set(bkt, calP.get(bkt) + prob)
+            if moved >= atrFast
+                predWins += 1
+                calW.set(bkt, calW.get(bkt) + 1)
+            pPrice.remove(pi)
+            pProb.remove(pi)
+            pBar.remove(pi)
+            pDir.remove(pi)
+        pi := pi - 1
+
+holdRate  = (gHolds + gBreaks) > 0 ? 100.0 * gHolds / (gHolds + gBreaks) : na
+falseRate = gBreaks > 0 ? 100.0 * gFalse / gBreaks : na
+winRate   = predTotal > 0 ? 100.0 * predWins / predTotal : na
+avgProb   = predTotal > 0 ? predProbSum / predTotal : na
+calibGap  = na(winRate) ? na : avgProb - winRate
+
+// #############################################################################
+// # SECTION 13 — PROFESSIONAL DASHBOARD (all values sourced from prior engines)
+// #############################################################################
+regimeColor = newsDriven ? color.fuchsia :
+     isExpand   ? color.orange :
+     isCompress ? color.aqua   :
+     isTrending ? (trendUp ? color.lime : color.red) : color.silver
+
+// Derived display labels (no new market calculations — pure formatting).
+riskLvl     = newsDriven or volRegime > 1.6 ? "HIGH" : (isCompress or lowLiq) ? "LOW" : "MEDIUM"
+riskCol     = riskLvl == "HIGH" ? color.red : riskLvl == "LOW" ? color.lime : color.orange
+trendStrTxt = trendStr > 1.5 ? "STRONG" : trendStr > 1.0 ? "MODERATE" : trendStr > 0.4 ? "WEAK" : "FLAT"
+momTxt      = mom > 0.3 ? "UP" : mom < -0.3 ? "DOWN" : "FLAT"
+momCol      = mom > 0.3 ? color.lime : mom < -0.3 ? color.red : color.silver
+volatTxt    = isExpand ? "EXPANSION" : isCompress ? "COMPRESSION" : "NORMAL"
+expTxt      = marketState + (bias == "LONG" ? " → higher" : bias == "SHORT" ? " → lower" : "")
+altTxt      = bias == "LONG" ? "Fail → drop to support" : bias == "SHORT" ? "Fail → rally to resistance" : "Break either side"
+
+var table panel = table.new(f_panelPos(panelPos), 2, 47, border_width = 1,
+     frame_color = color.new(color.gray, 60), frame_width = 1)
+
+f_prow(int r, string k, string v, color vc) =>
+    table.cell(panel, 0, r, k, text_color = color.new(color.gray, 0),
+         text_size = size.small, text_halign = text.align_left)
+    table.cell(panel, 1, r, v, text_color = vc,
+         text_size = size.small, text_halign = text.align_right)
+
+if showPanel and barstate.islast
+    // Version row — deliberately the loudest cell on the panel (yellow bg,
+    // black bold text) so you can confirm the running build at a glance.
+    table.cell(panel, 0, 0, "IA-SR  " + BUILD, text_color = color.black,
+         bgcolor = color.new(#ffd600, 0), text_size = size.normal, text_halign = text.align_left)
+    table.cell(panel, 1, 0, "STRUCTURE", text_color = color.black,
+         bgcolor = color.new(#ffd600, 0), text_size = size.small, text_halign = text.align_right)
+    f_prow(1,  "Regime",       regimeTxt,                                     regimeColor)
+    f_prow(2,  "Vol Regime",   str.tostring(volRegime, "#.##") + "x",         volRegime > 1.15 ? color.orange : volRegime < 0.85 ? color.aqua : color.silver)
+    f_prow(3,  "Trend Str",    str.tostring(trendStr, "#.##") + (trendUp ? " ▲" : " ▼"), isTrending ? (trendUp ? color.lime : color.red) : color.silver)
+    f_prow(4,  "Liquidity",    highLiq ? "HIGH" : lowLiq ? "LOW" : "NORMAL",  highLiq ? color.lime : lowLiq ? color.orange : color.silver)
+    f_prow(5,  "News/Shock",   newsDriven ? "ACTIVE" : "—",                   newsDriven ? color.fuchsia : color.silver)
+    // Adaptive + swing detail rows — hidden in Compact mode.
+    if not dashCompact
+        f_prow(6,  "→ Pivot Len",  str.tostring(adPivotLen),                      color.silver)
+        f_prow(7,  "→ Zone Mult",  str.tostring(adZoneMult, "#.##") + "x",        color.silver)
+        f_prow(8,  "→ ATR Mult",   str.tostring(adAtrMult, "#.##") + "x",         color.silver)
+        f_prow(9,  "→ Confirm",    str.tostring(adConfirmTouches) + " touch",     color.silver)
+        f_prow(10, "→ Min Score",  str.tostring(adMinScore),                      color.silver)
+        f_prow(11, "→ React Thr",  str.tostring(adReactThr, "#.##") + " ATR",     color.silver)
+        f_prow(12, "→ Merge Mult", str.tostring(adMergeMult, "#.##") + "x",       color.silver)
+        // --- Phase 2: confirmed HTF swings (exact price) + per-TF adaptive leg ---
+        f_prow(13, "MN Swing H/L", f_px(lastPhMN) + " / " + f_px(lastPlMN),       colMN)
+        f_prow(14, "W  Swing H/L", f_px(lastPhW)  + " / " + f_px(lastPlW),        colW)
+        f_prow(15, "D  Swing H/L", f_px(lastPhD)  + " / " + f_px(lastPlD),        colD)
+        f_prow(16, "4H Swing H/L", f_px(lastPhH4) + " / " + f_px(lastPlH4),       colH4)
+        f_prow(17, "1H Swing H/L", f_px(lastPhH1) + " / " + f_px(lastPlH1),       colH1)
+        f_prow(18, "Leg M/W/D/4H/1H/15/5", str.tostring(legMN) + "/" + str.tostring(legW) + "/" + str.tostring(legD) + "/" + str.tostring(legH4) + "/" + str.tostring(legH1) + "/" + str.tostring(legM15) + "/" + str.tostring(legM5), color.silver)
+        f_prow(19, "ATR M/W/D/4H/1H/15/5", str.tostring(atrMN, "#.##") + "/" + str.tostring(atrW, "#.##") + "/" + str.tostring(atrD, "#.##") + "/" + str.tostring(atrH4, "#.##") + "/" + str.tostring(atrH1, "#.##") + "/" + str.tostring(atrM15, "#.##") + "/" + str.tostring(atrM5, "#.##"), color.silver)
+        f_prow(20, "Lvls M/W/D/4H/1H/15/5", str.tostring(stMN.price.size()) + "/" + str.tostring(stW.price.size()) + "/" + str.tostring(stD.price.size()) + "/" + str.tostring(stH4.price.size()) + "/" + str.tostring(stH1.price.size()) + "/" + str.tostring(stM15.price.size()) + "/" + str.tostring(stM5.price.size()), color.white)
+    // --- Phase 7: Decision Engine output ------------------------------------
+    f_prow(21, "MARKET STATE", marketState, stateCol)
+    f_prow(22, "HTF Bias",     htfAlign > 0 ? "BULLISH (+" + str.tostring(htfAlign) + ")" : htfAlign < 0 ? "BEARISH (" + str.tostring(htfAlign) + ")" : "NEUTRAL", htfBull ? color.lime : htfBear ? color.red : color.silver)
+    f_prow(23, "Near S/R (ATR)", (distResATR < 100 ? "R " + str.tostring(distResATR, "#.#") + " (" + str.tostring(math.round(scoreRes)) + ")" : "R —") + " · " + (distSupATR < 100 ? "S " + str.tostring(distSupATR, "#.#") + " (" + str.tostring(math.round(scoreSup)) + ")" : "S —"), color.silver)
+    // --- MTF trend state per timeframe --------------------------------------
+    f_prow(24, "MN Trend", f_trendState(trMN), f_trendCol(trMN))
+    f_prow(25, "1W Trend", f_trendState(trW),  f_trendCol(trW))
+    f_prow(26, "1D Trend", f_trendState(trD),  f_trendCol(trD))
+    f_prow(27, "4H Trend", f_trendState(trH4), f_trendCol(trH4))
+    f_prow(28, "1H Trend", f_trendState(trH1), f_trendCol(trH1))
+    f_prow(29, "15M Trend", f_trendState(trM15), f_trendCol(trM15))
+    f_prow(30, "5M Trend",  f_trendState(trM5),  f_trendCol(trM5))
+    // --- Phase 10: environment + scenario + evidence ------------------------
+    f_prow(31, "Trend Strength", trendStrTxt, isTrending ? (trendUp ? color.lime : color.red) : color.silver)
+    f_prow(32, "Momentum",   momTxt,   momCol)
+    f_prow(33, "Volatility", volatTxt, isExpand ? color.orange : isCompress ? color.aqua : color.silver)
+    f_prow(34, "Risk Level", riskLvl,  riskCol)
+    f_prow(35, "Support Conf",    distSupATR < 100 ? str.tostring(math.round(scoreSup)) : "—", scoreSup >= 80 ? color.lime : color.silver)
+    f_prow(36, "Resistance Conf", distResATR < 100 ? str.tostring(math.round(scoreRes)) : "—", scoreRes >= 80 ? color.red : color.silver)
+    f_prow(37, "Expected",    expTxt, stateCol)
+    f_prow(38, "Alternative", altTxt, color.silver)
+    // --- Phase 9: self-review results (live accuracy of the engine) ---------
+    if showPerfPanel and not dashCompact
+        f_prow(39, "Hold Rate",   na(holdRate) ? "—" : str.tostring(math.round(holdRate)) + "%  (" + str.tostring(gHolds) + "/" + str.tostring(gHolds + gBreaks) + ")", na(holdRate) ? color.silver : holdRate >= 60 ? color.lime : color.orange)
+        f_prow(40, "False Breaks", na(falseRate) ? "—" : str.tostring(math.round(falseRate)) + "% of breaks", color.silver)
+        f_prow(41, "Pred Win",    na(winRate) ? "—" : str.tostring(math.round(winRate)) + "%  (" + str.tostring(predTotal) + " preds)", na(winRate) ? color.silver : winRate >= 55 ? color.lime : color.orange)
+    // Calibration by probability bucket: expected vs realised win rate.
+    if showCalPanel and not dashCompact
+        f_prow(42, "Calibration", na(calibGap) ? "—" : (calibGap > 0 ? "+" : "") + str.tostring(math.round(calibGap)) + "% overconf", na(calibGap) ? color.silver : math.abs(calibGap) <= 10 ? color.lime : color.orange)
+        f_prow(43, "Cal <70%",   calN.get(0) > 0 ? "exp " + str.tostring(math.round(calP.get(0) / calN.get(0))) + " · act " + str.tostring(math.round(100.0 * calW.get(0) / calN.get(0))) + " (" + str.tostring(calN.get(0)) + ")" : "—", color.silver)
+        f_prow(44, "Cal 70-80%", calN.get(1) > 0 ? "exp " + str.tostring(math.round(calP.get(1) / calN.get(1))) + " · act " + str.tostring(math.round(100.0 * calW.get(1) / calN.get(1))) + " (" + str.tostring(calN.get(1)) + ")" : "—", color.silver)
+        f_prow(45, "Cal 80%+",   calN.get(2) > 0 ? "exp " + str.tostring(math.round(calP.get(2) / calN.get(2))) + " · act " + str.tostring(math.round(100.0 * calW.get(2) / calN.get(2))) + " (" + str.tostring(calN.get(2)) + ")" : "—", color.silver)
+    // Explainable evidence — same weights that build Bull Prob (one source).
+    if showEviPanel
+        evi = f_evidence("\n")
+        table.cell(panel, 0, 46, "Evidence", text_color = color.new(color.gray, 0), text_size = size.small, text_halign = text.align_left)
+        table.cell(panel, 1, 46, evi == "" ? "—" : evi, text_color = color.silver, text_size = size.tiny, text_halign = text.align_left)
+
+// #############################################################################
+// # SECTION 14 — INSTITUTIONAL TRADE EXECUTION ENGINE
+// #   Converts existing engine outputs into a validated, executable trade plan.
+// #   No market recalculation — reuses bias/probs/quality/scores/levels/ATR.
+// #############################################################################
+grpTrade      = "Trade Execution Engine"
+showTradePlan = input.bool(true, "Show Trade Plan", group = grpTrade)
+showDiag      = input.bool(true, "Show Validation Diagnostic", group = grpTrade)
+minProbT      = input.int(65, "Min Probability %", minval = 50, maxval = 95, group = grpTrade)
+minRR         = input.float(2.0, "Min Reward:Risk", minval = 1.0, maxval = 10.0, step = 0.1, group = grpTrade)
+minScoreT     = input.int(60, "Min S/R Confidence", minval = 0, maxval = 100, group = grpTrade)
+accRiskPct    = input.float(1.0, "Account Risk %", minval = 0.1, maxval = 10.0, step = 0.1, group = grpTrade)
+riskMode      = input.string("Normal", "Risk Mode", options = ["Low", "Normal", "Aggressive"], group = grpTrade)
+atrStopM      = input.float(1.5, "ATR Stop Multiplier", minval = 0.5, maxval = 4.0, step = 0.1, group = grpTrade,
+     tooltip = "Scales the volatility-stop fallback AND the structural-stop bounds.")
+tpScale       = input.float(1.5, "TP Expansion × ATR", minval = 0.5, maxval = 4.0, step = 0.1, group = grpTrade)
+freqCap       = input.int(0, "Trade Frequency Cap (bars)", minval = 0, maxval = 500, group = grpTrade,
+     tooltip = "Minimum bars between Tier-A signals. 0 = off. A capped setup is demoted to Tier B (WATCH), not hidden.")
+entryMaxAtr   = input.float(4.0, "Max Entry Distance (ATR)", minval = 0.5, maxval = 10.0, step = 0.5, group = grpTrade,
+     tooltip = "Entry strictness: the limit entry must sit within this many ATR of current price.")
+
+// Mode + risk-derived effective thresholds (single source for all gates).
+riskMult    = riskMode == "Low" ? 0.5 : riskMode == "Aggressive" ? 2.0 : 1.0
+effMinProb  = f_clamp(minProbT + mProbAdj, 50, 98)
+effMinScore = f_clamp(minScoreT + mScoreAdj, 0, 100)
+
+grpAlert        = "Alert Engine"
+alertTradeReady = input.bool(true,  "Alert: validated trade plan ready", group = grpAlert,
+     tooltip = "Fires when the full validation gate flips to READY. Create a TradingView alert on this indicator with 'Any alert() function call'.")
+alertWatch      = input.bool(false, "Alert: Tier-B WATCH setup", group = grpAlert)
+alertLvlBreak   = input.bool(false, "Alert: S/R level break", group = grpAlert)
+alertSweep      = input.bool(false, "Alert: liquidity sweep at S/R", group = grpAlert)
+
+// Collect un-broken levels strictly above (dir 1) or below (dir -1) a price,
+// sorted nearest-first. Reuses the level book — no new detection.
+f_gather(float px, int dir) =>
+    arr = array.new<float>()
+    for si = 0 to allSt.size() - 1
+        st = allSt.get(si)
+        if st.price.size() > 0
+            for i = 0 to st.price.size() - 1
+                if not st.broken.get(i)
+                    p = st.price.get(i)
+                    if (dir == 1 and p > px) or (dir == -1 and p < px)
+                        arr.push(p)
+    if dir == 1
+        arr.sort(order.ascending)
+    else
+        arr.sort(order.descending)
+    arr
+
+f_setLn(line ln, int x1, int x2, float y, bool vis, color c) =>
+    line.set_xy1(ln, x1, na(y) ? close : y)
+    line.set_xy2(ln, x2, na(y) ? close : y)
+    line.set_color(ln, vis and not na(y) ? c : color.new(c, 100))
+
+f_setBx(box b, int x1, int x2, float a, float d, bool vis, color c) =>
+    box.set_left(b, x1)
+    box.set_right(b, x2)
+    box.set_top(b, na(a) or na(d) ? close : math.max(a, d))
+    box.set_bottom(b, na(a) or na(d) ? close : math.min(a, d))
+    box.set_bgcolor(b, vis and not na(a) and not na(d) ? c : color.new(c, 100))
+
+var line  tEntry = na
+var line  tStop  = na
+var line  tTp1   = na
+var line  tTp2   = na
+var line  tTp3   = na
+var box   tRisk  = na
+var box   tRew   = na
+var label tRR    = na
+var table tPanel = table.new(position.bottom_right, 2, 29, border_width = 1,
+     frame_color = color.new(color.gray, 60), frame_width = 1)
+
+f_trow(int r, string k, string v, color vc) =>
+    table.cell(tPanel, 0, r, k, text_color = color.new(color.gray, 0), text_size = size.small, text_halign = text.align_left)
+    table.cell(tPanel, 1, r, v, text_color = vc, text_size = size.small, text_halign = text.align_right)
+
+f_diag(int r, string name, bool pass, string detail) =>
+    f_trow(r, name, (pass ? "PASS" : "FAIL") + (detail == "" ? "" : "  " + detail), pass ? color.lime : color.red)
+
+// --- Plan computation (pure decision layer — runs every bar, no drawing) ----
+//     One computation feeds the chart render, Alert Engine, Scanner and the
+//     JSON export. Nothing downstream recomputes any of it.
+dirLong  = bias == "LONG"
+dirShort = bias == "SHORT"
+dirSign  = dirLong ? 1 : -1
+dirProb  = dirLong ? bullProb : dirShort ? bearProb : 0.0
+srConf   = dirLong ? scoreSup : dirShort ? scoreRes : 0.0
+// Entry: nearest opposing structure (buy support / sell resistance).
+sups  = f_gather(close, -1)
+ress  = f_gather(close, 1)
+entry = dirLong ? (sups.size() > 0 ? sups.get(0) : na) : dirShort ? (ress.size() > 0 ? ress.get(0) : na) : na
+// Structural stop: beyond the next level past entry, ATR-buffered, bounded to
+// [0.5 .. 3.0] ATR from entry — no degenerate micro-risk, no unrealistic
+// far-structure stop (beyond 3 ATR the structural premise is stale anyway).
+float stop = na
+if dirLong and not na(entry)
+    s0 = (sups.size() > 1 ? sups.get(1) : entry - atrFast * atrStopM) - atrFast * 0.25
+    stop := f_clamp(s0, entry - atrFast * atrStopM * 2.0, entry - atrFast * atrStopM / 3.0)
+if dirShort and not na(entry)
+    s0 = (ress.size() > 1 ? ress.get(1) : entry + atrFast * atrStopM) + atrFast * 0.25
+    stop := f_clamp(s0, entry + atrFast * atrStopM / 3.0, entry + atrFast * atrStopM * 2.0)
+// Targets: next levels in trade direction, ATR-expansion fallback.
+tgt = na(entry) ? array.new<float>() : (dirLong ? f_gather(entry, 1) : f_gather(entry, -1))
+tp1 = tgt.size() > 0 ? tgt.get(0) : na
+tp2 = tgt.size() > 1 ? tgt.get(1) : na
+tp3 = tgt.size() > 2 ? tgt.get(2) : na
+tp1 := na(tp1) and not na(entry) ? entry + dirSign * atrFast * tpScale : tp1
+tp2 := na(tp2) and not na(tp1)   ? tp1   + dirSign * atrFast * tpScale : tp2
+tp3 := na(tp3) and not na(tp2)   ? tp2   + dirSign * atrFast * tpScale : tp3
+finalTP = tp3
+risk    = na(entry) or na(stop)    ? na : math.abs(entry - stop)
+reward  = na(entry) or na(finalTP) ? na : math.abs(finalTP - entry)
+rrVal   = na(risk) or risk == 0 ? 0.0 : reward / risk
+stopPct = na(entry) or entry == 0 or na(stop) ? na : math.abs(entry - stop) / entry * 100
+posPct  = na(stopPct) or stopPct == 0 ? na : accRiskPct * riskMult / stopPct * 100
+// Validation gate — never force a trade. Thresholds are mode-shifted.
+qOK      = qualityHQ
+probOK   = dirProb >= effMinProb
+alignOK  = dirLong ? htfAlign > 0 : dirShort ? htfAlign < 0 : false
+srOK     = srConf >= effMinScore
+// "Reversal Risk" only blocks trades AGAINST the expected reversal. A reversal
+// back into the HTF trend at our own entry structure IS the setup, not a veto.
+revFavors = dirLong ? nearSup and htfBull : dirShort ? nearRes and htfBear : false
+structOK  = marketState != "Reversal Risk" or revFavors
+lvlsOK   = not na(entry) and not na(stop) and not na(tp1)
+rrOK     = rrVal >= minRR
+nearOK   = not na(entry) and math.abs(close - entry) <= atrFast * entryMaxAtr
+valid    = (dirLong or dirShort) and qOK and probOK and alignOK and srOK and structOK and lvlsOK and rrOK and nearOK
+
+// --- 3-TIER OUTPUT: hard gates stay hard for EXECUTE, but borderline setups
+//     earn a weighted gate score and surface as WATCH instead of vanishing.
+gs = 0.0
+gs += qOK ? 25.0 : qPts >= 45 + mQualAdj ? 15.0 : 0.0
+gs += probOK ? 20.0 : dirProb >= effMinProb - 8 ? 12.0 : 0.0
+gs += alignOK ? 15.0 : htfAlign != 0 ? 8.0 : 0.0
+gs += srOK ? 15.0 : srConf >= effMinScore - 15 ? 8.0 : 0.0
+gs += structOK ? 10.0 : 0.0
+gs += lvlsOK ? 5.0 : 0.0
+gs += rrOK ? 5.0 : rrVal >= minRR * 0.75 ? 3.0 : 0.0
+gs += nearOK ? 5.0 : 0.0
+var int lastABar = -100000
+capOK = freqCap == 0 or bar_index - lastABar >= freqCap
+tierA = valid and capOK
+tierB = not tierA and (dirLong or dirShort) and lvlsOK and gs >= 55.0
+tier  = tierA ? "A" : tierB ? "B" : "C"
+tierTxt = tierA ? "TIER A — EXECUTE" : tierB ? "TIER B — WATCH" : "TIER C — IGNORE"
+tierCol = tierA ? color.lime : tierB ? color.yellow : color.gray
+if barstate.isconfirmed and tierA
+    lastABar := bar_index
+
+// --- Alert Engine (confirmed bars only — consumes the same plan/state) ------
+if barstate.isconfirmed
+    if alertTradeReady and tierA and not tierA[1]
+        alert("IA-SR " + syminfo.ticker + " " + timeframe.period + " · TIER A · " + bias + " plan ready · entry " + f_px(entry) + " · SL " + f_px(stop) + " · TP1 " + f_px(tp1) + " · R:R " + str.tostring(rrVal, "#.#") + " · " + tradeQuality, alert.freq_once_per_bar)
+    if alertWatch and tierB and not tierB[1]
+        alert("IA-SR " + syminfo.ticker + " " + timeframe.period + " · TIER B WATCH · " + bias + " " + str.tostring(math.round(dirProb)) + "% · gate score " + str.tostring(math.round(gs)) + "/100", alert.freq_once_per_bar)
+    if alertLvlBreak and brkEvents > 0
+        alert("IA-SR " + syminfo.ticker + " " + timeframe.period + " · S/R level break (" + str.tostring(brkEvents) + ")", alert.freq_once_per_bar)
+    if alertSweep and sweepBar
+        alert("IA-SR " + syminfo.ticker + " " + timeframe.period + " · liquidity sweep at " + (sweepRes ? "resistance" : "support"), alert.freq_once_per_bar)
+
+// Static hooks for the Create Alert dialog (no webhook payload needed).
+alertcondition(tierA and not tierA[1], "IA-SR: Tier A Execute", "IA-SR validated institutional trade plan available")
+alertcondition(tierB and not tierB[1], "IA-SR: Tier B Watch", "IA-SR structure forming — awaiting confirmation")
+alertcondition(sweepBar, "IA-SR: Liquidity Sweep", "IA-SR liquidity sweep at S/R level")
+
+// #############################################################################
+// # SECTION 14B — TRADE REPLAY / POST-MORTEM JOURNAL
+// #   Records every validated plan with its evidence snapshot, simulates the
+// #   limit-order lifecycle on confirmed bars (fill → stop/target race,
+// #   conservative stop-first), and journals WHY each trade was taken and how
+// #   it ended. Debugging + continuous-improvement tool; also yields the real
+// #   plan win rate shown on the trade panel and exported to Python.
+// #############################################################################
+grpJrn      = "Trade Journal"
+showJournal = input.bool(true, "Show Trade Journal (plan post-mortem)", group = grpJrn)
+
+JRN_FILL_WIN = 40    // bars a pending limit entry stays working
+JRN_LIFE     = 200   // bars a filled trade may run before force-close
+
+var array<int>    jDir   = array.new<int>()
+var array<float>  jEntry = array.new<float>()
+var array<float>  jStop  = array.new<float>()
+var array<float>  jTp    = array.new<float>()
+var array<int>    jBar   = array.new<int>()
+var array<int>    jFill  = array.new<int>()     // fill bar, -1 = pending
+var array<float>  jProb  = array.new<float>()
+var array<string> jEvi   = array.new<string>()
+var array<string> jLog   = array.new<string>()  // resolved records, newest first
+var int planTotal = 0
+var int planWins  = 0
+
+if barstate.isconfirmed
+    // 1) New Tier-A plan → open a record (one per EXECUTE flip).
+    if tierA and not tierA[1]
+        jDir.push(dirLong ? 1 : -1)
+        jEntry.push(entry)
+        jStop.push(stop)
+        jTp.push(tp1)
+        jBar.push(bar_index)
+        jFill.push(-1)
+        jProb.push(dirProb)
+        jEvi.push(f_evidence(", "))
+        if jDir.size() > 10
+            jDir.remove(0)
+            jEntry.remove(0)
+            jStop.remove(0)
+            jTp.remove(0)
+            jBar.remove(0)
+            jFill.remove(0)
+            jProb.remove(0)
+            jEvi.remove(0)
+    // 2) Lifecycle: fill first, then a conservative stop-before-target race.
+    if jDir.size() > 0
+        k = jDir.size() - 1
+        while k >= 0
+            d       = jDir.get(k)
+            side    = d == 1 ? "LONG " : "SHORT "
+            ep      = jEntry.get(k)
+            done    = false
+            win     = false
+            counted = true
+            txt     = ""
+            if jFill.get(k) < 0
+                if (d == 1 ? low <= ep : high >= ep)
+                    jFill.set(k, bar_index)
+                else if bar_index - jBar.get(k) > JRN_FILL_WIN
+                    txt := "— " + side + f_px(ep) + " never filled"
+                    done := true
+                    counted := false
+            if not done and jFill.get(k) >= 0
+                rMult = f_div(math.abs(jTp.get(k) - ep), math.abs(ep - jStop.get(k)))
+                if (d == 1 ? low <= jStop.get(k) : high >= jStop.get(k))
+                    txt := "✖ " + side + f_px(ep) + " → SL (-1R)"
+                    done := true
+                else if (d == 1 ? high >= jTp.get(k) : low <= jTp.get(k))
+                    txt := "✔ " + side + f_px(ep) + " → TP1 (+" + str.tostring(rMult, "#.#") + "R)"
+                    win := true
+                    done := true
+                else if bar_index - jFill.get(k) > JRN_LIFE
+                    pnlR = f_div((close - ep) * d, math.abs(ep - jStop.get(k)))
+                    win := pnlR > 0
+                    txt := (win ? "✔ " : "✖ ") + side + f_px(ep) + " → timeout (" + (pnlR > 0 ? "+" : "") + str.tostring(pnlR, "#.#") + "R)"
+                    done := true
+            if done
+                if counted
+                    planTotal += 1
+                    if win
+                        planWins += 1
+                jLog.unshift(txt + " · " + str.tostring(math.round(jProb.get(k))) + "% · " + jEvi.get(k))
+                if jLog.size() > 8
+                    jLog.pop()
+                jDir.remove(k)
+                jEntry.remove(k)
+                jStop.remove(k)
+                jTp.remove(k)
+                jBar.remove(k)
+                jFill.remove(k)
+                jProb.remove(k)
+                jEvi.remove(k)
+            k := k - 1
+
+var table jrnT = table.new(position.bottom_left, 1, 10, border_width = 1,
+     frame_color = color.new(color.gray, 60), frame_width = 1)
+if barstate.islast and showJournal
+    planRate = planTotal > 0 ? str.tostring(math.round(100.0 * planWins / planTotal)) + "%" : "—"
+    table.cell(jrnT, 0, 0, "TRADE JOURNAL — PLAN POST-MORTEM", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(jrnT, 0, 1, "Plans " + str.tostring(planTotal) + " · Wins " + str.tostring(planWins) + " · Win rate " + planRate + " · Open " + str.tostring(jDir.size()), text_color = color.silver, text_size = size.small, text_halign = text.align_left)
+    for r = 0 to 7
+        table.cell(jrnT, 0, r + 2, r < jLog.size() ? jLog.get(r) : "", text_color = color.silver, text_size = size.tiny, text_halign = text.align_left)
+
+if barstate.islast and showTradePlan
+    // --- Chart plan (visualization only — consumes the plan globals) ---------
+    x1 = bar_index
+    x2 = bar_index + 15
+    if na(tEntry)
+        tEntry := line.new(x1, close, x2, close, xloc = xloc.bar_index, width = 2)
+        tStop  := line.new(x1, close, x2, close, xloc = xloc.bar_index, width = 2)
+        tTp1   := line.new(x1, close, x2, close, xloc = xloc.bar_index, width = 1)
+        tTp2   := line.new(x1, close, x2, close, xloc = xloc.bar_index, width = 1)
+        tTp3   := line.new(x1, close, x2, close, xloc = xloc.bar_index, width = 1)
+        tRisk  := box.new(x1, close, x2, close, xloc = xloc.bar_index, border_width = 0)
+        tRew   := box.new(x1, close, x2, close, xloc = xloc.bar_index, border_width = 0)
+        tRR    := label.new(x2, close, "", xloc = xloc.bar_index, style = label.style_label_left, size = size.small)
+    f_setLn(tEntry, x1, x2, entry, valid and showEntryLn, color.new(#2962ff, 0))
+    f_setLn(tStop,  x1, x2, stop,  valid and showSLLn,    color.new(#e53935, 0))
+    f_setLn(tTp1,   x1, x2, tp1,   valid and showTPLn,    color.new(#26a69a, 0))
+    f_setLn(tTp2,   x1, x2, tp2,   valid and showTPLn,    color.new(#26a69a, 20))
+    f_setLn(tTp3,   x1, x2, tp3,   valid and showTPLn,    color.new(#26a69a, 40))
+    f_setBx(tRisk,  x1, x2, entry, stop,    valid and showRiskBx, color.new(#e53935, 82))
+    f_setBx(tRew,   x1, x2, entry, finalTP, valid and showRiskBx, color.new(#26a69a, 82))
+    label.set_xy(tRR, x2, na(entry) ? close : entry)
+    label.set_text(tRR, valid ? "R:R " + str.tostring(rrVal, "#.#") + " : 1" : "")
+    label.set_color(tRR, valid ? color.new(#2962ff, 0) : color.new(#2962ff, 100))
+    label.set_textcolor(tRR, color.white)
+    // --- Trade summary panel --------------------------------------------------
+    mgmt  = dirLong ? "BE @TP1 · trail below HLs · scale @TP2 · exit on break" : dirShort ? "BE @TP1 · trail above LHs · scale @TP2 · exit on break" : "—"
+    inval = dirLong ? "HTF→bearish · support fails · prob<" + str.tostring(math.round(effMinProb)) + "% · Reversal" : dirShort ? "HTF→bullish · resistance fails · prob<" + str.tostring(math.round(effMinProb)) + "% · Reversal" : "—"
+    statusTxt = tierTxt + (tierA ? "" : "  (" + str.tostring(math.round(gs)) + "/100)")
+    statusCol = tierCol
+    table.cell(tPanel, 0, 0, "INSTITUTIONAL TRADE PLAN", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(tPanel, 1, 0, "", text_color = color.white)
+    f_trow(1,  "Status",      statusTxt, statusCol)
+    f_trow(2,  "Direction",   dirLong ? "LONG" : dirShort ? "SHORT" : "—", dirLong ? color.lime : dirShort ? color.red : color.silver)
+    f_trow(3,  "Entry",       valid ? f_px(entry) : "—", color.silver)
+    f_trow(4,  "Stop Loss",   valid ? f_px(stop)  : "—", color.new(#e53935, 0))
+    f_trow(5,  "TP1",         valid ? f_px(tp1) : "—", color.new(#26a69a, 0))
+    f_trow(6,  "TP2",         valid ? f_px(tp2) : "—", color.new(#26a69a, 0))
+    f_trow(7,  "TP3",         valid ? f_px(tp3) : "—", color.new(#26a69a, 0))
+    f_trow(8,  "Risk:Reward", valid ? str.tostring(rrVal, "#.#") + " : 1" : "—", rrVal >= minRR ? color.lime : color.silver)
+    f_trow(9,  "Position",    valid and not na(posPct) ? str.tostring(posPct, "#.#") + "% notional" : "—", color.silver)
+    f_trow(10, "Trade Quality", tradeQuality, qualCol)
+    f_trow(11, "Probability", str.tostring(math.round(dirProb)) + "%", dirProb >= effMinProb ? color.lime : color.silver)
+    f_trow(12, "Exp. Success", planTotal > 0 ? str.tostring(math.round(100.0 * planWins / planTotal)) + "% (plans)" : na(winRate) ? "—" : str.tostring(math.round(winRate)) + "% (bias)", color.silver)
+    f_trow(13, "Expected",    expTxt, stateCol)
+    f_trow(14, "Risk Level",  riskLvl, riskCol)
+    table.cell(tPanel, 0, 15, "Manage", text_color = color.new(color.gray, 0), text_size = size.tiny, text_halign = text.align_left)
+    table.cell(tPanel, 1, 15, valid ? mgmt : "—", text_color = color.silver, text_size = size.tiny, text_halign = text.align_right)
+    table.cell(tPanel, 0, 16, "Invalid if", text_color = color.new(color.gray, 0), text_size = size.tiny, text_halign = text.align_left)
+    table.cell(tPanel, 1, 16, valid ? inval : "—", text_color = color.silver, text_size = size.tiny, text_halign = text.align_right)
+    // --- Validation diagnostic: EVERY failed condition (effective thresholds) -
+    fails = (qOK ? "" : "quality=" + tradeQuality + " · ") + (probOK ? "" : "prob " + str.tostring(math.round(dirProb)) + "<" + str.tostring(math.round(effMinProb)) + " · ") + (alignOK ? "" : "HTF align " + str.tostring(htfAlign) + " · ") + (structOK ? "" : "reversal-risk · ") + (srOK ? "" : "S/R " + str.tostring(math.round(srConf)) + "<" + str.tostring(math.round(effMinScore)) + " · ") + (lvlsOK ? "" : "no levels · ") + (rrOK ? "" : "R:R " + str.tostring(rrVal, "#.#") + "<" + str.tostring(minRR, "#.#") + " · ") + (nearOK ? "" : "entry too far · ")
+    reason = valid ? "All conditions met" : not (dirLong or dirShort) ? "No directional bias" : "FAIL: " + str.substring(fails, 0, math.max(str.length(fails) - 3, 0))
+    if showDiag
+        f_trow(17, "── DIAGNOSTIC ──", "gate score " + str.tostring(math.round(gs)) + "/100", color.gray)
+        f_diag(18, "Direction",    dirLong or dirShort, dirLong ? "LONG" : dirShort ? "SHORT" : "none")
+        f_diag(19, "Trade Quality", qOK, tradeQuality)
+        f_diag(20, "Probability",  probOK, str.tostring(math.round(dirProb)) + "/" + str.tostring(math.round(effMinProb)))
+        f_diag(21, "HTF Alignment", alignOK, str.tostring(htfAlign))
+        f_diag(22, "Market Struct", structOK, marketState)
+        f_diag(23, "S/R Confidence", srOK, str.tostring(math.round(srConf)) + "/" + str.tostring(math.round(effMinScore)))
+        f_diag(24, "Entry/Stop/TP", lvlsOK, "")
+        f_diag(25, "Risk:Reward",  rrOK, str.tostring(rrVal, "#.#") + "/" + str.tostring(minRR, "#.#"))
+        f_diag(26, "Entry Dist",   nearOK, na(entry) ? "—" : str.tostring(f_div(math.abs(close - entry), atrFast), "#.#") + "/" + str.tostring(entryMaxAtr, "#.#") + " ATR")
+        f_trow(27, "REASON", reason, valid ? color.lime : color.orange)
+    // Weighted evidence behind this recommendation (from the Probability Engine).
+    if showEviPanel
+        table.cell(tPanel, 0, 28, "Evidence", text_color = color.new(color.gray, 0), text_size = size.tiny, text_halign = text.align_left)
+        table.cell(tPanel, 1, 28, f_evidence("\n"), text_color = color.silver, text_size = size.tiny, text_halign = text.align_right)
+
+
+// #############################################################################
+// # SECTION 15 — SETUP SCANNER (honest: full engine = chart context only)
+// #   Pine forbids nested request.security() and cannot rebuild the chart's
+// #   stateful level book for a foreign context, so the full institutional
+// #   engine (which depends on MTF confluence + HTF alignment) CANNOT be run
+// #   for other symbols or timeframes. Rather than substitute approximate
+// #   logic, the scanner reports the REAL chart-context verdict and marks the
+// #   rest as unsupported. No misleading signals.
+// #############################################################################
+grpScan  = "Setup Scanner"
+showScan = input.bool(true, "Show Setup Scanner", group = grpScan)
+
+var table scanT = table.new(position.top_left, 2, 4, border_width = 1,
+     frame_color = color.new(color.gray, 60), frame_width = 1)
+
+if barstate.islast and showScan
+    chartTxt = tierA ? "TIER A · " + bias + " " + str.tostring(math.round(dirProb)) + "% · EXECUTE" : tierB ? "TIER B · " + bias + " " + str.tostring(math.round(dirProb)) + "% · WATCH (" + str.tostring(math.round(gs)) + "/100)" : "TIER C · no meaningful structure"
+    chartCol = tierCol
+    table.cell(scanT, 0, 0, "INSTITUTIONAL SCANNER", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(scanT, 1, 0, "", text_color = color.white)
+    table.cell(scanT, 0, 1, syminfo.ticker + " " + timeframe.period, text_color = color.new(color.gray, 0), text_size = size.small, text_halign = text.align_left)
+    table.cell(scanT, 1, 1, chartTxt, text_color = chartCol, text_size = size.small, text_halign = text.align_right)
+    table.cell(scanT, 0, 2, "Other timeframes", text_color = color.new(color.gray, 0), text_size = size.tiny, text_halign = text.align_left)
+    table.cell(scanT, 1, 2, "full engine = chart TF only", text_color = color.new(color.gray, 20), text_size = size.tiny, text_halign = text.align_right)
+    table.cell(scanT, 0, 3, "Other symbols", text_color = color.new(color.gray, 0), text_size = size.tiny, text_halign = text.align_left)
+    table.cell(scanT, 1, 3, "N/A — nested security prohibited", text_color = color.new(color.gray, 20), text_size = size.tiny, text_halign = text.align_right)
+
+// #############################################################################
+// # SECTION 16 — DATA EXPORT (Pine → Python bridge; single source of truth)
+// #   Emits the canonical decision state as JSON via alert() → TradingView
+// #   webhook → external Python engine. This is the ONLY sanctioned snapshot
+// #   of the engine's outputs; no consumer recomputes probability/direction.
+// #############################################################################
+grpExport    = "Data Export (Pine → Python)"
+enableExport = input.bool(false, "Emit JSON decision alert (per bar close)", group = grpExport,
+     tooltip = "Sends the canonical decision state to a webhook for the external Python intelligence layer. See sr_engine_ARCHITECTURE_V2.md.")
+
+if enableExport and barstate.isconfirmed
+    payload = '{"v":1,"sym":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","state":"' + marketState + '","bias":"' + bias + '","bull":' + str.tostring(math.round(bullProb)) + ',"bear":' + str.tostring(math.round(bearProb)) + ',"quality":"' + tradeQuality + '","htfAlign":' + str.tostring(htfAlign) + ',"supConf":' + str.tostring(math.round(scoreSup)) + ',"resConf":' + str.tostring(math.round(scoreRes)) + ',"regime":"' + regimeTxt + '","valid":' + (valid ? 'true' : 'false') + ',"entry":' + f_jnum(entry) + ',"stop":' + f_jnum(stop) + ',"tp1":' + f_jnum(tp1) + ',"tp2":' + f_jnum(tp2) + ',"tp3":' + f_jnum(tp3) + ',"rr":' + str.tostring(rrVal, "#.##") + ',"power":' + f_jnum(powerPrice) + ',"atr":' + f_jnum(atrFast) + ',"planN":' + str.tostring(planTotal) + ',"planWin":' + (planTotal > 0 ? str.tostring(math.round(100.0 * planWins / planTotal)) : "null") + ',"tier":"' + tier + '","gs":' + str.tostring(math.round(gs)) + '}'
+    alert(payload, alert.freq_once_per_bar_close)
+
+// #############################################################################
+// # SECTION 17 — DETERMINISM HASH & FREEZE VALIDATION (read-only instrument)
+// #   Hashes the append-only identity log (declared up top). Three instruments:
+// #     · DB HASH   — commutative fingerprint of EVERY logged identity.
+// #     · HTF HASH  — same over 4H/D/W/MN (tfC >= 60) only: the cross-TF-
+// #                   comparable set, populated on every intraday chart.
+// #     · FREEZE    — hash of identities born <= a fixed cut, sampled at three
+// #                   CONFIRMED bars (last-1 / -501 / -1001). Append-only + frozen
+// #                   identities => that set is immutable => A = B = C on a non-
+// #                   repainting engine. Confirmed-bar sampling avoids the live-
+// #                   bar request.security artifact that failed the POC on 1h.
+// #   All O(log) scans are gated to the bars where their result is displayed.
+// #############################################################################
+grpDet     = "Determinism Validation"
+detWindow  = input.int(1200, "Freeze window (bars, must exceed 1001)", minval = 1050, group = grpDet)
+
+// Commutative identity hash (order-independent sum mod a prime). `htfOnly` limits
+// it to institutional TFs (tfC >= 60 = 4H/D/W/MN) for the cross-TF-stable readout.
+f_detHash(bool htOnly) =>
+    h = 0
+    if detKey.size() > 0
+        for i = 0 to detKey.size() - 1
+            if not htOnly or detTfC.get(i) >= 60
+                h := int(math.abs((h + detKey.get(i) * 131 + detSide.get(i) * 17 + detTfC.get(i) * 7) % 99999989))
+    h
+
+// Frozen-window hash: identities whose birth bar is at/before the cut. Immutable
+// set (append-only, frozen prices) => invariant across the three sample bars.
+f_detFreeze(int cutBar) =>
+    h = 0
+    if detKey.size() > 0
+        for i = 0 to detKey.size() - 1
+            if detBirth.get(i) <= cutBar
+                h := int(math.abs((h + detKey.get(i) * 131 + detSide.get(i) * 17 + detTfC.get(i) * 7) % 99999989))
+    h
+
+// DB / HTF hash read only in the HUD at the last bar → scans run once, not every bar.
+detDB = barstate.islast ? f_detHash(false) : 0
+detHT = barstate.islast ? f_detHash(true)  : 0
+
+// Freeze sampled at three CONFIRMED anchors; cut sits before the earliest anchor.
+detCut    = last_bar_index - detWindow
+detAnchor = bar_index == last_bar_index - 1 or bar_index == last_bar_index - 501 or bar_index == last_bar_index - 1001
+detFrz    = detAnchor ? f_detFreeze(detCut) : 0
+var int detA = na
+var int detB = na
+var int detC = na
+// RETENTION GUARD. A rolling-capped log can only prove the freeze invariant while
+// the whole frozen window is still IN the log. If the oldest surviving identity
+// was born AFTER the cut, older frozen levels have rolled off and A/B/C would
+// legitimately differ — that is a log-capacity limit, NOT a repaint. We detect it
+// (oldest birth <= cut, checked at the latest/most-loaded anchor) and report it
+// distinctly, so a FAIL only ever means a genuine determinism break.
+var bool detRetained = false          // false until computed at the last anchor (read only at barstate.islast)
+var int  detOldC     = na             // oldest surviving birth captured at anchor C
+if bar_index == last_bar_index - 1001
+    detC    := detFrz
+    detOldC := detKey.size() > 0 ? detBirth.get(0) : na
+if bar_index == last_bar_index - 501
+    detB := detFrz
+if bar_index == last_bar_index - 1
+    detA := detFrz
+    // Retained iff the oldest surviving identity did NOT advance since anchor C
+    // (the log is shift-from-front, so oldest birth only grows; any growth means a
+    // frozen level rolled off and A/B/C would differ for a capacity reason, not a
+    // repaint). Also require C to have actually held window levels (detOldC <= cut).
+    detRetained := not na(detOldC) and detOldC <= detCut and detKey.size() > 0 and detBirth.get(0) <= detOldC
+detPass = not na(detC) and detRetained == true and detA == detB and detB == detC
+detFreezeTxt = na(detC) ? "need " + str.tostring(detWindow) + "+ bars" :
+     detRetained != true ? "raise cap / lower window" :
+     detPass ? "PASS ✓" : "FAIL ✗"
+detFreezeCol = na(detC) or detRetained != true ? color.gray : detPass ? #00e676 : #ff1744
+
+var table detHUD = table.new(position.middle_left, 2, 6, border_width = 1,
+     frame_color = color.new(color.gray, 60), frame_width = 1)
+if showDetHUD and barstate.islast
+    table.cell(detHUD, 0, 0, "DETERMINISM", text_color = color.black,
+         bgcolor = color.new(#00e676, 0), text_size = size.small, text_halign = text.align_left)
+    table.cell(detHUD, 1, 0, "IA-SR " + BUILD, text_color = color.black,
+         bgcolor = color.new(#00e676, 0), text_size = size.tiny, text_halign = text.align_right)
+    table.cell(detHUD, 0, 1, "DB HASH",  text_color = color.gray, text_size = size.small, text_halign = text.align_left)
+    table.cell(detHUD, 1, 1, str.tostring(detDB), text_color = #00e676, text_size = size.small, text_halign = text.align_right)
+    table.cell(detHUD, 0, 2, "HTF HASH (≥4H)", text_color = color.gray, text_size = size.small, text_halign = text.align_left)
+    table.cell(detHUD, 1, 2, str.tostring(detHT), text_color = color.aqua, text_size = size.small, text_halign = text.align_right)
+    table.cell(detHUD, 0, 3, "Log ids", text_color = color.gray, text_size = size.small, text_halign = text.align_left)
+    table.cell(detHUD, 1, 3, str.tostring(detKey.size()) + " / " + str.tostring(DET_LOGCAP), text_color = color.silver, text_size = size.small, text_halign = text.align_right)
+    table.cell(detHUD, 0, 4, "Freeze A/B/C", text_color = color.gray, text_size = size.small, text_halign = text.align_left)
+    table.cell(detHUD, 1, 4, str.tostring(detA) + "/" + (na(detB) ? "—" : str.tostring(detB)) + "/" + (na(detC) ? "—" : str.tostring(detC)), text_color = color.silver, text_size = size.tiny, text_halign = text.align_right)
+    table.cell(detHUD, 0, 5, "Freeze test", text_color = color.gray, text_size = size.small, text_halign = text.align_left)
+    table.cell(detHUD, 1, 5, detFreezeTxt, text_color = detFreezeCol, text_size = size.normal, text_halign = text.align_right)

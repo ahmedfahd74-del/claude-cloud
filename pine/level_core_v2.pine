@@ -1,0 +1,1622 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+// LEVEL CORE v2 — Multi-degree, CROSS-TIMEFRAME (Module 1, frozen foundation)
+//
+//  Levels are sourced from FIXED timeframes (1H / 4H / 1D / 1W) via
+//  request.security — NEVER from the chart's own candles. Consequences:
+//   • SAME level prices on every chart TF (1m … 1W) — identical, by construction.
+//   • Each level's interactions are counted on ITS OWN degree's bars, so its
+//     event log & stats are identical no matter which chart you view.
+//   • Only degrees ≥ the chart TF are shown (keeps the HTF data complete).
+//  Inherits the v1 event engine (validated): immutable anchors, event-sourced
+//  stats, closed-bar-only detection (no repaint), zone-while-interacting.
+// ═══════════════════════════════════════════════════════════════════════════
+indicator("Level Core v2 [multi-degree cross-TF]", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500, max_bars_back=5000)
+
+gD = "Detection"
+pivLen  = input.int(5, "Swing size (pivot L/R, per degree)", minval=2, maxval=50, group=gD)
+bandPct = input.float(0.40, "Level band (% of price)", minval=0.02, maxval=5.0, step=0.02, group=gD)
+maxLvls   = input.int(20, "Levels shown (top-N by strength, All levels view)", minval=5, maxval=60, group=gD, tooltip="'All levels' ranks every scored, post-merge level by confluence-adjusted CONF and shows only the strongest N — a solid core set instead of whatever happens to be nearest to price. The LIVE nearest support/resistance always shows regardless of rank.")
+reachPct  = input.float(30.0, "Search range (% of price from current)", minval=5.0, maxval=200.0, step=5.0, group=gD, tooltip="Only levels within this % of current price enter the top-N ranking contest. Prevents ancient ATH/ATL archaeology (high touch-count but untradeable distance) from crowding out current tradeable structure. LIVE nearest support/resistance always shows regardless of reach limit.")
+minPerDeg = input.int(3, "Guaranteed slots per timeframe (degree balance)", minval=0, maxval=15, group=gD, tooltip="Each active degree (1H/4H/1D/1W) is guaranteed its strongest this-many levels BEFORE the remaining slots are filled by pure strength — so dominant 1D/1W structure can't crowd out the local 1H/4H levels you actually trade off. 0 = pure strength rank (no balancing).")
+maxEv     = input.int(40, "Timeline length (events per level)", minval=5, maxval=80, group=gD)
+minShow = input.int(1, "Min interactions to show (LIVE always shows)", minval=0, maxval=20, group=gD)
+
+gG = "Degrees"
+use1H = input.bool(true, "1H levels", group=gG)
+use4H = input.bool(true, "4H levels", group=gG)
+use1D = input.bool(true, "1D levels", group=gG)
+use1W = input.bool(true, "1W levels", group=gG)
+
+gC = "Confidence Scoring (institutional)"
+minConf   = input.float(0.0, "Min confidence to show (LIVE always shows)", minval=0.0, maxval=100.0, step=5.0, group=gC)
+topN      = input.int(3, "★ Star the strongest N levels", minval=0, maxval=20, group=gC)
+showAudit = input.bool(true, "Show confidence AUDIT breakdown (★ levels, on hover)", group=gC)
+decayBars = input.float(150.0, "Strength half-life (degree-bars) — older interactions fade", minval=10.0, maxval=5000.0, group=gC, tooltip="Measured in the LEVEL'S OWN degree bars (a 1D level ages in days, a 1W level in weeks) via event timestamps — so a level's confidence is identical on every chart timeframe.")
+sepNorm   = input.float(20.0, "Touch separation norm (degree-bars) — clustered = penalised", minval=1.0, maxval=500.0, group=gC, tooltip="Also in the level's own degree bars, so the qualified-touch count and separation score are the same on 1m or 1D charts.")
+dispNorm  = input.float(2.0, "ATR displacement for full credit (band-units)", minval=0.5, maxval=10.0, step=0.5, group=gC)
+evidNorm  = input.float(5.0, "Interactions for full 'evidence'", minval=1.0, maxval=30.0, group=gC)
+wWin   = input.float(0.28, "Weight: win rate (held vs break)", minval=0.0, maxval=1.0, step=0.02, group=gC)
+wRej   = input.float(0.20, "Weight: rejection quality (wick/body)", minval=0.0, maxval=1.0, step=0.02, group=gC)
+wDisp  = input.float(0.16, "Weight: ATR displacement after touch", minval=0.0, maxval=1.0, step=0.02, group=gC)
+wSweep = input.float(0.12, "Weight: liquidity sweep before reaction", minval=0.0, maxval=1.0, step=0.02, group=gC)
+wSep   = input.float(0.12, "Weight: touch separation (anti-cluster)", minval=0.0, maxval=1.0, step=0.02, group=gC)
+wEvid  = input.float(0.12, "Weight: evidence (# recent interactions)", minval=0.0, maxval=1.0, step=0.02, group=gC)
+wProven = input.float(0.30, "Weight: PROVEN HOLDS (bounced before) ★ data-validated", minval=0.0, maxval=1.0, step=0.02, group=gC, tooltip="Backtest (BTC daily, surrogate-controlled, no lookahead): an UNTESTED level is respected only 27% vs ~40% for a random line — WORSE than chance, a trap. A level that has HELD even once jumps to ~43%, then climbs. So a fresh level starts weak and EARNS strength by bouncing. This is the one factor that beat the shuffle-null (+11pt), so it carries real weight.")
+
+gL = "Line Controls — every line on the chart"
+// One row per LINE TYPE: colour · w(idth) · style. Support/Resistance are the per-level
+// book lines ("All levels" view); the rest are the ranked / auction-zone lines.
+supCol = input.color(#26a69a, "Support     ", inline="sup", group=gL)
+supW   = input.int(1, "w", minval=1, maxval=8, inline="sup", group=gL)
+supSty = input.string("Solid", "", options=["Solid", "Dashed", "Dotted"], inline="sup", group=gL)
+resCol = input.color(#ef5350, "Resistance  ", inline="res", group=gL)
+resW   = input.int(1, "w", minval=1, maxval=8, inline="res", group=gL)
+resSty = input.string("Solid", "", options=["Solid", "Dashed", "Dotted"], inline="res", group=gL)
+claudeCol = input.color(#ffd24a, "Claude Line ", inline="cl", group=gL)
+claudeW   = input.int(2, "w", minval=1, maxval=8, inline="cl", group=gL)
+claudeSty = input.string("Dashed", "", options=["Solid", "Dashed", "Dotted"], inline="cl", group=gL)
+czCeilCol  = input.color(#ef5350, "Zone ceiling", inline="ce", group=gL)
+czCeilW    = input.int(3, "w", minval=1, maxval=8, inline="ce", group=gL)
+czCeilSty  = input.string("Solid", "", options=["Solid", "Dashed", "Dotted"], inline="ce", group=gL)
+czFloorCol = input.color(#26a69a, "Zone floor  ", inline="fl", group=gL)
+czFloorW   = input.int(3, "w", minval=1, maxval=8, inline="fl", group=gL)
+czFloorSty = input.string("Solid", "", options=["Solid", "Dashed", "Dotted"], inline="fl", group=gL)
+leadSupCol = input.color(#26a69a, "Leading sup ", inline="ls", group=gL)
+leadResCol = input.color(#ef5350, " res", inline="ls", group=gL)
+leadW      = input.int(1, "w", minval=1, maxval=8, inline="lw", group=gL)
+leadSty    = input.string("Solid", "", options=["Solid", "Dashed", "Dotted"], inline="lw", group=gL)
+leadFade   = input.bool(true, "fade far ones", inline="lw", group=gL)
+emphWidth  = input.int(3, "LIVE / ★ emphasis width (overrides w on live + starred)", minval=1, maxval=8, group=gL)
+showActiveZone = input.bool(true, "Active zone", inline="az", group=gL, tooltip="A level expands into a zone while price is touching it. OFF = always a plain line.")
+zoneCol    = input.color(#ffd24a, "", inline="az", group=gL)
+zoneOp     = input.int(85, "transp", minval=0, maxval=100, inline="az", group=gL)
+zoneBord   = input.int(1, "border", minval=0, maxval=4, inline="az", group=gL)
+extMode    = input.string("Left", "Extend", options=["Left", "Right", "Both", "None"], inline="ex", group=gL)
+extR       = input.int(30, "right bars", minval=0, maxval=200, inline="ex", group=gL)
+colByDeg   = input.bool(false, "Colour by DEGREE (TF) instead of support/resistance", group=gL)
+c1Hcol     = input.color(#787b86, "1H", inline="deg", group=gL)
+c4Hcol     = input.color(#42bda8, "4H", inline="deg", group=gL)
+c1Dcol     = input.color(#5b9cf6, "1D", inline="deg", group=gL)
+c1Wcol     = input.color(#c07cff, "1W", inline="deg", group=gL)
+
+gLb = "Labels"
+showLbl     = input.bool(true, "Show level labels", group=gLb)
+lblSize     = input.string("Small", "Label size", options=["Tiny", "Small", "Normal"], group=gLb)
+lblSide     = input.string("Right", "Label side", options=["Right", "Left"], group=gLb)
+lblOp       = input.int(20, "Label background transparency", minval=0, maxval=100, group=gLb)
+showConf    = input.bool(true, "Show CONF score", group=gLb)
+showStats   = input.bool(true, "Show event stats line", group=gLb)
+showDegTag  = input.bool(true, "Show degree (TF) tag", group=gLb)
+showZoneLbl = input.bool(true, "Show zone / leading labels", group=gLb)
+
+gM = "Confluence Merge (liquidity zones)"
+mergeOn      = input.bool(true, "Merge clustered levels into one zone", group=gM, tooltip="OFF = every level shows as its own line. ON = nearby levels (a liquidity shelf) collapse into a single zone with combined strength. Underlying levels & memory are preserved.")
+mergeBandPct = input.float(0.80, "Merge band (% of price)", minval=0.05, maxval=10.0, step=0.05, group=gM)
+conflBonus   = input.float(6.0, "Confluence bonus per extra level (strength)", minval=0.0, maxval=30.0, step=1.0, group=gM)
+
+gNz = "Manual Nudge (LIVE floor / ceiling)"
+nudgeCeil  = input.float(0.0, "Nudge nearest RESISTANCE / ceiling (% of price)", minval=-2.0, maxval=2.0, step=0.01, group=gNz, tooltip="Presentation only. Shift the nearest level ABOVE price (the ceiling price is about to hit) up/down a hair to sit it on the exact wick. Does not change the level, its memory, or its score.")
+nudgeFloor = input.float(0.0, "Nudge nearest SUPPORT / floor (% of price)", minval=-2.0, maxval=2.0, step=0.01, group=gNz, tooltip="Presentation only. Shift the nearest level BELOW price (the floor price is about to hit).")
+
+gP = "Position Layer (HTF bias + regime)"
+biasSwing = input.int(5, "HTF structure swing size (state classifier)", minval=2, maxval=30, group=gP, tooltip="Pivot L/R used to read each HTF's HH/HL/LH/LL market-state structure (per 1W/1D/4H).")
+posMomLen = input.int(50, "HTF momentum EMA length (per 1W/1D/4H)", minval=5, maxval=400, group=gP, tooltip="Each HTF votes its HH/HL/LH/LL structure ONLY if momentum agrees: price above this EMA = bullish momentum, below = bearish. Momentum that OPPOSES the structure vetoes that timeframe's vote.")
+erLen     = input.int(20, "Regime efficiency-ratio lookback (Daily bars)", minval=5, maxval=200, group=gP)
+erTrend   = input.float(0.35, "Trending efficiency ratio (0–1) — churn cutoff", minval=0.05, maxval=0.95, step=0.05, group=gP, tooltip="Kaufman efficiency ratio per HTF = |net move| / |sum of bar moves|. Below this a topping/bottoming structure is read as DISTRIBUTION / ACCUMULATION (churn), not a clean trend.")
+erChop    = input.float(0.12, "Dead-structure floor (efficiency ratio 0–1)", minval=0.02, maxval=0.60, step=0.02, group=gP, tooltip="Even clean HH+HL / LH+LL structure is downgraded to RANGE when efficiency is below this — a low-volatility grind is not a tradable trend. Volatility gate on directional bias.")
+
+gCZ = "Claude Zone (ranked view)"
+viewMode   = input.string("All levels", "View", options=["All levels", "Leading (ranked)", "Claude Zone (3)", "Claude Line only"], group=gCZ, tooltip="All = the maxLvls STRONGEST levels (ranked by confluence-adjusted CONF, post-merge — not by distance). Leading = the N STRONGEST scored levels each side (ranked by CONF). Claude Zone = the latched dealing range (floor, ceiling, Claude Line). Claude Line only = cleanest chart.")
+leadN      = input.int(3, "Leading levels per side", minval=1, maxval=20, group=gCZ)
+showClaude = input.bool(true, "Show Claude Line (equilibrium of the dealing range)", group=gCZ, tooltip="The midpoint of the LATCHED dealing range — the strongest scored level below price and the strongest above. Moves only when the auction actually breaks, never on a touch.")
+showPD     = input.bool(true, "Shade premium / discount", group=gCZ)
+gateCZ     = input.bool(true, "Bias by MARKET STATE (range = mean-revert · trend = continuation)", group=gCZ)
+
+gLE = "Dealing Range (latched auction)"
+rangeTF      = input.timeframe("15", "Range anchor timeframe (MTF-consistent walls)", group=gLE, tooltip="The break/acceptance test is timed to THIS timeframe's closed bars, not the chart's. Every chart AT OR BELOW this TF (1m, 5m, 15m…) then latches identical floor/ceiling/Claude Line — no more different walls per chart. Charts ABOVE it (1H/4H/1D/1W) keep timing their own wider range, which is what a HTF trader wants.")
+zoneMinConf  = input.float(35.0, "Min CONF to act as a boundary / leading level", minval=0.0, maxval=100.0, step=5.0, group=gLE, tooltip="The Zone, Claude Line and Leading levels are built from the SCORED book — only levels whose confidence clears this qualify. Raise it for fewer, stronger lines.")
+wallProven   = input.string("Proven only", "Wall requirement", options=["Proven only", "Prefer proven", "Strongest only"], group=gLE, tooltip="AUTHORITY of the floor/ceiling. Proven only = a wall must have HELD ≥2× (the one factor that beat the null); if none is in reach the strongest is used and tagged UNPROVEN. Prefer proven = proven wins, but a much stronger fresh level can still qualify. Strongest only = pure CONF, no proven gate.")
+wallDegPref  = input.bool(true, "Prefer higher-degree (4H+) walls", group=gLE, tooltip="Floor/ceiling skip 1H levels and lean on 4H/1D/1W structure — more authority. Falls back to any degree if none qualifies. The 1H levels still appear as Leading lines inside the range.")
+breakBufATR  = input.float(0.25, "Break buffer beyond wall (× ATR)", minval=0.0, maxval=5.0, step=0.05, group=gLE, tooltip="A close must clear the wall by this many ATRs to count toward a break. ATR-scaled so it fits the instrument's real volatility instead of a fixed %.")
+breakAccept  = input.int(2, "Acceptance: closes beyond wall to confirm a break", minval=1, maxval=10, group=gLE, tooltip="How many CONSECUTIVE closes beyond the buffer confirm a real break. 1 = a single decisive close. 2+ = the market must ACCEPT on the other side. This is what stops one noisy 5m candle re-anchoring the whole range.")
+sweepBufATR  = input.float(0.5, "Invalidation buffer beyond wall (× ATR)", minval=0.0, maxval=5.0, step=0.1, group=gLE, tooltip="The stop / invalidation sits this far beyond the wall's band — past the sweep zone, so a liquidity grab that wicks the level does not take you out.")
+showInval    = input.bool(true, "Draw invalidation (stop) line beyond each wall", group=gLE)
+approachPct  = input.float(10.0, "Approaching threshold (% of range width)", minval=1.0, maxval=45.0, step=1.0, group=gLE)
+showAuMeta   = input.bool(true, "Show range state/version/age on the Claude Line", group=gLE)
+
+// (all line styling now lives in the "Line Controls" group above)
+
+f_sz(s) => s == "Tiny" ? size.tiny : s == "Normal" ? size.normal : size.small
+f_degTxt(int d) => d == 0 ? "1H" : d == 1 ? "4H" : d == 2 ? "1D" : "1W"
+f_lstyle(s) => s == "Dashed" ? line.style_dashed : s == "Dotted" ? line.style_dotted : line.style_solid
+f_ext(s) => s == "Right" ? extend.right : s == "Both" ? extend.both : s == "None" ? extend.none : extend.left
+f_degCol(int d) => d == 0 ? c1Hcol : d == 1 ? c4Hcol : d == 2 ? c1Dcol : c1Wcol
+
+// a degree is active only if its timeframe is ≥ the chart timeframe
+chartSec = timeframe.in_seconds(timeframe.period)
+a1H = use1H and timeframe.in_seconds("60")  >= chartSec
+a4H = use4H and timeframe.in_seconds("240") >= chartSec
+a1D = use1D and timeframe.in_seconds("D")   >= chartSec
+a1W = use1W and timeframe.in_seconds("W")   >= chartSec
+
+type Ev
+    int   bar
+    int   t
+    int   kind        // 1 touch, 2 held, 3 break, 4 retest
+    float react       // measured: degree-bar excursion vs level, in band-units
+    float rejQ        // measured: rejection quality 0..1 (close pulled back from the extreme)
+    bool  swept       // measured: wick swept beyond the level then closed back
+
+type Lvl
+    float anchor
+    int   deg
+    bool  inside
+    int   entSide
+    float testHi
+    float testLo
+    bool  brokenLast
+    array<Ev> log
+
+var array<Lvl> book = array.new<Lvl>()
+
+// TF-invariant "now" (1H-aligned epoch ms): recency decay is measured against this,
+// not against chart bar_index, so a level's age is identical on every chart timeframe.
+nowRef = time - time % 3600000
+
+// milliseconds per bar of a level's OWN degree (1H/4H/1D/1W). Every time-based measure
+// (decay, separation, qualified spacing) is expressed in the level's degree-bars via
+// event timestamps → TF-invariant, never in chart bars.
+f_degMs(int deg) => deg == 0 ? 3600000.0 : deg == 1 ? 14400000.0 : deg == 2 ? 86400000.0 : 604800000.0
+
+f_log(Lvl L, int kind, int bar, int t, float react, float rejQ, bool swept) =>
+    array.push(L.log, Ev.new(bar, t, kind, react, rejQ, swept))
+    if array.size(L.log) > maxEv
+        array.shift(L.log)
+
+f_count(Lvl L, int kind) =>
+    int c = 0
+    if array.size(L.log) > 0
+        for i = 0 to array.size(L.log) - 1
+            if array.get(L.log, i).kind == kind
+                c += 1
+    c
+
+f_create(float px, int deg, int bar, int t) =>
+    L = Lvl.new(px, deg, false, 0, na, na, false, array.new<Ev>())
+    array.push(L.log, Ev.new(bar, t, 2, 0.0, 0.0, false))     // founding rejection (held)
+    array.push(book, L)
+
+// found a level of a given degree; anchor immutable. NO eviction: the book holds the
+// full distinct HTF-sourced set (hard safety cap only). The render caps the DISPLAY to
+// the maxLvls strongest (by confluence-adjusted CONF) — so cost stays bounded without
+// a per-bar eviction scan.
+f_found(float px, int deg, int bar, int t) =>
+    if not na(px)
+        band = px * bandPct / 100.0
+        exists = false
+        if array.size(book) > 0
+            for i = 0 to array.size(book) - 1
+                if array.get(book, i).deg == deg and math.abs(array.get(book, i).anchor - px) <= band
+                    exists := true
+                    break
+        if not exists and array.size(book) < 480
+            f_create(px, deg, bar, t)
+
+// run interaction detection for one degree using ITS closed-bar OHLC (identical on any chart TF)
+f_interact(int deg, bool newBar, int bar, int t, float dh, float dl, float dc, float dpc) =>
+    if newBar and array.size(book) > 0
+        for i = 0 to array.size(book) - 1
+            L = array.get(book, i)
+            if L.deg == deg
+                band = L.anchor * bandPct / 100.0
+                top = L.anchor + band
+                bot = L.anchor - band
+                nowIn = dh >= bot and dl <= top
+                rct = band <= 0 ? 0.0 : math.max(math.abs(dh - L.anchor), math.abs(dl - L.anchor)) / band
+                // measured attributes for scoring (do NOT affect which events fire)
+                rng = dh - dl
+                swept = (dh > top and dc <= top) or (dl < bot and dc >= bot)
+                if nowIn and not L.inside
+                    L.entSide := dpc >= L.anchor ? 1 : -1
+                    L.testHi := dh
+                    L.testLo := dl
+                    rejE = rng <= 0 ? 0.0 : (L.entSide <= 0 ? (dh - dc) / rng : (dc - dl) / rng)
+                    f_log(L, L.brokenLast ? 4 : 1, bar, t, rct, rejE, swept)
+                    L.inside := true
+                else if nowIn and L.inside
+                    L.testHi := math.max(L.testHi, dh)
+                    L.testLo := math.min(L.testLo, dl)
+                else if (not nowIn) and L.inside
+                    exitSide = dc > top ? 1 : dc < bot ? -1 : L.entSide
+                    rejX = rng <= 0 ? 0.0 : (L.entSide <= 0 ? (dh - dc) / rng : (dc - dl) / rng)
+                    if exitSide == L.entSide
+                        f_log(L, 2, bar, t, rct, rejX, swept)
+                        L.brokenLast := false
+                    else
+                        f_log(L, 3, bar, t, rct, rejX, swept)
+                        L.brokenLast := true
+                    L.inside := false
+                    L.testHi := na
+                    L.testLo := na
+                array.set(book, i, L)   // void terminator: keeps the branchy if in statement position (avoids CE10235)
+
+// ── SCORING LAYER — every factor is a pure reduction over the event log ──────
+// touch separation: reward interactions spread over time, penalise clustered ones
+f_separation(Lvl L) =>
+    n = array.size(L.log)
+    float s = 1.0
+    if n >= 3
+        span = (array.get(L.log, n - 1).t - array.get(L.log, 0).t) / f_degMs(L.deg)   // degree-bars, TF-invariant
+        avgGap = span / (n - 1)
+        s := math.min(avgGap / sepNorm, 1.0)
+    s
+
+// REAL qualified-interaction count from the event log (no estimates): an event
+// qualifies if it is the first, or sits >= sepNorm bars after the last QUALIFIED
+// one — i.e. a genuinely separate visit, not a clustered re-hit. Greedy, deterministic.
+f_qualified(Lvl L) =>
+    n = array.size(L.log)
+    int q = 0
+    float lastQ = 0.0
+    if n > 0
+        for i = 0 to n - 1
+            b = array.get(L.log, i).t
+            if q == 0 or (b - lastQ) / f_degMs(L.deg) >= sepNorm   // spacing in degree-bars, TF-invariant
+                q += 1
+                lastQ := b
+    q
+
+// SINGLE SOURCE of the score AND its audit breakdown. Returns:
+// [conf, winF, rejF, dispF, sweepF, sepF, evidF, degW, nEv, avgW, held, brk]
+// avgW = average recency weight (the decay indicator: 1 = all fresh, →0 = old).
+f_audit(Lvl L) =>
+    n = array.size(L.log)
+    float conf = 0.0
+    float winF = 0.5
+    float rejF = 0.0
+    float dispF = 0.0
+    float sweepF = 0.0
+    float sepF = 1.0
+    float evidF = 0.0
+    float provenF = 0.15    // untested default = TRAP (data: fresh level respected below random)
+    float avgW = 0.0
+    int held = 0
+    int brk = 0
+    float degW = L.deg == 3 ? 1.0 : L.deg == 2 ? 0.85 : L.deg == 1 ? 0.70 : 0.55
+    if n > 0
+        float wsum = 0.0
+        float rejW = 0.0
+        float dispW = 0.0
+        float sweepW = 0.0
+        for i = 0 to n - 1
+            ev = array.get(L.log, i)
+            age = math.max(0.0, (nowRef - ev.t) / f_degMs(L.deg))   // age in degree-bars, TF-invariant
+            w = 1.0 / (1.0 + age / decayBars)          // recency decay
+            wsum := wsum + w
+            rejW := rejW + w * ev.rejQ
+            dispW := dispW + w * math.min(ev.react / dispNorm, 1.0)
+            if ev.swept
+                sweepW := sweepW + w
+            if ev.kind == 2
+                held := held + 1
+            if ev.kind == 3
+                brk := brk + 1
+        winF   := (held + brk) > 0 ? held / (held + brk) : 0.5
+        rejF   := wsum > 0 ? rejW / wsum : 0.0
+        dispF  := wsum > 0 ? dispW / wsum : 0.0
+        sweepF := wsum > 0 ? math.min(sweepW / wsum * 2.0, 1.0) : 0.0
+        sepF   := f_separation(L)
+        evidF  := math.min(wsum / evidNorm, 1.0)
+        // PROVEN HOLDS — the data-validated cliff: untested = trap, one hold = normal, then climbs.
+        // held counts confirmed bounces (incl. the founding rejection), so held<=1 = never re-tested.
+        provenF := held <= 1 ? 0.15 : held == 2 ? 0.55 : held == 3 ? 0.78 : 1.0
+        avgW   := wsum / n
+        wtot   = wWin + wRej + wDisp + wSweep + wSep + wEvid + wProven
+        raw    = wtot > 0 ? (winF*wWin + rejF*wRej + dispF*wDisp + sweepF*wSweep + sepF*wSep + evidF*wEvid + provenF*wProven) / wtot : 0.0
+        conf   := math.min(math.max(raw * degW * 100.0, 0.0), 100.0)
+    [conf, winF, rejF, dispF, sweepF, sepF, evidF, provenF, degW, n, avgW, held, brk]
+
+// score only (thin wrapper over the single source)
+f_conf(Lvl L) =>
+    [cf, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11, w12] = f_audit(L)
+    cf
+
+// point-contribution of one component to the final confidence (they sum to CONF)
+f_pts(float f, float w, float wtot, float dg) => wtot > 0 ? f * w / wtot * dg * 100.0 : 0.0
+
+// ── per-degree HTF data (prior CLOSED bar → non-repainting) ──────────────────
+[h1, l1, c1, pc1] = request.security(syminfo.tickerid, "60",  [high[1], low[1], close[1], close[2]], lookahead=barmerge.lookahead_on)
+[h4, l4, c4, pc4] = request.security(syminfo.tickerid, "240", [high[1], low[1], close[1], close[2]], lookahead=barmerge.lookahead_on)
+[hd, ld, cd, pcd] = request.security(syminfo.tickerid, "D",   [high[1], low[1], close[1], close[2]], lookahead=barmerge.lookahead_on)
+[hw, lw, cw, pcw] = request.security(syminfo.tickerid, "W",   [high[1], low[1], close[1], close[2]], lookahead=barmerge.lookahead_on)
+
+// COMPLETE anchor set per degree, accumulated INSIDE each degree's OWN context so it is
+// driven by that degree's full bar history — NOT by how far back the chart reaches.
+// (This is why 1m used to show almost nothing: it only walked ~3.5 days of chart bars,
+// so it never created the older HTF pivots. The 1D-context accumulator sees them all.)
+f_pushUniq(array<float> a, float px) =>
+    if not na(px)
+        bnd = px * bandPct / 100.0
+        seen = false
+        if array.size(a) > 0
+            for i = 0 to array.size(a) - 1
+                if math.abs(array.get(a, i) - px) <= bnd
+                    seen := true
+                    break
+        if not seen
+            array.push(a, px)
+    array.size(a)
+f_degAnchors() =>
+    var array<float> a = array.new<float>()
+    ph = ta.pivothigh(high, pivLen, pivLen)
+    pl = ta.pivotlow(low,  pivLen, pivLen)
+    f_pushUniq(a, ph)
+    f_pushUniq(a, pl)
+    a
+aVals1 = request.security(syminfo.tickerid, "60",  f_degAnchors(), lookahead=barmerge.lookahead_off)
+aVals4 = request.security(syminfo.tickerid, "240", f_degAnchors(), lookahead=barmerge.lookahead_off)
+aValsD = request.security(syminfo.tickerid, "D",   f_degAnchors(), lookahead=barmerge.lookahead_off)
+aValsW = request.security(syminfo.tickerid, "W",   f_degAnchors(), lookahead=barmerge.lookahead_off)
+
+n1 = ta.change(time("60"))  != 0
+n4 = ta.change(time("240")) != 0
+nd = ta.change(time("D"))   != 0
+nw = ta.change(time("W"))   != 0
+
+// seed the book ONCE with each degree's COMPLETE anchor set (HTF-sourced). Anchors are
+// appended in detection order, so we process only indices not yet seeded → O(anchors)
+// total across the whole chart, NOT O(bars × anchors). This is the RE10110 fix.
+f_seedFrom(array<float> arr, int deg, int from) =>
+    int r = from
+    if not na(arr)                          // request.security arrays are na until HTF has data
+        n = array.size(arr)
+        if n > from
+            for i = from to n - 1
+                f_found(array.get(arr, i), deg, bar_index, time)
+        r := n
+    r
+var int sd1 = 0
+var int sd4 = 0
+var int sdD = 0
+var int sdW = 0
+// Seed EVERY degree regardless of chart TF → the book is identical on every chart, so
+// the Claude Zone (strongest floor/ceiling → Claude Line) is byte-stable across TFs.
+// The "only show degrees ≥ chart TF" rule is applied at DISPLAY time, not here.
+sd1 := f_seedFrom(aVals1, 0, sd1)
+sd4 := f_seedFrom(aVals4, 1, sd4)
+sdD := f_seedFrom(aValsD, 2, sdD)
+sdW := f_seedFrom(aValsW, 3, sdW)
+
+// interactions on every degree's closed bars (all degrees, all chart TFs)
+f_interact(0, n1, bar_index, time, h1, l1, c1, pc1)
+f_interact(1, n4, bar_index, time, h4, l4, c4, pc4)
+f_interact(2, nd, bar_index, time, hd, ld, cd, pcd)
+f_interact(3, nw, bar_index, time, hw, lw, cw, pcw)
+
+// ══ POSITION LAYER — HTF MARKET-STATE ENGINE (governs the whole system) ═══════
+// Per HTF (1W/1D/4H) classify the MARKET STATE from HH/HL/LH/LL progression +
+// swing expansion + momentum + volatility (efficiency ratio). Bias is DERIVED
+// from state — directional only in TRENDING / PULLBACK; TRANSITION / DISTRIBUTION
+// / ACCUMULATION / RANGE are non-directional. 2/3 HTF agreement then CONFIRMS the
+// direction (it is the confirmation filter, not the primary decision). This is the
+// ONLY source of bias; the execution layer consumes it and never creates it.
+// state codes: 0 RANGE · 1 TRENDING · 2 PULLBACK · 3 TRANSITION · 4 DISTRIBUTION · 5 ACCUMULATION
+f_state() =>
+    _ph = ta.pivothigh(high, biasSwing, biasSwing)
+    _pl = ta.pivotlow(low,  biasSwing, biasSwing)
+    var float _h1 = na
+    var float _h2 = na
+    var float _l1 = na
+    var float _l2 = na
+    if not na(_ph)
+        _h2 := _h1
+        _h1 := _ph
+    if not na(_pl)
+        _l2 := _l1
+        _l1 := _pl
+    _hh = not na(_h1) and not na(_h2) and _h1 > _h2      // higher high
+    _lh = not na(_h1) and not na(_h2) and _h1 < _h2      // lower high
+    _hl = not na(_l1) and not na(_l2) and _l1 > _l2      // higher low
+    _ll = not na(_l1) and not na(_l2) and _l1 < _l2      // lower low
+    _e  = ta.ema(close, posMomLen)                       // call ta.ema once (every bar)
+    _m  = close > _e ? 1 : close < _e ? -1 : 0           // momentum
+    _dir = math.abs(close - close[erLen])
+    _vol = math.sum(math.abs(close - close[1]), erLen)
+    _er  = _vol == 0 ? 0.0 : _dir / _vol                 // efficiency ratio = volatility/strength
+    var int _tm = 0                                       // trend memory (last clean structure)
+    _su = _hh and _hl                                     // clean bullish structure
+    _sd = _lh and _ll                                     // clean bearish structure
+    if _su
+        _tm := 1
+    if _sd
+        _tm := -1
+    int _st = 0
+    int _bv = 0
+    if _su
+        if _er < erChop
+            _st := 0                                      // dead grind → range (volatility gate)
+        else
+            _st := _m >= 0 ? 1 : 2                        // momentum with = TREND, against = PULLBACK
+            _bv := 1
+    else if _sd
+        if _er < erChop
+            _st := 0
+        else
+            _st := _m <= 0 ? 1 : 2
+            _bv := -1
+    else if _hh and _ll
+        _st := 3                                          // broadening = volatile TRANSITION
+    else if _lh and _hl
+        if _tm == 1 and _er < erTrend and _m <= 0
+            _st := 4                                      // coil at highs after up-trend = DISTRIBUTION
+        else if _tm == -1 and _er < erTrend and _m >= 0
+            _st := 5                                      // coil at lows after down-trend = ACCUMULATION
+        else
+            _st := 3                                      // contracting coil = TRANSITION
+    else
+        _st := 0                                          // no two-sided structure yet = RANGE
+    int _ln = _bv != 0 ? _bv : (_st == 4 ? -1 : _st == 5 ? 1 : 0)   // directional lean (incl. D/A)
+    [_st, _bv, _ln, _er]
+
+f_statePrev() =>
+    [_s, _b, _l, _e] = f_state()
+    [_s[1], _b[1], _l[1], _e[1]]
+
+// market state per HTF (state code · bias vote · lean · efficiency), prior CLOSED bar
+[stW, bvW, lnW, erWv] = request.security(syminfo.tickerid, "W",   f_statePrev(), lookahead=barmerge.lookahead_on)
+[stD, bvD, lnD, erDv] = request.security(syminfo.tickerid, "D",   f_statePrev(), lookahead=barmerge.lookahead_on)
+[st4, bv4, ln4, er4v] = request.security(syminfo.tickerid, "240", f_statePrev(), lookahead=barmerge.lookahead_on)
+
+// Only count a bias TF when it is ≥ the chart TF. Reading a LOWER timeframe than the
+// chart via request.security (e.g. 4H/1D from a 1W chart) is degenerate, so neutralize
+// those votes. On any chart ≤ 4H all three are active → identical to before; only the
+// D and W charts change, where the sub-chart reads were previously misleading.
+biasWon = timeframe.in_seconds("W")   >= chartSec
+biasDon = timeframe.in_seconds("D")   >= chartSec
+bias4on = timeframe.in_seconds("240") >= chartSec
+stWe = biasWon ? stW : 0
+stDe = biasDon ? stD : 0
+st4e = bias4on ? st4 : 0
+bvWe = biasWon ? bvW : 0
+bvDe = biasDon ? bvD : 0
+bv4e = bias4on ? bv4 : 0
+nBias = (biasWon ? 1 : 0) + (biasDon ? 1 : 0) + (bias4on ? 1 : 0)
+
+// CONFIRMATION among the ACTIVE bias TFs (directional only from TREND/PULLBACK).
+// 2 of 3 normally; when fewer than 3 are active, require all of them to agree.
+bulls = (bvWe == 1 ? 1 : 0) + (bvDe == 1 ? 1 : 0) + (bv4e == 1 ? 1 : 0)
+bears = (bvWe == -1 ? 1 : 0) + (bvDe == -1 ? 1 : 0) + (bv4e == -1 ? 1 : 0)
+needAgree = nBias >= 3 ? 2 : math.max(1, nBias)
+posDir   = bulls >= needAgree ? 1 : bears >= needAgree ? -1 : 0   // confirmed direction (else neutral)
+
+// SYSTEM market state (precedence): confirmed dir → TRENDING if enough agreeing HTFs are
+// TREND else PULLBACK; no confirmed dir → conflict=TRANSITION, else surface D/A, else RANGE
+trendAgree = posDir == 1 ? ((stWe == 1 and bvWe == 1 ? 1 : 0) + (stDe == 1 and bvDe == 1 ? 1 : 0) + (st4e == 1 and bv4e == 1 ? 1 : 0)) : posDir == -1 ? ((stWe == 1 and bvWe == -1 ? 1 : 0) + (stDe == 1 and bvDe == -1 ? 1 : 0) + (st4e == 1 and bv4e == -1 ? 1 : 0)) : 0
+int sysState = 0
+if posDir != 0
+    sysState := trendAgree >= math.min(2, nBias) ? 1 : 2
+else if bulls > 0 and bears > 0
+    sysState := 3
+else if stWe == 4 or stDe == 4 or st4e == 4
+    sysState := 4
+else if stWe == 5 or stDe == 5 or st4e == 5
+    sysState := 5
+else
+    sysState := 0
+
+// ══ TRUE DIRECTION — HTF structure bias (single source) ══════════════════════════
+// Direction is the confirmed HTF market-state bias (posDir: 2/3 of 1W/1D/4H agreeing).
+// Published for downstream IMIS consumers.
+dirVerdict = posDir
+dirTxt     = dirVerdict == 1 ? "BULL" : dirVerdict == -1 ? "BEAR" : "RANGE"
+plot(dirVerdict, "true.direction", display=display.data_window)
+alertcondition(ta.change(dirVerdict) != 0, "True direction change", "IMIS: true market direction (HTF structure) changed")
+
+// ══ DEALING RANGE — LATCHED, PROVEN-GATED auction boundaries from the SCORED book ══
+//   1. SOURCE    — walls are the nearest scored, multi-degree level that passes the
+//      WALL TEST: CONF ≥ zoneMinConf, degree ≥ 4H (wallDegPref), and PROVEN (held ≥2×,
+//      per wallProven). Proven-holds is the one factor that beat the null, so a wall
+//      must have earned it; if none is in reach the strongest is used and tagged
+//      UNPROVEN rather than faking authority.
+//   2. LATCH     — the range persists in state and re-anchors ONLY on an ACCEPTED
+//      break: breakAccept consecutive closes beyond the wall by breakBufATR×ATR. A
+//      touch, a wick, or one noisy poke never moves it. On a break the broken wall
+//      FLIPS role (broken ceiling → new floor) — break-and-retest.
+//   3. INVALIDATION — a stop line sits beyond the wall's band + sweepBufATR×ATR, past
+//      the liquidity-grab zone, so a wick of the level does not take the stop.
+// This is what stops the Zone / Claude Line / Leading levels jumping, and gives the
+// floor/ceiling real authority instead of drawing weak lines price slices through.
+
+drAtr = ta.atr(14)   // chart-TF ATR — fallback buffer scale on charts ABOVE the range TF
+
+// MTF-CONSISTENT TIMING — the break/acceptance test used to run on the CHART's own bar
+// closes, so a 1m, 5m and 15m chart each latched a DIFFERENT range (different candle
+// sequence = different break timing = different floor/ceiling/Claude Line, even though
+// the candidate walls themselves were already identical). Fixed by timing the test to
+// ONE fixed timeframe's (rangeTF) own closed bars instead — every chart at or below it
+// then reads the exact same break history. Mirrors the non-repaint prior-closed-bar
+// pattern already used for the per-degree HTF reads (h1/l1/c1 etc. above).
+rSec        = timeframe.in_seconds(rangeTF)
+rangeOn     = rSec >= chartSec                                          // chart is AT/BELOW the anchor TF
+[rC, rAtrV] = request.security(syminfo.tickerid, rangeTF, [close[1], ta.atr(14)[1]], lookahead=barmerge.lookahead_on)
+rangeNewBar = rangeOn and ta.change(time(rangeTF)) != 0                 // a rangeTF bar just closed
+testNow     = rangeOn ? rangeNewBar : barstate.isconfirmed              // ABOVE rangeTF: fall back to chart timing
+refClose    = rangeOn ? rC : close
+refAtr      = rangeOn ? nz(rAtrV) : nz(drAtr)
+
+// WALL TEST — does this scored level deserve to be a floor/ceiling?
+// mode 0 STRICT   = conf gate + degree preference + proven gate
+// mode 1 RELAXED  = conf gate only (drop degree/proven)
+// mode 2 LASTRESORT = no gate at all — accept anything so a wall never vanishes.
+f_wallOK(Lvl L, int mode) =>
+    c = f_conf(L)
+    held = f_count(L, 2)
+    degOK = not wallDegPref or L.deg >= 1
+    pOK = wallProven == "Strongest only" ? true : wallProven == "Prefer proven" ? (held >= 2 or c >= zoneMinConf + 15.0) : held >= 2
+    confOK = c >= zoneMinConf
+    mode == 2 ? true : mode == 1 ? confOK : (confOK and degOK and pOK)
+
+// nearest level in a direction that passes the wall test. THREE passes: strict
+// (proven + degree), then relaxed (conf only), then last-resort (nearest of ANY
+// score) so the floor/ceiling never disappears when nothing clears zoneMinConf —
+// it just shows the nearest level tagged WEAK. Returns [price, isProven, isWeak].
+f_pickWall(float px, int dir) =>
+    float best = na
+    bool  bestPr = false
+    int   foundPass = -1
+    for pass = 0 to 2                                   // 0 strict · 1 relaxed · 2 last-resort
+        if na(best) and array.size(book) > 0
+            for i = 0 to array.size(book) - 1
+                L = array.get(book, i)
+                degOn = L.deg == 0 ? a1H : L.deg == 1 ? a4H : L.deg == 2 ? a1D : a1W
+                side = dir == 1 ? L.anchor > px : L.anchor < px
+                nearer = na(best) or (dir == 1 ? L.anchor < best : L.anchor > best)
+                if degOn and side and nearer and f_wallOK(L, pass)
+                    best := L.anchor
+                    bestPr := f_count(L, 2) >= 2
+                    foundPass := pass
+    [best, bestPr, foundPass == 2]
+
+// latched state — the boundaries persist until an ACCEPTED break
+var float locUBv   = na
+var float locLBv   = na
+var bool  ubProven = false
+var bool  lbProven = false
+var bool  ubWeak   = false  // ceiling came from the last-resort pass (below zoneMinConf)
+var bool  lbWeak   = false  // floor came from the last-resort pass
+var int   locBrk   = 0      // this bar: 0 none · 1 broke up · -1 broke down
+var int   upCloses = 0      // consecutive closes beyond the ceiling buffer
+var int   dnCloses = 0      // consecutive closes beyond the floor buffer
+locBrk := 0
+if barstate.isconfirmed and (na(locUBv) or na(locLBv))
+    // bootstrap (or re-acquire after an expansion left a side empty) — safe on any bar,
+    // uses refClose so the seed already agrees across every chart at/below rangeTF
+    if na(locUBv)
+        [p, pr, wk] = f_pickWall(refClose, 1)
+        locUBv := p
+        ubProven := pr
+        ubWeak := wk
+    if na(locLBv)
+        [p, pr, wk] = f_pickWall(refClose, -1)
+        locLBv := p
+        lbProven := pr
+        lbWeak := wk
+    upCloses := 0
+    dnCloses := 0
+else if testNow
+    // ACCEPTANCE — count consecutive RANGE-TF closes beyond the buffer; one poke resets it.
+    // Gated to testNow so 1m/5m/15m charts all advance the counter on the SAME 15m closes
+    // instead of each chart counting its own bar closes (which made breakAccept's real-world
+    // meaning chart-dependent — "2 closes" was 2 minutes on a 1m chart, 2 days on a 1D chart).
+    buf = refAtr * breakBufATR
+    upCloses := refClose > locUBv + buf ? upCloses + 1 : 0
+    dnCloses := refClose < locLBv - buf ? dnCloses + 1 : 0
+    if upCloses >= breakAccept
+        locBrk := 1
+        locLBv := locUBv                 // broken ceiling becomes the new floor…
+        lbProven := ubProven             // …and keeps its proven status…
+        lbWeak := ubWeak                 // …and its weak status
+        [p, pr, wk] = f_pickWall(refClose, 1)
+        locUBv := p
+        ubProven := pr
+        ubWeak := wk
+        upCloses := 0
+        dnCloses := 0
+    else if dnCloses >= breakAccept
+        locBrk := -1
+        locUBv := locLBv
+        ubProven := lbProven
+        ubWeak := lbWeak
+        [p, pr, wk] = f_pickWall(refClose, -1)
+        locLBv := p
+        lbProven := pr
+        lbWeak := wk
+        upCloses := 0
+        dnCloses := 0
+    // NO other branch: inside the range — touching, wicking, one poke — nothing moves.
+
+locUB = locUBv
+locLB = locLBv
+locEQ = na(locUB) or na(locLB) ? na : (locUB + locLB) / 2.0
+// sweep-aware invalidation: beyond the wall's band + an ATR buffer → past the stop-hunt zone
+invUB = na(locUB) ? na : locUB + locUB * bandPct / 100.0 + refAtr * sweepBufATR
+invLB = na(locLB) ? na : locLB - locLB * bandPct / 100.0 - refAtr * sweepBufATR
+locPremium = not na(locEQ) and close >= locEQ
+locRangeW  = na(locUB) or na(locLB) ? na : locUB - locLB
+// zone state: 0 INSIDE · 1 APPROACH_CEIL · 2 APPROACH_FLOOR · 3 EXPANSION_UP · 4 EXPANSION_DOWN · 5 UNDEFINED
+int locState = 5
+if not na(locUB) and not na(locLB)
+    thr = locRangeW * approachPct / 100.0
+    locState := (locUB - close) <= thr ? 1 : (close - locLB) <= thr ? 2 : 0
+else if na(locUB) and not na(locLB)
+    locState := 3
+else if na(locLB) and not na(locUB)
+    locState := 4
+f_locStateTxt(int s) => s == 1 ? "APPROACHING CEILING" : s == 2 ? "APPROACHING FLOOR" : s == 3 ? "EXPANSION UP" : s == 4 ? "EXPANSION DOWN" : s == 5 ? "UNDEFINED" : (locPremium ? "INSIDE · PREMIUM" : "INSIDE · DISCOUNT")
+
+// ── Range Version / Age / Transition ──
+// Now driven by REAL breaks only (locBrk), so the version counts auctions, not ticks.
+// Previously this incremented whenever the price-relative lookup re-picked a boundary,
+// which meant it counted price movement and the number was meaningless.
+var int auctionVer   = 0
+var int auctionBar   = 0
+var int auctionTrans = 0   // this bar: 0 none · 1 broke up (new range above) · 2 broke down
+auctionTrans := 0
+if locBrk != 0
+    auctionVer   := auctionVer + 1
+    auctionBar   := bar_index
+    auctionTrans := locBrk == 1 ? 1 : 2
+auctionAge = bar_index - auctionBar
+
+// ── ATTENTION verdict: exactly 2 words — direction + what to do ──
+// direction (UP/DOWN/RANGE) from the HTF structure bias · attention state from
+// direction + auction location: STAY AWAY = no clean bias (RANGE); GET READY = a
+// confirmed direction AND price at a favourable location (bull cheap/at floor · bear
+// rich/at ceiling — where the limit order belongs); WAIT = direction but price
+// extended (don't chase).
+dirWord  = dirVerdict == 1 ? "UP" : dirVerdict == -1 ? "DOWN" : "RANGE"
+favLong  = dirVerdict == 1 and (not locPremium or locState == 2)
+favShort = dirVerdict == -1 and (locPremium or locState == 1)
+attnTxt  = dirVerdict == 0 ? "STAY AWAY" : (favLong or favShort) ? "GET READY" : "WAIT"
+
+// ── publish to the data window (machine-readable for other IMIS consumers) ──
+plot(locUB,      "loc.UB (ceiling)",       display=display.data_window)
+plot(locLB,      "loc.LB (floor)",         display=display.data_window)
+plot(locEQ,      "loc.EQ (Claude Line)",   display=display.data_window)
+plot(invUB,      "loc.invalidUB (stop)",   display=display.data_window)
+plot(invLB,      "loc.invalidLB (stop)",   display=display.data_window)
+plot(ubProven ? 1 : 0, "loc.ceilingProven", display=display.data_window)
+plot(lbProven ? 1 : 0, "loc.floorProven",   display=display.data_window)
+plot(auctionVer, "loc.rangeVersion",       display=display.data_window)
+plot(auctionAge, "loc.rangeAge",           display=display.data_window)
+plot(locState,   "loc.zoneState",          display=display.data_window)
+// loc.mtfConsistent: 1 = this chart's walls are timed to rangeTF and match every other
+// chart at/below it. 0 = this chart is ABOVE rangeTF and times its own wider range.
+plot(rangeOn ? 1 : 0, "loc.mtfConsistent", display=display.data_window)
+alertcondition(auctionTrans != 0, "Auction transition", "IMIS Location Engine: active auction changed (new version)")
+
+// ── RENDER ───────────────────────────────────────────────────────────────────
+var array<line>  dLine = array.new<line>()
+var array<label> dLab  = array.new<label>()
+var array<box>   dBox  = array.new<box>()
+f_kindTxt(int k) => k == 2 ? "✓ held" : k == 3 ? "✗ break" : k == 4 ? "↻ retest" : "• touch"
+
+// top-N book indices by CONF (descending) — selection sort over a candidate index list.
+// Used by the Leading view so it ranks by STRENGTH, not by distance to price.
+f_rankTop(array<int> idxs, array<float> conf, int want) =>
+    out = array.new_int()
+    if array.size(idxs) > 0
+        used = array.new_bool(array.size(idxs), false)
+        n = math.min(want, array.size(idxs))
+        if n > 0
+            for r = 0 to n - 1
+                int bestJ = -1
+                float bestC = -1.0
+                for j = 0 to array.size(idxs) - 1
+                    if not array.get(used, j)
+                        c = array.get(conf, array.get(idxs, j))
+                        if c > bestC
+                            bestC := c
+                            bestJ := j
+                if bestJ >= 0
+                    array.set(used, bestJ, true)
+                    array.push(out, array.get(idxs, bestJ))
+    out
+
+// DEGREE-BALANCE draft step: pick element `rnd` of one degree's already-ranked rep
+// list, if it exists, isn't taken yet, and the cap isn't full. Marks it shown + taken
+// (arrays are by-reference so the writes persist) and returns the updated fill count.
+f_take(array<int> ranked, int rnd, array<bool> sel, array<bool> took, int cap, int filled) =>
+    int f = filled
+    if rnd < array.size(ranked) and f < cap
+        idx = array.get(ranked, rnd)
+        if not array.get(took, idx)
+            array.set(sel, idx, true)
+            array.set(took, idx, true)
+            f := f + 1
+    f
+
+if barstate.islast
+    while array.size(dLine) > 0
+        line.delete(array.pop(dLine))
+    while array.size(dLab) > 0
+        label.delete(array.pop(dLab))
+    while array.size(dBox) > 0
+        box.delete(array.pop(dBox))
+    x1 = bar_index - math.min(400, bar_index)
+    x2 = bar_index + extR
+    int naIdx = -1
+    float naD = 1.0e20
+    int nbIdx = -1
+    float nbD = 1.0e20
+    if array.size(book) > 0
+        for i = 0 to array.size(book) - 1
+            dg = array.get(book, i).deg
+            dOn = dg == 0 ? a1H : dg == 1 ? a4H : dg == 2 ? a1D : a1W
+            a = array.get(book, i).anchor
+            if dOn and a >= close and (a - close) < naD
+                naD := a - close
+                naIdx := i
+            if dOn and a < close and (close - a) < nbD
+                nbD := close - a
+                nbIdx := i
+    // CONFIDENCE CACHE — score every level exactly ONCE per render, indexed by book
+    // position. Everything downstream (star rank, merge comparison, cluster tooltip)
+    // reads this array instead of re-scoring. Without it the merge loop re-ran a full
+    // f_audit for every pair of levels → O(book² × events) and a >500ms loop timeout.
+    lvlConf = array.new_float()
+    if array.size(book) > 0
+        for i = 0 to array.size(book) - 1
+            array.push(lvlConf, f_conf(array.get(book, i)))
+    // rank: the Nth-highest score = star threshold
+    float starThr = 1.0e20
+    if topN > 0 and array.size(lvlConf) > 0
+        confs = array.copy(lvlConf)
+        array.sort(confs, order.descending)
+        idx = math.min(topN, array.size(confs)) - 1
+        if idx >= 0
+            starThr := array.get(confs, idx)
+    // DISPLAY SELECTION — "All levels" shows the maxLvls STRONGEST clusters (ranked by
+    // confluence-adjusted CONF), not merely the nearest by distance. Pass 1 finds each
+    // level's cluster representative (mirrors the old inline merge check, computed once
+    // here instead of once per candidate below); Pass 2 ranks representatives by
+    // strength and keeps the top maxLvls, always force-including the LIVE nearest
+    // above/below so "what's happening right now" can never be ranked out.
+    zoneOnly = viewMode != "All levels"
+    selShow  = array.new_bool(array.size(book), false)
+    clCountA = array.new_int(array.size(book), 1)
+    clStrA   = array.new_float(array.size(book), 0.0)
+    if not zoneOnly and array.size(book) > 0
+        repIdx = array.new_int()
+        for i = 0 to array.size(book) - 1
+            L = array.get(book, i)
+            degOn = L.deg == 0 ? a1H : L.deg == 1 ? a4H : L.deg == 2 ? a1D : a1W
+            live  = i == naIdx or i == nbIdx
+            conf  = array.get(lvlConf, i)
+            inReach = math.abs(L.anchor - close) / close * 100 <= reachPct
+            if degOn and (conf >= minConf or live) and (array.size(L.log) >= minShow or live) and (inReach or live)
+                merged = false
+                clCount = 1
+                if mergeOn
+                    bandM = L.anchor * mergeBandPct / 100.0
+                    for k = 0 to array.size(book) - 1
+                        if k != i
+                            Lk = array.get(book, k)
+                            degOnk = Lk.deg == 0 ? a1H : Lk.deg == 1 ? a4H : Lk.deg == 2 ? a1D : a1W
+                            ck = array.get(lvlConf, k)
+                            livek = k == naIdx or k == nbIdx
+                            candk = degOnk and (ck >= minConf or livek) and (array.size(Lk.log) >= minShow or livek)
+                            if candk and math.abs(Lk.anchor - L.anchor) <= bandM
+                                clCount := clCount + 1
+                                if ck > conf or (ck == conf and k < i)
+                                    merged := true
+                array.set(clCountA, i, clCount)
+                array.set(clStrA, i, math.min(100.0, conf + conflBonus * (clCount - 1)))
+                if not merged
+                    array.push(repIdx, i)
+        // DEGREE BALANCE — Phase 1: guarantee each active degree its strongest
+        // minPerDeg reps, drafted round-robin (round 0 = every degree's #1, round 1
+        // = every degree's #2 …) so dominant 1D/1W can't crowd out local 1H/4H and a
+        // tight cap stays balanced. Phase 2: fill the rest by pure global strength.
+        took = array.new_bool(array.size(book), false)
+        int filled = 0
+        if minPerDeg > 0
+            dd0 = array.new_int()
+            dd1 = array.new_int()
+            dd2 = array.new_int()
+            dd3 = array.new_int()
+            for j = 0 to array.size(repIdx) - 1
+                ri = array.get(repIdx, j)
+                dgr = array.get(book, ri).deg
+                if dgr == 0
+                    array.push(dd0, ri)
+                else if dgr == 1
+                    array.push(dd1, ri)
+                else if dgr == 2
+                    array.push(dd2, ri)
+                else
+                    array.push(dd3, ri)
+            rr0 = f_rankTop(dd0, clStrA, minPerDeg)
+            rr1 = f_rankTop(dd1, clStrA, minPerDeg)
+            rr2 = f_rankTop(dd2, clStrA, minPerDeg)
+            rr3 = f_rankTop(dd3, clStrA, minPerDeg)
+            for rnd = 0 to minPerDeg - 1
+                filled := f_take(rr0, rnd, selShow, took, maxLvls, filled)
+                filled := f_take(rr1, rnd, selShow, took, maxLvls, filled)
+                filled := f_take(rr2, rnd, selShow, took, maxLvls, filled)
+                filled := f_take(rr3, rnd, selShow, took, maxLvls, filled)
+        // Phase 2 — fill remaining slots from the reps not already drafted, by strength
+        remIdx = array.new_int()
+        for j = 0 to array.size(repIdx) - 1
+            ri = array.get(repIdx, j)
+            if not array.get(took, ri)
+                array.push(remIdx, ri)
+        fillSel = f_rankTop(remIdx, clStrA, maxLvls - filled)
+        if array.size(fillSel) > 0
+            for j = 0 to array.size(fillSel) - 1
+                array.set(selShow, array.get(fillSel, j), true)
+        if naIdx >= 0
+            array.set(selShow, naIdx, true)
+        if nbIdx >= 0
+            array.set(selShow, nbIdx, true)
+    // ── CLAUDE ZONE = LOCATION ENGINE (stable auction range). The 3 lines come straight
+    // from the auction boundaries — identical on every chart TF, no touch-cluster book. ──
+    float aFloor    = locLB
+    float aCeil     = locUB
+    float claudeMid = locEQ
+    if array.size(book) > 0
+        for i = 0 to array.size(book) - 1
+            if array.get(selShow, i)
+                L = array.get(book, i)
+                events  = array.size(L.log)
+                live = i == naIdx or i == nbIdx
+                conf = array.get(lvlConf, i)          // cached — not re-scored
+                starred = topN > 0 and conf >= starThr
+                bounces = f_count(L, 2)               // event-log walks only for drawn levels
+                breaks  = f_count(L, 3)
+                retests = f_count(L, 4)
+                clCount = array.get(clCountA, i)      // from the Pass-1 merge scan above
+                clStr   = array.get(clStrA, i)        // confluence-adjusted strength — the ranking key
+                isCluster = mergeOn and clCount > 1
+                isRes = L.anchor > close
+                col = colByDeg ? f_degCol(L.deg) : (isRes ? resCol : supCol)
+                decided = bounces + breaks
+                band = L.anchor * bandPct / 100.0
+                linW = (live or starred or isCluster) ? emphWidth : (isRes ? resW : supW)
+                // manual nudge — presentation only, applies to the LIVE ceiling / floor
+                nOff = (i == naIdx ? nudgeCeil : i == nbIdx ? nudgeFloor : 0.0) * L.anchor / 100.0
+                drawA = L.anchor + nOff
+                if L.inside and showActiveZone
+                    zt = (na(L.testHi) ? L.anchor + band : math.max(L.testHi, L.anchor + band)) + nOff
+                    zb = (na(L.testLo) ? L.anchor - band : math.min(L.testLo, L.anchor - band)) + nOff
+                    array.push(dBox, box.new(x1, zt, x2, zb, border_color=zoneBord > 0 ? color.new(zoneCol, 40) : color.new(zoneCol, 100), bgcolor=color.new(zoneCol, zoneOp), border_width=zoneBord))
+                else
+                    array.push(dLine, line.new(x1, drawA, x2, drawA, color=col, width=linW, extend=f_ext(extMode), style=f_lstyle(isRes ? resSty : supSty)))
+                if showLbl
+                    bornT = array.size(L.log) > 0 ? array.get(L.log, 0).t : time
+                    string tl = "LEVEL " + str.tostring(L.anchor, format.mintick) + "  [" + f_degTxt(L.deg) + " degree]\n" + (isRes ? "resistance" : "support") + " · born " + str.format_time(bornT, "yyyy-MM-dd") + "\n———————————————\n"
+                    st = math.max(0, array.size(L.log) - 15)
+                    if array.size(L.log) > 0
+                        for e = st to array.size(L.log) - 1
+                            ev = array.get(L.log, e)
+                            tl := tl + str.format_time(ev.t, "yy-MM-dd HH:mm") + "  " + f_kindTxt(ev.kind) + "  (" + str.tostring(ev.react, "#.0") + "×)\n"
+                    wrtxt = decided > 0 ? str.tostring(math.round(bounces / decided * 100)) + "%" : "n/a"
+                    // AUDIT breakdown (★ levels): every component's point-contribution, summing to CONF
+                    if showAudit and starred
+                        // full breakdown scored here only — a handful of ★ levels, not the whole book
+                        [aConf, winF, rejF, dispF, sweepF, sepF, evidF, provenF, degW, nEv, avgW, held, brk] = f_audit(L)
+                        wtot = wWin + wRej + wDisp + wSweep + wSep + wEvid + wProven
+                        qual = f_qualified(L)
+                        sub = f_pts(winF, wWin, wtot, 1.0) + f_pts(rejF, wRej, wtot, 1.0) + f_pts(dispF, wDisp, wtot, 1.0) + f_pts(sweepF, wSweep, wtot, 1.0) + f_pts(sepF, wSep, wtot, 1.0) + f_pts(evidF, wEvid, wtot, 1.0) + f_pts(provenF, wProven, wtot, 1.0)
+                        tfPts = sub * (degW - 1.0)
+                        tl := tl + "———— AUDIT (calculation order) ————\n"
+                        tl := tl + "1 interactions  " + str.tostring(nEv) + " ev · qualified " + str.tostring(qual) + "  (≥" + str.tostring(sepNorm, "#") + " bars apart)\n"
+                        tl := tl + "2 decay         avg-weight " + str.tostring(avgW, "#.00") + "  (older discounted)\n"
+                        tl := tl + "3 rejection     " + str.tostring(rejF, "#.00") + "  → +" + str.tostring(f_pts(rejF, wRej, wtot, 1.0), "#.0") + "\n"
+                        tl := tl + "4 displacement  " + str.tostring(dispF, "#.00") + "  → +" + str.tostring(f_pts(dispF, wDisp, wtot, 1.0), "#.0") + "\n"
+                        tl := tl + "5 sweep         " + str.tostring(sweepF, "#.00") + "  → +" + str.tostring(f_pts(sweepF, wSweep, wtot, 1.0), "#.0") + "\n"
+                        tl := tl + "6 win rate      " + str.tostring(math.round(winF * 100)) + "%  → +" + str.tostring(f_pts(winF, wWin, wtot, 1.0), "#.0") + "\n"
+                        tl := tl + "7 separation    " + str.tostring(sepF, "#.00") + "  → +" + str.tostring(f_pts(sepF, wSep, wtot, 1.0), "#.0") + "\n"
+                        tl := tl + "8 evidence      " + str.tostring(evidF, "#.00") + "  → +" + str.tostring(f_pts(evidF, wEvid, wtot, 1.0), "#.0") + "\n"
+                        tl := tl + "9 proven holds  " + str.tostring(held) + " bounce" + (held == 1 ? "" : "s") + " → f " + str.tostring(provenF, "#.00") + "  → +" + str.tostring(f_pts(provenF, wProven, wtot, 1.0), "#.0") + (held <= 1 ? "  (UNTESTED — trap)" : "") + "\n"
+                        tl := tl + "  subtotal      " + str.tostring(sub, "#.0") + " pts\n"
+                        tl := tl + "10 timeframe " + f_degTxt(L.deg) + "  ×" + str.tostring(degW, "#.00") + "  → " + (tfPts >= 0 ? "+" : "") + str.tostring(tfPts, "#.0") + " pts\n"
+                        tl := tl + "11 FINAL CONF   " + str.tostring(math.round(conf)) + "  (= subtotal " + (tfPts >= 0 ? "+ " : "− ") + str.tostring(math.abs(tfPts), "#.0") + ")\n"
+                    if isCluster
+                        tl := tl + "———— ⧉ MERGED CLUSTER · STR " + str.tostring(math.round(clStr)) + " ————\n" + str.tostring(clCount) + " levels within " + str.tostring(mergeBandPct, "#.00") + "% of price:\n"
+                        for k = 0 to array.size(book) - 1
+                            Lk = array.get(book, k)
+                            if math.abs(Lk.anchor - L.anchor) <= L.anchor * mergeBandPct / 100.0
+                                tl := tl + "  " + str.tostring(Lk.anchor, format.mintick) + "  " + f_degTxt(Lk.deg) + " · CONF " + str.tostring(math.round(array.get(lvlConf, k))) + " · " + str.tostring(array.size(Lk.log)) + " ev\n"
+                    ltag = (starred ? "★ " : "") + (live ? "◄ LIVE  " : "")
+                    degPart  = showDegTag ? "  " + f_degTxt(L.deg) : ""
+                    confPart = showConf ? (isCluster ? "  ·  STR " + str.tostring(math.round(clStr)) + " ⧉×" + str.tostring(clCount) : "  ·  CONF " + str.tostring(math.round(conf))) : ""
+                    statLine = showStats ? "\n" + str.tostring(events) + " ev · " + str.tostring(bounces) + "✓/" + str.tostring(breaks) + "✗ · win " + wrtxt + (retests > 0 ? " · " + str.tostring(retests) + "↻" : "") : ""
+                    head = ltag + str.tostring(L.anchor, format.mintick) + degPart + " " + (isRes ? "RES" : "SUP") + confPart + statLine
+                    lblX = lblSide == "Left" ? x1 : x2
+                    lblStyle = lblSide == "Left" ? label.style_label_right : label.style_label_left
+                    array.push(dLab, label.new(lblX, drawA, head, xloc=xloc.bar_index, style=lblStyle, color=color.new(col, live ? 0 : lblOp), textcolor=color.white, size=f_sz(lblSize), tooltip=tl))
+    // ── CLAUDE ZONE = Location Engine boundaries (auction floor/ceiling) + Leading swings ──
+    zoneOn = viewMode == "Claude Zone (3)"
+    leadOn = viewMode == "Leading (ranked)"
+    if zoneOn and not na(aFloor)
+        array.push(dLine, line.new(x1, aFloor, x2, aFloor, color=czFloorCol, width=czFloorW, extend=f_ext(extMode), style=f_lstyle(czFloorSty)))
+        if showInval and not na(invLB)
+            array.push(dLine, line.new(x1, invLB, x2, invLB, color=color.new(czFloorCol, 55), width=1, extend=f_ext(extMode), style=line.style_dotted))
+        if showZoneLbl
+            fTag = lbWeak ? " ⚠WEAK" : lbProven ? " ✓proven" : " ⚠UNPROVEN"
+            array.push(dLab, label.new(x2, aFloor, "◄ FLOOR " + str.tostring(aFloor, format.mintick) + fTag + " · v" + str.tostring(auctionVer), xloc=xloc.bar_index, style=label.style_label_left, color=color.new(czFloorCol, 0), textcolor=color.white, size=f_sz(lblSize)))
+    if zoneOn and not na(aCeil)
+        array.push(dLine, line.new(x1, aCeil, x2, aCeil, color=czCeilCol, width=czCeilW, extend=f_ext(extMode), style=f_lstyle(czCeilSty)))
+        if showInval and not na(invUB)
+            array.push(dLine, line.new(x1, invUB, x2, invUB, color=color.new(czCeilCol, 55), width=1, extend=f_ext(extMode), style=line.style_dotted))
+        if showZoneLbl
+            cTag = ubWeak ? " ⚠WEAK" : ubProven ? " ✓proven" : " ⚠UNPROVEN"
+            array.push(dLab, label.new(x2, aCeil, "◄ CEILING " + str.tostring(aCeil, format.mintick) + cTag + " · v" + str.tostring(auctionVer), xloc=xloc.bar_index, style=label.style_label_left, color=color.new(czCeilCol, 0), textcolor=color.white, size=f_sz(lblSize)))
+    // ── LEADING (ranked) — the N STRONGEST scored levels each side, by CONF ──────────
+    // Was: nearest N raw single-TF pivots to the live close (unscored, re-sorted every
+    // tick, so a level vanished the moment price touched it). Now: drawn from the same
+    // scored multi-degree book as everything else, ranked by confidence, and the level
+    // price is currently INTERACTING with is always drawn — it can never disappear
+    // under price. Side is decided on the CONFIRMED close, so it cannot flip intrabar.
+    if leadOn and array.size(book) > 0
+        refPx = barstate.isconfirmed ? close : close[1]     // stable side reference
+        // rank qualifying levels per side by CONF (descending), keep the top leadN
+        upIdx = array.new_int()
+        dnIdx = array.new_int()
+        for i = 0 to array.size(book) - 1
+            L = array.get(book, i)
+            degOn = L.deg == 0 ? a1H : L.deg == 1 ? a4H : L.deg == 2 ? a1D : a1W
+            touching = L.inside                              // being interacted with right now
+            if degOn and (array.get(lvlConf, i) >= zoneMinConf or touching)
+                if L.anchor >= refPx
+                    array.push(upIdx, i)
+                else
+                    array.push(dnIdx, i)
+        topUp = f_rankTop(upIdx, lvlConf, leadN)
+        topDn = f_rankTop(dnIdx, lvlConf, leadN)
+        if array.size(topUp) > 0
+            for r = 0 to array.size(topUp) - 1
+                bi = array.get(topUp, r)
+                v = array.get(book, bi).anchor
+                fade = leadFade ? math.min(70, r * 22) : 0
+                array.push(dLine, line.new(x1, v, x2, v, color=color.new(leadResCol, fade), width=leadW, extend=f_ext(extMode), style=f_lstyle(leadSty)))
+                if showZoneLbl
+                    array.push(dLab, label.new(x2, v, str.tostring(v, format.mintick) + " RES · " + str.tostring(math.round(array.get(lvlConf, bi))), xloc=xloc.bar_index, style=label.style_label_left, color=color.new(leadResCol, math.min(80, fade + lblOp)), textcolor=color.white, size=f_sz(lblSize)))
+        if array.size(topDn) > 0
+            for r = 0 to array.size(topDn) - 1
+                bi = array.get(topDn, r)
+                v = array.get(book, bi).anchor
+                fade = leadFade ? math.min(70, r * 22) : 0
+                array.push(dLine, line.new(x1, v, x2, v, color=color.new(leadSupCol, fade), width=leadW, extend=f_ext(extMode), style=f_lstyle(leadSty)))
+                if showZoneLbl
+                    array.push(dLab, label.new(x2, v, str.tostring(v, format.mintick) + " SUP · " + str.tostring(math.round(array.get(lvlConf, bi))), xloc=xloc.bar_index, style=label.style_label_left, color=color.new(leadSupCol, math.min(80, fade + lblOp)), textcolor=color.white, size=f_sz(lblSize)))
+    if showClaude and not na(claudeMid)
+        // ON-CHART LABEL = the decision only: price + the 2 words (direction · what to do).
+        claudeLbl = "CLAUDE LINE " + str.tostring(claudeMid, format.mintick) + "\n▸ " + dirWord + " · " + attnTxt
+        // EVERYTHING descriptive moves to the hover tooltip so the chart stays a decision, not noise.
+        pd  = close >= claudeMid ? "PREMIUM (above fair value)" : "DISCOUNT (below fair value)"
+        beh = not gateCZ ? "" : (sysState == 1 or sysState == 2) ? "\nregime: TREND → continuation" : "\nregime: RANGE → mean-revert"
+        meta = showAuMeta ? "\nauction: " + f_locStateTxt(locState) + " · v" + str.tostring(auctionVer) + " · age " + str.tostring(auctionAge) : ""
+        agreeTxt = dirVerdict == 0 ? "HTF structure: RANGE (no clean bias)" : "HTF structure: " + dirTxt
+        claudeTip = "CLAUDE LINE = fair value (auction equilibrium)\nlocation: " + pd + beh + meta + "\n" + agreeTxt + "\n→ " + dirWord + " · " + attnTxt
+        array.push(dLine, line.new(x1, claudeMid, x2, claudeMid, color=claudeCol, width=claudeW, extend=f_ext(extMode), style=f_lstyle(claudeSty)))
+        array.push(dLab, label.new(x2, claudeMid, claudeLbl, xloc=xloc.bar_index, style=label.style_label_left, color=color.new(claudeCol, 0), textcolor=color.black, size=f_sz(lblSize), tooltip=claudeTip))
+        if showPD and viewMode != "Claude Line only" and not na(aFloor) and not na(aCeil)
+            array.push(dBox, box.new(x1, aCeil, x2, claudeMid, border_color=color.new(czCeilCol, 100), bgcolor=color.new(czCeilCol, 92)))
+            array.push(dBox, box.new(x1, claudeMid, x2, aFloor, border_color=color.new(czFloorCol, 100), bgcolor=color.new(czFloorCol, 92)))
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ENTRY / SETUP MODULE (SWINGTECH) — structure · BOS-leg · OTE · FVG · sweep ·
+// POC · checklist. The ENTRY-CONFLUENCE layer stacked on top of the S/R walls.
+// Faithful port of the standalone SWINGTECH V6, with three integration changes:
+//   1. namespaced (st*/gE*) so nothing collides with the S/R engine;
+//   2. DIRECTION UNIFIED — the checklist's "HTF aligned" row reads the engine's
+//      own true-direction (dirVerdict, the HTF market-state), NOT a second bias,
+//      so the setup can never say "aligned" while the Claude Line says otherwise;
+//   3. heavy work gated behind the master toggle + the volume profile keeps its
+//      once-per-bar rebuild guard, so it can never re-trip the >500ms loop.
+// ═══════════════════════════════════════════════════════════════════════════
+gE0 = "Entry / Setup (SWINGTECH)"
+stOn = input.bool(true, "Enable entry / setup module", group=gE0, tooltip="Master switch for the whole SWINGTECH layer (swings, BOS leg, OTE, FVG, liquidity sweep, volume profile, checklist). OFF = pure S/R engine, no entry drawing or compute.")
+
+gES = "Entry · Structure"
+stPivLen   = input.int(4, "Swing strength", minval=1, group=gES, tooltip="Bars each side that define a confirmed swing.")
+stUseClose = input.bool(false, "Pivot source: CLOSE (off = High / Low wicks)", group=gES, tooltip="Which price defines a swing pivot. OFF (default) = swing highs/lows sit at the wick extremes where liquidity rests (institutional default). ON = swings confirm on CLOSE, ignoring wicks — fewer, 'cleaner' swings. Either way the BOS break is always confirmed on CLOSE, and liquidity sweeps / leg extremes always use the real wicks.")
+stShowTri  = input.bool(true,  "Swing triangles", group=gES)
+stShowLbl  = input.bool(true,  "HH / HL / LH / LL labels", group=gES)
+stEqTolATR = input.float(0.15, "Equal high/low tolerance (× ATR)", minval=0.0, step=0.05, group=gES)
+
+gEF = "Entry · Fib / OTE"
+showFib    = input.bool(true, "Show fib on latest BOS leg", group=gEF)
+oteLevel   = input.float(0.71, "OTE level", minval=0.1, maxval=0.9, step=0.01, group=gEF)
+fibExtend  = input.int(15, "Extend right (bars)", minval=0, maxval=200, group=gEF)
+showBosLn  = input.bool(true, "Show BOS marker", group=gEF)
+oteTol     = input.float(0.06, "OTE confluence tolerance (± fib ratio)", minval=0.0, maxval=0.5, step=0.01, group=gEF, tooltip="How close an FVG or the POC must sit to the OTE level to count as lining up.")
+
+gEV = "Entry · FVG"
+showFVG    = input.bool(true, "Show FVGs inside the leg", group=gEV)
+fvgMinATR  = input.float(0.0, "Min FVG size (× ATR)", minval=0.0, step=0.1, group=gEV)
+fvgWidth   = input.int(4, "FVG box width (bars)", minval=1, maxval=50, group=gEV)
+
+gEL = "Entry · Liquidity Sweep"
+showLS     = input.bool(true, "Mark liquidity sweep (if present)", group=gEL, tooltip="Optional. Present when the leg's origin RAIDED a prior level — took it out with the wick and closed back inside. Never required, it just adds a check.")
+lsMode     = input.string("Standing level taken", "Sweep type", options=["Standing level taken", "Wick raid (strict close-back)"], group=gEL, tooltip="Standing level taken (default): the origin's wick took out a level that was still standing, and the BOS proves the raid failed — price reversed and broke structure. Strict: additionally requires the sweep candle to close back inside the level.")
+lsPivLen   = input.int(2, "Sweep level sensitivity", minval=1, maxval=5, group=gEL, tooltip="Pivot strength used ONLY to find raidable levels — deliberately lighter than the swing strength so sweeps of small unlabeled highs/lows are caught. Lower = more levels considered.")
+lsLookback = input.int(120, "Sweep lookback (bars)", minval=10, maxval=400, group=gEL, tooltip="How far back to look for the level the origin raided.")
+lsMinPen   = input.float(0.0, "Min penetration (× ATR)", minval=0.0, step=0.05, group=gEL, tooltip="How far past the level the wick must reach to count. 0 = any exceedance.")
+
+gEP = "Entry · Volume Profile"
+vpMode     = input.string("On", "Profile", options=["On", "Off"], group=gEP)
+vpBins     = input.int(35, "Profile rows", minval=10, maxval=100, group=gEP)
+vpLTF      = input.timeframe("15", "Intrabar timeframe", group=gEP, tooltip="Volume is spread across each intrabar's range for accurate node placement, like TradingView's own FRVP.")
+vpWidth    = input.int(18, "Max profile width (bars)", minval=5, maxval=100, group=gEP)
+vpOffset   = input.int(8, "Distance right of price (bars)", minval=0, maxval=100, group=gEP)
+
+gEC = "Entry · Colors"
+colStruct  = input.color(color.new(color.gray, 15),   "Structure labels", group=gEC)
+colFibLn   = input.color(color.new(color.gray, 10),   "Fib 0 / 1", group=gEC)
+colOte     = input.color(color.new(color.yellow, 25), "OTE line", group=gEC)
+colBos     = input.color(color.new(color.gray, 30),   "BOS", group=gEC)
+colFvgBox  = input.color(color.new(color.gray, 80),   "FVG box", group=gEC)
+colLSc     = input.color(color.new(color.red, 20),    "Liquidity sweep", group=gEC)
+colVP      = input.color(color.new(color.gray, 70),   "Profile", group=gEC)
+colPOC     = input.color(color.new(color.orange, 20), "POC", group=gEC)
+
+gEK = "Entry · Checklist"
+showChk    = input.bool(true, "Show checklist", group=gEK)
+
+stAtr = drAtr    // reuse the engine's ATR(14) — no second series
+
+// intrabar data for the profile (global scope requirement)
+ltfH = request.security_lower_tf(syminfo.tickerid, vpLTF, high)
+ltfL = request.security_lower_tf(syminfo.tickerid, vpLTF, low)
+ltfV = request.security_lower_tf(syminfo.tickerid, vpLTF, volume)
+
+// ---------------- CONFIRMED SWINGS ----------------
+// Pivot SOURCE is toggleable: wicks (high/low, default) or CLOSE. The break that
+// defines a BOS is always confirmed on close either way (see leg section below).
+stSrcH = stUseClose ? close : high
+stSrcL = stUseClose ? close : low
+ph = ta.pivothigh(stSrcH, stPivLen, stPivLen)
+pl = ta.pivotlow(stSrcL,  stPivLen, stPivLen)
+
+plotshape(stOn and stShowTri and not na(ph), "Swing High", shape.triangledown, location.abovebar, color.new(color.gray, 25), size=size.tiny, offset=-stPivLen)
+plotshape(stOn and stShowTri and not na(pl), "Swing Low",  shape.triangleup,   location.belowbar, color.new(color.gray, 25), size=size.tiny, offset=-stPivLen)
+
+var float lastPH    = na
+var int   lastPHbar = na
+var float prevPH    = na
+var int   prevPHbar = na
+var float lastPL    = na
+var int   lastPLbar = na
+var float prevPL    = na
+var int   prevPLbar = na
+var bool  phBroken  = false
+var bool  plBroken  = false
+var int   lastHiCls = 0
+var int   lastLoCls = 0
+
+if not na(ph)
+    prevPH    := lastPH
+    prevPHbar := lastPHbar
+    lastPH    := ph
+    lastPHbar := bar_index - stPivLen
+    phBroken  := false
+    string t = "H"
+    if not na(prevPH)
+        if math.abs(ph - prevPH) <= stEqTolATR * stAtr
+            t := "EQH"
+            lastHiCls := 0
+        else if ph > prevPH
+            t := "HH"
+            lastHiCls := 1
+        else
+            t := "LH"
+            lastHiCls := -1
+    if stOn and stShowLbl
+        label.new(lastPHbar, ph, t, xloc.bar_index, yloc.abovebar, color.new(color.black, 100), label.style_label_down, colStruct, size.tiny)
+
+if not na(pl)
+    prevPL    := lastPL
+    prevPLbar := lastPLbar
+    lastPL    := pl
+    lastPLbar := bar_index - stPivLen
+    plBroken  := false
+    string t = "L"
+    if not na(prevPL)
+        if math.abs(pl - prevPL) <= stEqTolATR * stAtr
+            t := "EQL"
+            lastLoCls := 0
+        else if pl < prevPL
+            t := "LL"
+            lastLoCls := -1
+        else
+            t := "HL"
+            lastLoCls := 1
+    if stOn and stShowLbl
+        label.new(lastPLbar, pl, t, xloc.bar_index, yloc.belowbar, color.new(color.black, 100), label.style_label_up, colStruct, size.tiny)
+
+// ---------------- BOS -> DEFINES THE LEG ----------------
+var int   legDir     = 0
+var float legAnchor  = na
+var int   legAnchorB = na
+var float legExt     = na
+var int   legExtB    = na
+var float bosLevel   = na
+var int   bosLevelB  = na
+var int   bosBreakB  = na
+var float lsLevel    = na
+var int   lsLevelB   = na
+
+bool newBos = false
+
+if not na(lastPL) and not plBroken and close < lastPL and not na(lastPH)
+    plBroken   := true
+    legDir     := -1
+    float aP = lastPH
+    int   aB = lastPHbar
+    int   aScan = math.min(bar_index - lastPHbar, 480)
+    for i = 0 to aScan
+        if high[i] > aP
+            aP := high[i]
+            aB := bar_index - i
+    legAnchor  := aP
+    legAnchorB := aB
+    bosLevel   := lastPL
+    bosLevelB  := lastPLbar
+    bosBreakB  := bar_index
+    newBos     := true
+
+if not na(lastPH) and not phBroken and close > lastPH and not na(lastPL)
+    phBroken   := true
+    legDir     := 1
+    float aP = lastPL
+    int   aB = lastPLbar
+    int   aScan = math.min(bar_index - lastPLbar, 480)
+    for i = 0 to aScan
+        if low[i] < aP
+            aP := low[i]
+            aB := bar_index - i
+    legAnchor  := aP
+    legAnchorB := aB
+    bosLevel   := lastPH
+    bosLevelB  := lastPHbar
+    bosBreakB  := bar_index
+    newBos     := true
+
+if newBos
+    int stSpan = math.min(bar_index - legAnchorB, 480)
+    if legDir == -1
+        legExt  := low
+        legExtB := bar_index
+        for i = 0 to stSpan
+            if low[i] < legExt
+                legExt  := low[i]
+                legExtB := bar_index - i
+    else
+        legExt  := high
+        legExtB := bar_index
+        for i = 0 to stSpan
+            if high[i] > legExt
+                legExt  := high[i]
+                legExtB := bar_index - i
+
+    // ---- LIQUIDITY SWEEP (optional; always uses real wicks) ----
+    lsLevel  := na
+    lsLevelB := na
+    if showLS
+        int   aOff   = math.max(0, bar_index - legAnchorB)
+        float aClose = close[aOff]
+        float runMax = na
+        float runMin = na
+        for j = aOff + 1 to math.min(aOff + lsLookback, 450)
+            if na(high[j]) or j < lsPivLen
+                break
+            bool minorHi = true
+            bool minorLo = true
+            for w = 1 to lsPivLen
+                if na(high[j + w]) or na(high[j - w])
+                    minorHi := false
+                    minorLo := false
+                else
+                    if high[j] < high[j + w] or high[j] < high[j - w]
+                        minorHi := false
+                    if low[j] > low[j + w] or low[j] > low[j - w]
+                        minorLo := false
+            if legDir == -1 and minorHi
+                bool standing = na(runMax) or high[j] > runMax
+                bool took     = legAnchor > high[j] + lsMinPen * stAtr
+                bool failed   = lsMode == "Standing level taken" or aClose < high[j]
+                if standing and took and failed
+                    lsLevel  := high[j]
+                    lsLevelB := bar_index - j
+                    break
+            else if legDir == 1 and minorLo
+                bool standing = na(runMin) or low[j] < runMin
+                bool took     = legAnchor < low[j] - lsMinPen * stAtr
+                bool failed   = lsMode == "Standing level taken" or aClose > low[j]
+                if standing and took and failed
+                    lsLevel  := low[j]
+                    lsLevelB := bar_index - j
+                    break
+            runMax := na(runMax) ? high[j] : math.max(runMax, high[j])
+            runMin := na(runMin) ? low[j]  : math.min(runMin, low[j])
+
+if not newBos and legDir == -1 and not na(legExt) and low < legExt
+    legExt  := low
+    legExtB := bar_index
+if not newBos and legDir == 1 and not na(legExt) and high > legExt
+    legExt  := high
+    legExtB := bar_index
+
+// ---------------- DRAW (gated by the master toggle) ----------------
+var line  fl1   = na
+var line  fl0   = na
+var line  flOte = na
+var label lb1   = na
+var label lb0   = na
+var label lbOte = na
+var line  bosLn = na
+var label bosLb = na
+var line  lsLn  = na
+var label lsLb  = na
+var line  pocLn = na
+var array<box>   fvgB = array.new<box>()
+var array<label> fvgL = array.new<label>()
+var array<box>   vpB  = array.new<box>()
+
+bool fvgAtOte = false
+var bool  pocAtOte = false
+var float pocRatio = na
+var int lastVpBar = na
+bool vpRebuild = na(lastVpBar) or lastVpBar != bar_index
+
+if barstate.islast and stOn
+    line.delete(fl1)
+    line.delete(fl0)
+    line.delete(flOte)
+    label.delete(lb1)
+    label.delete(lb0)
+    label.delete(lbOte)
+    line.delete(bosLn)
+    label.delete(bosLb)
+    line.delete(lsLn)
+    label.delete(lsLb)
+    while array.size(fvgB) > 0
+        box.delete(array.pop(fvgB))
+    while array.size(fvgL) > 0
+        label.delete(array.pop(fvgL))
+
+    if legDir != 0 and not na(legAnchor) and not na(legExt)
+        int   xEnd = bar_index + fibExtend
+        float ote  = legExt + oteLevel * (legAnchor - legExt)
+        float oteA = legExt + (oteLevel - oteTol) * (legAnchor - legExt)
+        float oteB = legExt + (oteLevel + oteTol) * (legAnchor - legExt)
+        float zHi  = math.max(oteA, oteB)
+        float zLo  = math.min(oteA, oteB)
+
+        if showFib
+            fl1   := line.new(legAnchorB, legAnchor, xEnd, legAnchor, xloc.bar_index, color=colFibLn, width=1)
+            fl0   := line.new(legAnchorB, legExt,    xEnd, legExt,    xloc.bar_index, color=colFibLn, width=1)
+            flOte := line.new(legAnchorB, ote,       xEnd, ote,       xloc.bar_index, color=colOte,   width=1)
+            lb1   := label.new(xEnd, legAnchor, "1", xloc.bar_index, yloc.price, color.new(color.black, 100), label.style_label_left, colFibLn, size.small)
+            lb0   := label.new(xEnd, legExt,    "0", xloc.bar_index, yloc.price, color.new(color.black, 100), label.style_label_left, colFibLn, size.small)
+            lbOte := label.new(xEnd, ote, str.tostring(oteLevel), xloc.bar_index, yloc.price, color.new(color.black, 100), label.style_label_left, colOte, size.small)
+
+        if showBosLn and not na(bosLevel)
+            bosLn := line.new(bosLevelB, bosLevel, bosBreakB, bosLevel, xloc.bar_index, color=colBos, width=1)
+            bosLb := label.new(math.round(math.avg(bosLevelB, bosBreakB)), bosLevel, "BOS", xloc.bar_index, yloc.price, color.new(color.black, 100), legDir == -1 ? label.style_label_up : label.style_label_down, colBos, size.tiny)
+
+        if showLS and not na(lsLevel)
+            lsLn := line.new(lsLevelB, lsLevel, legAnchorB, lsLevel, xloc.bar_index, color=colLSc, width=1)
+            lsLb := label.new(math.round(math.avg(lsLevelB, legAnchorB)), lsLevel, "LS", xloc.bar_index, yloc.price, color.new(color.black, 100), legDir == -1 ? label.style_label_down : label.style_label_up, colLSc, size.tiny)
+
+        int stSpan = math.min(bar_index - legAnchorB, 400)
+        if stSpan >= 2
+            for i = 0 to stSpan - 2
+                if na(high[i + 2])
+                    break
+                float t = na
+                float b = na
+                if legDir == 1 and low[i] > high[i + 2] and (low[i] - high[i + 2]) >= fvgMinATR * stAtr
+                    t := low[i]
+                    b := high[i + 2]
+                else if legDir == -1 and high[i] < low[i + 2] and (low[i + 2] - high[i]) >= fvgMinATR * stAtr
+                    t := low[i + 2]
+                    b := high[i]
+                if not na(t)
+                    if b <= zHi and t >= zLo
+                        fvgAtOte := true
+                    if showFVG
+                        int bx = bar_index - i - 1
+                        array.push(fvgB, box.new(bx, t, bx + fvgWidth, b, xloc=xloc.bar_index, border_color=color.new(colFvgBox, 60), border_width=1, bgcolor=colFvgBox))
+                        array.push(fvgL, label.new(bx + fvgWidth, math.avg(t, b), "FVG", xloc.bar_index, yloc.price, color.new(color.black, 100), label.style_label_left, color.new(color.gray, 30), size.tiny))
+
+        // ---- FIXED RANGE VOLUME PROFILE over the leg (rebuilt once per bar) ----
+        if vpMode == "On" and stSpan >= 3 and vpRebuild
+            lastVpBar := bar_index
+            line.delete(pocLn)
+            while array.size(vpB) > 0
+                box.delete(array.pop(vpB))
+            float minL = math.min(legAnchor, legExt)
+            float maxH = math.max(legAnchor, legExt)
+            for j = 0 to stSpan
+                minL := math.min(minL, low[j])
+                maxH := math.max(maxH, high[j])
+            float binH = (maxH - minL) / vpBins
+            if binH > 0
+                array<float> vols = array.new<float>(vpBins, 0.0)
+                for j = 0 to stSpan
+                    array<float> aH = ltfH[j]
+                    array<float> aL = ltfL[j]
+                    array<float> aV = ltfV[j]
+                    bool usedIntra = false
+                    if not na(aH) and array.size(aH) > 0 and array.size(aH) == array.size(aL) and array.size(aH) == array.size(aV)
+                        usedIntra := true
+                        for q = 0 to array.size(aH) - 1
+                            float ih = array.get(aH, q)
+                            float il = array.get(aL, q)
+                            float iv = nz(array.get(aV, q))
+                            if iv > 0 and not na(ih) and not na(il)
+                                float irng = ih - il
+                                if irng <= 0
+                                    int bi = math.min(vpBins - 1, math.max(0, int(math.floor((il - minL) / binH))))
+                                    array.set(vols, bi, array.get(vols, bi) + iv)
+                                else
+                                    int b0 = math.min(vpBins - 1, math.max(0, int(math.floor((il - minL) / binH))))
+                                    int b1 = math.min(vpBins - 1, math.max(0, int(math.floor((ih - minL) / binH))))
+                                    for b = b0 to b1
+                                        float lo = minL + b * binH
+                                        float hi = lo + binH
+                                        float ov = math.min(ih, hi) - math.max(il, lo)
+                                        if ov > 0
+                                            array.set(vols, b, array.get(vols, b) + iv * ov / irng)
+                    if not usedIntra
+                        float bl = low[j]
+                        float bh = high[j]
+                        float v  = nz(volume[j])
+                        float rg = bh - bl
+                        if v > 0
+                            if rg <= 0
+                                int bi = math.min(vpBins - 1, math.max(0, int(math.floor((bl - minL) / binH))))
+                                array.set(vols, bi, array.get(vols, bi) + v)
+                            else
+                                int b0 = math.min(vpBins - 1, math.max(0, int(math.floor((bl - minL) / binH))))
+                                int b1 = math.min(vpBins - 1, math.max(0, int(math.floor((bh - minL) / binH))))
+                                for b = b0 to b1
+                                    float lo = minL + b * binH
+                                    float hi = lo + binH
+                                    float ov = math.min(bh, hi) - math.max(bl, lo)
+                                    if ov > 0
+                                        array.set(vols, b, array.get(vols, b) + v * ov / rg)
+
+                float maxV = 0.0
+                int   maxI = -1
+                for b = 0 to vpBins - 1
+                    if array.get(vols, b) > maxV
+                        maxV := array.get(vols, b)
+                        maxI := b
+
+                if maxI >= 0 and maxV > 0
+                    float poc = minL + (maxI + 0.5) * binH
+                    pocRatio := (poc - legExt) / (legAnchor - legExt)
+                    pocAtOte := math.abs(pocRatio - oteLevel) <= oteTol
+                    int anchorR = bar_index + vpOffset + vpWidth
+                    for b = 0 to vpBins - 1
+                        float bv = array.get(vols, b)
+                        if bv > 0
+                            int w = math.max(1, math.round(vpWidth * bv / maxV))
+                            float lo = minL + b * binH
+                            array.push(vpB, box.new(anchorR - w, lo + binH, anchorR, lo, xloc=xloc.bar_index, border_color=color.new(colVP, 100), bgcolor=b == maxI ? color.new(colPOC, 45) : colVP))
+                    pocLn := line.new(legAnchorB, poc, anchorR, poc, xloc.bar_index, color=colPOC, style=line.style_dashed, width=1)
+
+// ---------------- CHECKLIST (direction from the engine's dirVerdict) ----------------
+int structBias = lastHiCls == 1 and lastLoCls == 1 ? 1 : lastHiCls == -1 and lastLoCls == -1 ? -1 : 0
+
+var table stChk = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 25), border_width=1, border_color=color.new(color.gray, 70))
+if barstate.islast and showChk and stOn
+    color onc = color.new(color.lime, 0)
+    color offc = color.new(color.gray, 45)
+    color txc = color.new(color.white, 10)
+
+    bool hasLeg = legDir != 0
+    // HTF alignment now reads the ENGINE's true direction (HTF market-state), not a
+    // separate daily-pivot bias — one source of truth across the whole indicator.
+    bool htfOk  = hasLeg and dirVerdict != 0 and ((legDir == 1) == (dirVerdict == 1))
+    bool lsOk   = hasLeg and not na(lsLevel)
+
+    int score = (htfOk ? 1 : 0) + (hasLeg ? 1 : 0) + (fvgAtOte ? 1 : 0) + (lsOk ? 1 : 0) + (pocAtOte ? 1 : 0)
+
+    string sTxt = structBias == 1 ? "BULLISH" : structBias == -1 ? "BEARISH" : "CONSOLIDATION"
+    color  sCol = structBias == 1 ? onc : structBias == -1 ? color.new(color.red, 0) : color.new(color.orange, 0)
+    string hTxt = dirVerdict == 1 ? "BULL" : dirVerdict == -1 ? "BEAR" : "—"
+
+    table.cell(stChk, 0, 0, "SETUP", text_color=txc, text_size=size.small, text_halign=text.align_left)
+    table.cell(stChk, 1, 0, str.tostring(score) + "/5", text_color=score >= 4 ? onc : txc, text_size=size.small)
+    table.cell(stChk, 0, 1, "Structure", text_color=txc, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stChk, 1, 1, sTxt, text_color=sCol, text_size=size.tiny)
+    table.cell(stChk, 0, 2, "HTF dir aligned", text_color=txc, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stChk, 1, 2, hTxt + " " + (htfOk ? "✓" : "—"), text_color=htfOk ? onc : offc, text_size=size.tiny)
+    table.cell(stChk, 0, 3, "BOS + FVG", text_color=txc, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stChk, 1, 3, hasLeg ? "✓" : "—", text_color=hasLeg ? onc : offc, text_size=size.tiny)
+    table.cell(stChk, 0, 4, str.tostring(oteLevel) + " + FVG", text_color=txc, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stChk, 1, 4, fvgAtOte ? "✓" : "—", text_color=fvgAtOte ? onc : offc, text_size=size.tiny)
+    table.cell(stChk, 0, 5, "Liquidity sweep", text_color=txc, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(stChk, 1, 5, lsOk ? "✓" : "—", text_color=lsOk ? onc : offc, text_size=size.tiny)
+    table.cell(stChk, 0, 6, "POC @ " + str.tostring(oteLevel), text_color=txc, text_size=size.tiny, text_halign=text.align_left)
+    string pTxt = na(pocRatio) ? "—" : (pocAtOte ? "✓" : "—") + " (" + str.tostring(pocRatio, "#.##") + ")"
+    table.cell(stChk, 1, 6, pTxt, text_color=pocAtOte ? onc : offc, text_size=size.tiny)
+
+// ---------------- PUBLISH — entry-layer state to the data window ----------------
+plot(legDir,                    "st.legDir",     display=display.data_window)
+plot(na(legAnchor) ? na : legAnchor, "st.legAnchor", display=display.data_window)
+plot(na(legExt) ? na : legExt,  "st.legExtreme", display=display.data_window)
+plot(na(bosLevel) ? na : bosLevel, "st.bosLevel", display=display.data_window)
+plot(na(lsLevel) ? na : lsLevel, "st.sweepLevel", display=display.data_window)
+plot(fvgAtOte ? 1 : 0,          "st.fvgAtOte",   display=display.data_window)
+plot(pocAtOte ? 1 : 0,          "st.pocAtOte",   display=display.data_window)
+plot(structBias,                "st.structBias", display=display.data_window)
+alertcondition(newBos, "SWINGTECH BOS", "SWINGTECH: new BOS leg formed")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TRADE SIGNALS (plan) — the execution layer. Turns the engine's ingredients
+// into a discrete, non-repainting signal + a concrete entry / SL / TP plan.
+//   ARM      dirVerdict (HTF true direction) must be non-zero — trade only in it.
+//   LOCATION price pulled to the bias-side PROVEN wall, in the right half:
+//              long  = discount (close ≤ Claude Line) AND the bar's low reached
+//                      within entryBandATR×ATR of the proven floor (locLB)
+//              short = premium  AND the bar's high reached the proven ceiling.
+//   STRUCTURE (optional) chart BOS leg agrees with HTF: legDir == dirVerdict.
+//   R:R      (Claude-Line target − entry) / (entry − invalidation) ≥ minRR.
+//   FIRE     rising edge of the ready state on a CONFIRMED bar → fires ONCE.
+//   PLAN     entry = close · SL = sweep-aware invalidation (invLB/invUB) ·
+//            TP1 = Claude Line (locEQ) · TP2 = opposing wall.
+// Only cheap, already-computed, non-repainting state is used (no per-bar FVG/VP
+// rescans), so the arrows are honest on history and never repaint intrabar.
+// ═══════════════════════════════════════════════════════════════════════════
+gSig = "Trade Signals (plan)"
+sigOn        = input.bool(true, "Show trade signals (arrows + active plan)", group=gSig, tooltip="Discrete LONG/SHORT triggers built from the HTF direction + the proven wall + structure. Off = no arrows/plan (the analysis engine still draws).")
+entryBandATR = input.float(0.5, "Entry zone: distance to the wall (× ATR)", minval=0.05, maxval=5.0, step=0.05, group=gSig, tooltip="How close the bar must reach to the proven floor/ceiling to count as 'at the wall'. Wider = earlier, looser entries.")
+reqStruct    = input.bool(true, "Require chart structure (BOS leg) to agree with HTF direction", group=gSig, tooltip="On = only fire when the chart's last BOS leg points the same way as the HTF bias (the SWINGTECH multi-TF alignment). Off = location + R:R alone.")
+minRR        = input.float(1.5, "Minimum reward : risk to fire (Claude-Line target)", minval=0.1, maxval=10.0, step=0.1, group=gSig, tooltip="Reward to the Claude Line vs risk to the invalidation. Filters entries that are already too close to fair value to be worth the stop.")
+showPlan     = input.bool(true, "Draw entry / SL / TP lines for the latest signal", group=gSig)
+showReason   = input.bool(true, "Show WHY (filter reason) readout", group=gSig, tooltip="States the FIRST gate blocking a signal — NO BIAS / NO WALL / not at wall / structure not aligned / R:R too low / READY / FIRED — so the chart explains its own silence instead of leaving you to guess. (Idea borrowed from a reviewed engine's filter-reason gauntlet.)")
+sigCol1      = input.color(#26a69a, "Long", inline="sc", group=gSig)
+sigCol2      = input.color(#ef5350, "Short", inline="sc", group=gSig)
+
+sigAtr = drAtr
+
+// READINESS (non-repaint: all inputs are prior-closed HTF reads or latched walls)
+longLoc   = not na(locLB) and not na(locEQ) and close <= locEQ and (low - locLB) <= sigAtr * entryBandATR
+longStr   = not reqStruct or legDir == 1
+longRisk  = na(invLB) ? na : close - invLB
+longRR    = not na(longRisk) and longRisk > 0 ? (locEQ - close) / longRisk : 0.0
+longReady = sigOn and dirVerdict == 1 and longLoc and longStr and longRR >= minRR
+
+shortLoc   = not na(locUB) and not na(locEQ) and close >= locEQ and (locUB - high) <= sigAtr * entryBandATR
+shortStr   = not reqStruct or legDir == -1
+shortRisk  = na(invUB) ? na : invUB - close
+shortRR    = not na(shortRisk) and shortRisk > 0 ? (close - locEQ) / shortRisk : 0.0
+shortReady = sigOn and dirVerdict == -1 and shortLoc and shortStr and shortRR >= minRR
+
+longFire  = barstate.isconfirmed and longReady  and not longReady[1]
+shortFire = barstate.isconfirmed and shortReady and not shortReady[1]
+
+// ── WHY / filter reason — report the FIRST gate that blocks a signal, in order.
+// Borrowed from the reviewed sr_system brain.py, which states a reason for every
+// no-trade. Answers "why is it quiet?" directly instead of leaving you guessing.
+// codes: 0 fired-long · 1 fired-short · 2 no bias · 3 no wall · 4 not at wall ·
+//        5 structure not aligned · 6 R:R too low · 7 ready(armed) · -1 off
+sigWalls = not na(locLB) and not na(locUB) and not na(locEQ)
+legWord  = legDir == 1 ? "up" : legDir == -1 ? "down" : "flat"
+int    sigWhy = 7
+string sigWhyTxt = na
+if longFire
+    sigWhy := 0
+    sigWhyTxt := "✔ FIRED · LONG"
+else if shortFire
+    sigWhy := 1
+    sigWhyTxt := "✔ FIRED · SHORT"
+else if not sigOn
+    sigWhy := -1
+    sigWhyTxt := "signals off"
+else if dirVerdict == 0
+    sigWhy := 2
+    sigWhyTxt := "◻ NO BIAS · HTF range (stay out)"
+else if not sigWalls
+    sigWhy := 3
+    sigWhyTxt := "◻ NO WALL in reach"
+else if dirVerdict == 1
+    if not longLoc
+        sigWhy := 4
+        sigWhyTxt := "… WAIT · price not at the floor"
+    else if not longStr
+        sigWhy := 5
+        sigWhyTxt := "… WAIT · structure not aligned (leg " + legWord + ")"
+    else if longRR < minRR
+        sigWhy := 6
+        sigWhyTxt := "✖ SKIP · R:R " + str.tostring(longRR, "#.0") + " < " + str.tostring(minRR, "#.0")
+    else
+        sigWhy := 7
+        sigWhyTxt := "▲ READY · LONG (armed — fires on close)"
+else
+    if not shortLoc
+        sigWhy := 4
+        sigWhyTxt := "… WAIT · price not at the ceiling"
+    else if not shortStr
+        sigWhy := 5
+        sigWhyTxt := "… WAIT · structure not aligned (leg " + legWord + ")"
+    else if shortRR < minRR
+        sigWhy := 6
+        sigWhyTxt := "✖ SKIP · R:R " + str.tostring(shortRR, "#.0") + " < " + str.tostring(minRR, "#.0")
+    else
+        sigWhy := 7
+        sigWhyTxt := "▼ READY · SHORT (armed — fires on close)"
+
+// latch the most recent plan (drawn once, on the last bar — bounded object count)
+var int   sigDir   = 0
+var float sigEntry = na
+var float sigSL    = na
+var float sigTP1   = na
+var float sigTP2   = na
+var float sigRR    = na
+var int   sigBar   = na
+if longFire
+    sigDir := 1
+    sigEntry := close
+    sigSL := invLB
+    sigTP1 := locEQ
+    sigTP2 := locUB
+    sigRR := longRR
+    sigBar := bar_index
+if shortFire
+    sigDir := -1
+    sigEntry := close
+    sigSL := invUB
+    sigTP1 := locEQ
+    sigTP2 := locLB
+    sigRR := shortRR
+    sigBar := bar_index
+
+// arrows mark EVERY historical trigger (cheap, unbounded)
+plotshape(longFire,  "Long signal",  shape.triangleup,   location.belowbar, color.new(sigCol1, 0), size=size.small, text="LONG")
+plotshape(shortFire, "Short signal", shape.triangledown, location.abovebar, color.new(sigCol2, 0), size=size.small, text="SHORT")
+alertcondition(longFire,  "Long signal",  "AI-MI: LONG — HTF bull + price at the proven floor + structure aligned")
+alertcondition(shortFire, "Short signal", "AI-MI: SHORT — HTF bear + price at the proven ceiling + structure aligned")
+plot(longFire ? 1 : shortFire ? -1 : 0, "sig.fire", display=display.data_window)
+plot(sigRR, "sig.plannedRR", display=display.data_window)
+plot(sigWhy, "sig.whyCode", display=display.data_window)
+
+// active plan — entry / SL / TP1 / TP2 lines + an R:R label, latest signal only
+var line  planE  = na
+var line  planS  = na
+var line  planT1 = na
+var line  planT2 = na
+var label planLb = na
+var label reasonLb = na
+if barstate.islast
+    line.delete(planE)
+    line.delete(planS)
+    line.delete(planT1)
+    line.delete(planT2)
+    label.delete(planLb)
+    label.delete(reasonLb)
+    // WHY readout — always shows the current gate state (green=ready/fired, orange=wait/skip, gray=no bias)
+    if showReason and sigOn and not na(sigWhyTxt)
+        rcol = sigWhy == 0 ? sigCol1 : sigWhy == 1 ? sigCol2 : sigWhy == 7 ? (dirVerdict == 1 ? sigCol1 : sigCol2) : (sigWhy >= 4 and sigWhy <= 6) ? color.new(#ff9800, 0) : color.new(color.gray, 0)
+        reasonLb := label.new(bar_index + 2, close, "WHY: " + sigWhyTxt, xloc=xloc.bar_index, style=label.style_label_left, color=color.new(rcol, 12), textcolor=color.white, size=size.small)
+    if showPlan and sigDir != 0 and not na(sigEntry)
+        pcol = sigDir == 1 ? sigCol1 : sigCol2
+        px1 = sigBar
+        px2 = bar_index + 20
+        planE  := line.new(px1, sigEntry, px2, sigEntry, xloc=xloc.bar_index, color=color.new(color.gray, 20), width=2)
+        if not na(sigSL)
+            planS := line.new(px1, sigSL, px2, sigSL, xloc=xloc.bar_index, color=color.new(sigCol2, 20), width=1, style=line.style_dashed)
+        if not na(sigTP1)
+            planT1 := line.new(px1, sigTP1, px2, sigTP1, xloc=xloc.bar_index, color=color.new(sigCol1, 20), width=1, style=line.style_dotted)
+        if not na(sigTP2)
+            planT2 := line.new(px1, sigTP2, px2, sigTP2, xloc=xloc.bar_index, color=color.new(sigCol1, 40), width=1, style=line.style_dashed)
+        planTxt = (sigDir == 1 ? "LONG PLAN" : "SHORT PLAN") + "  R:R " + str.tostring(sigRR, "#.0") + "→CL\nentry " + str.tostring(sigEntry, format.mintick) + "  SL " + str.tostring(sigSL, format.mintick) + "\nTP1 " + str.tostring(sigTP1, format.mintick) + " (Claude)  TP2 " + str.tostring(sigTP2, format.mintick) + " (wall)"
+        planLb := label.new(px2, sigEntry, planTxt, xloc=xloc.bar_index, style=label.style_label_left, color=color.new(pcol, 10), textcolor=color.white, size=size.small)

@@ -1,0 +1,214 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+// VOLUME-PROFILE S/R ENGINE — institutional levels (STANDALONE)
+//
+//  Sources every support/resistance line from a VOLUME PROFILE instead of price
+//  pivots. This is the ONE level-source that beat plain pivots in the expectancy
+//  lab (research/institutional_levels.py) — VProfile > pivot on BTC / ETH / SOL.
+//  The on-chart algorithm is byte-for-byte the tested one: a rolling window of
+//  the last `winLen` CLOSED bars, volume distributed across each bar's range,
+//  POINT-OF-CONTROL (highest-volume price) + a 70% VALUE AREA (VAH / VAL).
+//
+//  Sub-parts:
+//    1. PROFILE      — rolling histogram, volume spread over each bar's H-L range
+//    2. POC          — the price the market accepted most (fair-value magnet)
+//    3. VALUE AREA   — VAH / VAL bounding `vaPct` of volume (the 70% band)
+//    4. HVN NODES    — secondary high-volume shelves = extra S/R (optional)
+//    5. LOCATION     — price above / inside / below value → context for entries
+//
+//  DETERMINISTIC + NON-REPAINTING: the profile is built only from bars [1..winLen]
+//  (all CLOSED), never the live bar, so a level printed on any historical bar was
+//  computable at that bar's close and never moves. No MA / oscillator — pure
+//  traded-volume structure.
+// ═══════════════════════════════════════════════════════════════════════════
+indicator("Volume-Profile S/R Engine", shorttitle="VP-SR", overlay=true, max_lines_count=500, max_labels_count=500, max_bars_back=5000)
+
+// ── INPUTS ─────────────────────────────────────────────────────────────────
+gP = "Volume profile"
+winLen  = input.int(60,   "Profile window (closed bars)", minval=10, maxval=500, group=gP, tooltip="How many CLOSED bars build the profile. 60 mirrors the validated research window.")
+bins    = input.int(50,   "Price bins (resolution)",      minval=10, maxval=200, group=gP, tooltip="Vertical resolution of the histogram. Higher = finer levels, slower.")
+vaPct   = input.float(0.70,"Value-Area coverage",         minval=0.50, maxval=0.95, step=0.05, group=gP, tooltip="Fraction of traded volume the Value Area (VAH..VAL) must contain. 70% is the institutional standard.")
+useRange= input.bool(true, "Spread volume across bar range (off = at close)", group=gP, tooltip="ON = each bar's volume is smeared across its High-Low range (true profile). OFF = all volume booked at the close price.")
+
+gN = "High-volume nodes (extra S/R)"
+showHVN = input.bool(true, "Show HVN shelves",  group=gN)
+hvnK    = input.int(3,    "Max HVN levels",    minval=1, maxval=8, group=gN, tooltip="Secondary high-volume price shelves (besides the POC) drawn as faint S/R.")
+hvnMin  = input.float(0.35,"HVN min strength (× POC volume)", minval=0.05, maxval=0.95, step=0.05, group=gN, tooltip="A bin is an HVN only if its volume ≥ this fraction of the POC bin's volume.")
+
+gD = "Display"
+showRays  = input.bool(true, "Project current levels right", group=gD)
+showHist  = input.bool(true, "Plot rolling POC / VAH / VAL", group=gD)
+showFill  = input.bool(true, "Shade the Value Area",         group=gD)
+showPanel = input.bool(true, "Show info panel",              group=gD)
+panelPos  = input.string("Top Right", "Panel position", options=["Top Right","Top Left","Bottom Right","Bottom Left"], group=gD)
+colPOC = input.color(#ff9800, "POC",         group=gD)
+colVA  = input.color(#42a5f5, "Value Area",  group=gD)
+colHVN = input.color(#9e9e9e, "HVN",         group=gD)
+
+f_tpos(s) => s == "Top Left" ? position.top_left : s == "Bottom Right" ? position.bottom_right : s == "Bottom Left" ? position.bottom_left : position.top_right
+
+// ── PROFILE STATE (reused each bar, never re-allocated) ──────────────────────
+var float[] hist = array.new_float(bins, 0.0)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CORE — rolling volume profile → POC / VAH / VAL  (non-repaint: bars [1..winLen])
+// Mirrors research/institutional_levels.py :: gen_vprofile exactly.
+// ═══════════════════════════════════════════════════════════════════════════
+float poc = na
+float vah = na
+float val = na
+float pHi = na
+float pLo = na
+float pocVol = na
+
+if bar_index > winLen
+    // window extent over the last winLen CLOSED bars
+    float lo = low[1]
+    float hi = high[1]
+    for i = 1 to winLen
+        lo := math.min(lo, low[i])
+        hi := math.max(hi, high[i])
+    if hi > lo
+        float w = (hi - lo) / bins
+        array.fill(hist, 0.0)
+        for i = 1 to winLen
+            float vv = na(volume[i]) ? 0.0 : volume[i]
+            if useRange
+                int b0 = math.max(0, math.min(bins - 1, int((low[i]  - lo) / w)))
+                int b1 = math.max(0, math.min(bins - 1, int((high[i] - lo) / w)))
+                float share = vv / (b1 - b0 + 1)
+                for b = b0 to b1
+                    array.set(hist, b, array.get(hist, b) + share)
+            else
+                int b = math.max(0, math.min(bins - 1, int((close[i] - lo) / w)))
+                array.set(hist, b, array.get(hist, b) + vv)
+        // POINT OF CONTROL — the most-traded bin
+        int pocB = 0
+        float best = -1.0
+        for b = 0 to bins - 1
+            float vb = array.get(hist, b)
+            if vb > best
+                best := vb
+                pocB := b
+        // VALUE AREA — expand from POC, always adding the heavier neighbour, to vaPct
+        float tot = array.sum(hist)
+        int lob = pocB
+        int hib = pocB
+        float acc = array.get(hist, pocB)
+        int guard = 0
+        while acc < vaPct * tot and (lob > 0 or hib < bins - 1) and guard < bins * 2
+            guard += 1
+            float up = hib < bins - 1 ? array.get(hist, hib + 1) : -1.0
+            float dn = lob > 0        ? array.get(hist, lob - 1) : -1.0
+            if up >= dn and hib < bins - 1
+                hib += 1
+                acc += array.get(hist, hib)
+            else if lob > 0
+                lob -= 1
+                acc += array.get(hist, lob)
+            else
+                break
+        poc    := lo + (pocB + 0.5) * w
+        vah    := lo + (hib + 1) * w
+        val    := lo + lob * w
+        pHi    := hi
+        pLo    := lo
+        pocVol := best
+
+// ── LOCATION — where price sits relative to fair value ───────────────────────
+// 1 = above value (premium) · 0 = inside value · -1 = below value (discount)
+int loc = na(poc) ? na : close > vah ? 1 : close < val ? -1 : 0
+string locTxt = loc == 1 ? "ABOVE VALUE (premium)" : loc == -1 ? "BELOW VALUE (discount)" : na(loc) ? "—" : "INSIDE VALUE (fair)"
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RENDER — rolling lines, value-area fill, projected rays, HVN shelves
+// ═══════════════════════════════════════════════════════════════════════════
+plot(showHist ? poc : na, "POC", color=colPOC, linewidth=2, style=plot.style_stepline)
+pV = plot(showHist ? vah : na, "VAH", color=color.new(colVA, 40), style=plot.style_stepline)
+pL = plot(showHist ? val : na, "VAL", color=color.new(colVA, 40), style=plot.style_stepline)
+fill(pV, pL, color=showFill ? color.new(colVA, 90) : na, title="Value Area")
+
+// projected horizontal rays at the CURRENT levels (the actionable S/R right now)
+f_ray(ln, lb, price, col, wid, txt) =>
+    line _l = ln
+    label _b = lb
+    if not na(price)
+        if na(_l)
+            _l := line.new(bar_index, price, bar_index + 1, price, xloc=xloc.bar_index, extend=extend.right, color=col, width=wid)
+            _b := label.new(bar_index, price, txt, xloc=xloc.bar_index, style=label.style_label_left, color=color.new(col, 100), textcolor=col, size=size.small)
+        else
+            line.set_xy1(_l, bar_index, price)
+            line.set_xy2(_l, bar_index + 1, price)
+            label.set_xy(_b, bar_index, price)
+            label.set_text(_b, txt)
+    [_l, _b]
+
+var line   pocRay = na
+var label  pocLbl = na
+var line   vahRay = na
+var label  vahLbl = na
+var line   valRay = na
+var label  valLbl = na
+
+if showRays and barstate.islast
+    [l1, b1] = f_ray(pocRay, pocLbl, poc, colPOC, 2, "POC " + (na(poc) ? "" : str.tostring(poc, format.mintick)))
+    pocRay := l1
+    pocLbl := b1
+    [l2, b2] = f_ray(vahRay, vahLbl, vah, colVA, 1, "VAH " + (na(vah) ? "" : str.tostring(vah, format.mintick)))
+    vahRay := l2
+    vahLbl := b2
+    [l3, b3] = f_ray(valRay, valLbl, val, colVA, 1, "VAL " + (na(val) ? "" : str.tostring(val, format.mintick)))
+    valRay := l3
+    valLbl := b3
+
+// HVN shelves — secondary high-volume nodes (local peaks in the histogram) as S/R
+var line[] hvnLines = array.new_line(0)
+if showHVN and barstate.islast and not na(pocVol) and pHi > pLo
+    for j = 0 to array.size(hvnLines) - 1
+        line.delete(array.get(hvnLines, j))
+    array.clear(hvnLines)
+    float w = (pHi - pLo) / bins
+    int drawn = 0
+    // scan bins for local maxima that clear the HVN threshold, skip the POC bin
+    for b = 1 to bins - 2
+        if drawn >= hvnK
+            break
+        float vb = array.get(hist, b)
+        bool isPeak = vb > array.get(hist, b - 1) and vb >= array.get(hist, b + 1)
+        if isPeak and vb >= hvnMin * pocVol
+            float pr = pLo + (b + 0.5) * w
+            // don't redraw a shelf that coincides with the POC
+            if math.abs(pr - poc) > w
+                line ln = line.new(bar_index - winLen, pr, bar_index + 1, pr, xloc=xloc.bar_index, extend=extend.right, color=color.new(colHVN, 45), width=1, style=line.style_dotted)
+                array.push(hvnLines, ln)
+                drawn += 1
+
+// ── INFO PANEL ───────────────────────────────────────────────────────────────
+var table pan = table.new(f_tpos(panelPos), 2, 6, frame_color=color.new(color.gray, 60), frame_width=1, border_color=color.new(color.gray, 80), border_width=1)
+f_row(r, k, v, col) =>
+    table.cell(pan, 0, r, k, text_color=color.new(color.gray, 0), text_size=size.small, text_halign=text.align_left)
+    table.cell(pan, 1, r, v, text_color=col, text_size=size.small, text_halign=text.align_right)
+if showPanel and barstate.islast
+    table.cell(pan, 0, 0, "VOLUME-PROFILE S/R", text_color=color.white, text_size=size.small, bgcolor=color.new(color.gray, 70))
+    table.cell(pan, 1, 0, str.tostring(winLen) + "×" + str.tostring(bins), text_color=color.new(color.gray, 20), text_size=size.small, bgcolor=color.new(color.gray, 70))
+    f_row(1, "POC", na(poc) ? "—" : str.tostring(poc, format.mintick), colPOC)
+    f_row(2, "VAH", na(vah) ? "—" : str.tostring(vah, format.mintick), colVA)
+    f_row(3, "VAL", na(val) ? "—" : str.tostring(val, format.mintick), colVA)
+    f_row(4, "Price", str.tostring(close, format.mintick), color.new(color.gray, 0))
+    f_row(5, "Location", locTxt, loc == 1 ? colPOC : loc == -1 ? colVA : color.new(color.gray, 0))
+
+// ── MACHINE-READABLE PUBLISH (data window) ───────────────────────────────────
+plot(poc,  "vp.poc",       display=display.data_window)
+plot(vah,  "vp.vah",       display=display.data_window)
+plot(val,  "vp.val",       display=display.data_window)
+plot(pHi,  "vp.rangeHigh", display=display.data_window)
+plot(pLo,  "vp.rangeLow",  display=display.data_window)
+plot(loc,  "vp.location",  display=display.data_window)   // 1 premium / 0 fair / -1 discount
+
+// ── ALERTS ───────────────────────────────────────────────────────────────────
+crossPOC   = not na(poc) and ta.cross(close, poc)
+enterValue = not na(loc) and loc == 0 and (loc[1] != 0)
+leaveValue = not na(loc) and loc != 0 and (loc[1] == 0)
+alertcondition(crossPOC,   "Price crossed POC",        "Price crossed the Point of Control (fair-value pivot).")
+alertcondition(enterValue, "Price entered Value Area", "Price re-entered the 70% Value Area (VAL..VAH).")
+alertcondition(leaveValue, "Price left Value Area",    "Price accepted outside the Value Area (breakout / rejection).")

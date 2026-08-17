@@ -1,0 +1,636 @@
+//@version=6
+// Institutional S/R Engine — MEMORY + ICS + MS-CORE STRUCTURE CONFLUENCE.
+// Levels are clustered swing pivots (chart-native — where price actually reverses).
+// Each level carries a MEMORY: touches, flips (support↔resistance), reaction size,
+// time span, volume, retests, bounces, breaks, win-rate, last reaction. An
+// Institutional Confidence Score (ICS 0-100) blends all of it PLUS structure
+// confluence with the MS-Core market-structure bias (W→D→4H→1H). Only the
+// strongest levels display; a level being tested expands into a live ZONE.
+// Bias now uses the SAME method as MS-Core: swings detected on the WICK,
+// breaks confirmed on the CLOSE — so S/R and structure agree by construction.
+// Levels that FIGHT the bias are dimmed; the one actionable level is ★-marked.
+indicator("Institutional S/R [ICS + Structure]", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500, max_bars_back=5000)
+
+gD = "Detection"
+pivLen      = input.int(10, "Swing Size", minval=2, maxval=100, group=gD)
+histBars    = input.int(2000, "History Lookback (bars)", minval=100, maxval=5000, group=gD)
+bandPct     = input.float(0.75, "Cluster Band (% of price)", minval=0.05, maxval=10.0, step=0.05, group=gD)
+zoneBandPct = input.float(0.50, "Test Zone Band (% of price)", minval=0.05, maxval=10.0, step=0.05, group=gD)
+
+gS = "Selection"
+maxLines   = input.int(6, "Max Lines", minval=1, maxval=20, group=gS)
+minICS     = input.float(0.0, "Min ICS to Show", minval=0.0, maxval=100.0, step=5.0, group=gS)
+minTouches = input.int(2, "Min Touches", minval=1, maxval=20, group=gS)
+sepPct     = input.float(1.5, "Min Separation (% of price)", minval=0.1, maxval=10.0, step=0.1, group=gS)
+
+gI = "ICS Weights"
+touchNorm = input.float(6.0, "Touches for Full Score", minval=1.0, maxval=30.0, group=gI)
+reactNorm = input.float(2.0, "Reaction ATR for Full Score", minval=0.5, maxval=10.0, step=0.5, group=gI)
+spanNorm  = input.float(200.0, "Time Span (bars) for Full Score", minval=10.0, maxval=5000.0, group=gI)
+wTouch  = input.float(0.25, "Weight Touches", minval=0.0, maxval=1.0, step=0.05, group=gI)
+wFlip   = input.float(0.15, "Weight Flip", minval=0.0, maxval=1.0, step=0.05, group=gI)
+wReact  = input.float(0.12, "Weight Reaction", minval=0.0, maxval=1.0, step=0.05, group=gI)
+wWin    = input.float(0.18, "Weight Win Rate", minval=0.0, maxval=1.0, step=0.05, group=gI)
+wSpan   = input.float(0.08, "Weight Time Span", minval=0.0, maxval=1.0, step=0.05, group=gI)
+wVol    = input.float(0.05, "Weight Volume", minval=0.0, maxval=1.0, step=0.05, group=gI)
+wStruct = input.float(0.25, "Weight Structure Confluence", minval=0.0, maxval=1.0, step=0.05, group=gI)
+
+gC = "Style"
+resCol    = input.color(#ffd24a, "Resistance", group=gC)
+supCol    = input.color(#4ac6ff, "Support", group=gC)
+zoneCol   = input.color(#ffd24a, "Active Test Zone", group=gC)
+lineWidth = input.int(2, "Line Width", minval=1, maxval=6, group=gC)
+flipThick = input.bool(true, "Flip levels thicker", group=gC)
+extendR   = input.int(30, "Extend Right (bars)", minval=0, maxval=200, group=gC)
+showLbl   = input.bool(true, "Show Labels", group=gC)
+lblSizeS  = input.string("Small", "Label Size", options=["Tiny", "Small", "Normal", "Large"], group=gC)
+
+gM = "Market Structure (MS-Core)"
+biasPiv   = input.int(5, "Bias Swing Length (wick fractal L/R)", minval=2, maxval=30, group=gM)
+structLen = input.int(120, "Premium/Discount Range Lookback", minval=20, maxval=1000, group=gM)
+showExc   = input.bool(true, "Excursion Zones (track test depth)", group=gM)
+showPanel = input.bool(true, "Show Decision Panel", group=gM)
+dimVs     = input.bool(true, "Dim levels that fight the bias", group=gM)
+showAct   = input.bool(true, "Mark the actionable level (★)", group=gM)
+
+gL = "DOL Liquidity (Sphinx)"
+showDOL     = input.bool(true, "Show DOL liquidity levels (prior D/W/M)", group=gL)
+dolDay      = input.bool(true, "Prior Day H/L (PDH/PDL)", group=gL)
+dolWeek     = input.bool(true, "Prior Week H/L (PWH/PWL)", group=gL)
+dolMonth    = input.bool(true, "Prior Month H/L (PMH/PML)", group=gL)
+dolEQ       = input.bool(true, "Weekly / Monthly Equilibrium (50%)", group=gL)
+dolOpens    = input.bool(true, "D/W/M Opens (Midnight Daily EQ etc.)", group=gL)
+dolBandPct  = input.float(1.5, "Confluence / cluster band (% of price)", minval=0.1, maxval=5.0, step=0.1, group=gL)
+dolBoost    = input.float(15.0, "DOL confluence ICS boost (per level)", minval=0.0, maxval=50.0, step=5.0, group=gL)
+nakedBoost  = input.float(8.0, "Extra boost if DOL is naked (untested)", minval=0.0, maxval=30.0, step=2.0, group=gL)
+dolSnap     = input.bool(true, "Snap confluent S/R line to exact DOL price", group=gL)
+dolEmph     = input.bool(true, "Emphasize ceiling (bear) / floor (bull)", group=gL)
+colCeil     = input.color(#ef5350, "Ceiling (above price)", group=gL)
+colFloor    = input.color(#26a69a, "Floor (below price)", group=gL)
+
+gSe = "DOL Sessions (intraday H/L)"
+showSess   = input.bool(true, "Show session highs/lows (Asia/London/NY)", group=gSe)
+sessRes    = input.timeframe("60", "Intraday resolution for sessions", options=["15", "30", "60", "120", "240"], group=gSe, tooltip="Lower = more precise session H/L but heavier. If a big chart (1W) ever times out, raise this to 240.")
+sessTz     = input.string("GMT+0", "Session timezone", options=["GMT+0", "America/New_York", "GMT+1", "GMT+2", "GMT+3", "Asia/Tokyo"], group=gSe, tooltip="Standard crypto is UTC (GMT+0). Switch to America/New_York for classic ICT kill-zone times.")
+useAsia    = input.bool(true, "Asia session", group=gSe)
+asiaSess   = input.session("0000-0800", "Asia window", group=gSe)
+useLondon  = input.bool(true, "London session", group=gSe)
+londonSess = input.session("0800-1600", "London window", group=gSe)
+useNY      = input.bool(true, "New York session", group=gSe)
+nySess     = input.session("1300-2100", "New York window", group=gSe)
+
+gN = "Manual Nudge"
+nudgePrice = input.float(0.0, "Line to nudge — type its price (0 = off)", group=gN, tooltip="Read the price off the line's own label and type it here. The closest line — S/R OR liquidity (⚡) — gets moved. Set back to 0 to disable.")
+nudgeAmt   = input.float(0.0, "Nudge amount (% of price, + up / − down)", minval=-3.0, maxval=3.0, step=0.02, group=gN, tooltip="How far to move that line. Small steps (0.02–0.10%) usually land it on the wick.")
+
+f_size(s) => s == "Tiny" ? size.tiny : s == "Normal" ? size.normal : s == "Large" ? size.large : size.small
+
+// A level and its full memory.
+type Lvl
+    float price
+    int   touch
+    bool  hi
+    bool  lo
+    int   first
+    int   last
+    float reactSum
+    int   reactN
+    float volSum
+    int   retest
+    int   bounce
+    int   brk
+    int   lastReact
+    bool  was
+    array<int> hist
+    float testHi
+    float testLo
+
+var array<Lvl> book = array.new<Lvl>()
+
+atr    = ta.atr(14)
+avgVol = ta.sma(volume, 50)
+
+// ── Premium / discount context ───────────────────────────────────────────────
+rangeHi = ta.highest(high, structLen)
+rangeLo = ta.lowest(low, structLen)
+eqLvl   = (rangeHi + rangeLo) / 2.0
+inPrem  = close > eqLvl
+
+// ── MS-CORE bias: swings on WICK, break confirmed on CLOSE (matches ms_core.pine)
+// Returns +1 bull / -1 bear / 0. Scalar, so requesting W/D/4H/1H is cheap and
+// never triggers array-memory blow-up.
+// NOTE: no barstate.isconfirmed in here — it does NOT work inside request.security
+// (it reads the CHART bar, not the requested TF's bar), which previously let the
+// still-forming HTF bar register a premature break (the "1D Bullish on a bearish
+// chart" bug). Confirmation is applied OUTSIDE via f_biasPrev()[1] + lookahead_on,
+// so the value is the last CLOSED HTF bar and history never repaints.
+f_bias() =>
+    _ph = ta.pivothigh(high, biasPiv, biasPiv)
+    _pl = ta.pivotlow(low,  biasPiv, biasPiv)
+    var int   _dir    = 0
+    var float _lastPH = na
+    var float _lastPL = na
+    var float _upRef  = na
+    var float _dnRef  = na
+    if not na(_ph)
+        _lastPH := _ph
+        if na(_upRef)
+            _upRef := _ph
+    if not na(_pl)
+        _lastPL := _pl
+        if na(_dnRef)
+            _dnRef := _pl
+    _brokeUp = not na(_upRef) and close > _upRef
+    _brokeDn = not na(_dnRef) and close < _dnRef
+    if _brokeUp
+        _dir := 1
+        _dnRef := _lastPL
+        _upRef := na
+    if _brokeDn
+        _dir := -1
+        _upRef := _lastPH
+        _dnRef := na
+    _dir
+
+// Non-repaint wrapper: bias of the last CLOSED bar of the requested TF.
+f_biasPrev() =>
+    int b = f_bias()
+    b[1]
+
+wB  = request.security(syminfo.tickerid, "W",   f_biasPrev(), lookahead = barmerge.lookahead_on)
+dB  = request.security(syminfo.tickerid, "D",   f_biasPrev(), lookahead = barmerge.lookahead_on)
+h4B = request.security(syminfo.tickerid, "240", f_biasPrev(), lookahead = barmerge.lookahead_on)
+h1B = request.security(syminfo.tickerid, "60",  f_biasPrev(), lookahead = barmerge.lookahead_on)
+f_biasTxt(int b) => b > 0 ? "Bullish" : b < 0 ? "Bearish" : "Neutral"
+
+// Weighted HTF bias score (W is the boss) in [-1, 1], with a neutral deadband.
+biasScore = wB * 0.40 + dB * 0.30 + h4B * 0.20 + h1B * 0.10
+bDir = biasScore > 0.15 ? 1 : biasScore < -0.15 ? -1 : 0
+
+// ── DOL LIQUIDITY: prior D/W/M pools (Sphinx), non-repainting ─────────────────
+// [1] + lookahead_on = the last CLOSED period's high/low (prior day/week/month).
+pdH = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+pdL = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_on)
+pwH = request.security(syminfo.tickerid, "W", high[1], lookahead=barmerge.lookahead_on)
+pwL = request.security(syminfo.tickerid, "W", low[1],  lookahead=barmerge.lookahead_on)
+pmH = request.security(syminfo.tickerid, "M", high[1], lookahead=barmerge.lookahead_on)
+pmL = request.security(syminfo.tickerid, "M", low[1],  lookahead=barmerge.lookahead_on)
+wEQ = (na(pwH) or na(pwL)) ? na : (pwH + pwL) / 2.0
+mEQ = (na(pmH) or na(pmL)) ? na : (pmH + pmL) / 2.0
+// current-period opens (fixed at period start → non-repainting). dOpen = Midnight Daily EQ.
+dOpen = request.security(syminfo.tickerid, "D", open, lookahead=barmerge.lookahead_off)
+wOpen = request.security(syminfo.tickerid, "W", open, lookahead=barmerge.lookahead_off)
+mOpen = request.security(syminfo.tickerid, "M", open, lookahead=barmerge.lookahead_off)
+
+// Session H/L: accumulate high/low inside a session, LATCH the completed session's
+// values (prior session = non-repainting), and track naked (untested since latch).
+// Returns [priorHigh, priorLow, nakedHigh, nakedLow]. Evaluated at an intraday res
+// via request.security so it works on any chart TF (incl. 1D/1W).
+f_sess(simple string sess, simple string tz) =>
+    var float h  = na
+    var float l  = na
+    var float pH = na
+    var float pL = na
+    var bool  nH = false
+    var bool  nL = false
+    ins = not na(time(timeframe.period, sess, tz))
+    ns  = ins and not ins[1]
+    if ns
+        h := high
+        l := low
+    else if ins
+        h := math.max(h, high)
+        l := math.min(l, low)
+    if ins[1] and not ins
+        pH := h
+        pL := l
+        nH := true
+        nL := true
+    if not na(pH) and high >= pH
+        nH := false
+    if not na(pL) and low <= pL
+        nL := false
+    [pH, pL, nH, nL]
+
+[asiaH, asiaL, asiaHn, asiaLn]   = request.security(syminfo.tickerid, sessRes, f_sess(asiaSess, sessTz),   lookahead=barmerge.lookahead_off)
+[lonH,  lonL,  lonHn,  lonLn]    = request.security(syminfo.tickerid, sessRes, f_sess(londonSess, sessTz), lookahead=barmerge.lookahead_off)
+[nyH,   nyL,   nyHn,   nyLn]     = request.security(syminfo.tickerid, sessRes, f_sess(nySess, sessTz),     lookahead=barmerge.lookahead_off)
+
+// naked tracking: a pool is "naked" until price trades through it in the new period
+var bool pdHn = true
+var bool pdLn = true
+var bool pwHn = true
+var bool pwLn = true
+var bool pmHn = true
+var bool pmLn = true
+if pdH != pdH[1]
+    pdHn := true
+if pdL != pdL[1]
+    pdLn := true
+if pwH != pwH[1]
+    pwHn := true
+if pwL != pwL[1]
+    pwLn := true
+if pmH != pmH[1]
+    pmHn := true
+if pmL != pmL[1]
+    pmLn := true
+if not na(pdH) and high >= pdH
+    pdHn := false
+if not na(pdL) and low <= pdL
+    pdLn := false
+if not na(pwH) and high >= pwH
+    pwHn := false
+if not na(pwL) and low <= pwL
+    pwLn := false
+if not na(pmH) and high >= pmH
+    pmHn := false
+if not na(pmL) and low <= pmL
+    pmLn := false
+
+var array<float>  dolPx  = array.new<float>()   // raw pools (pre-cluster)
+var array<string> dolTag = array.new<string>()
+var array<bool>   dolNk  = array.new<bool>()
+var array<float>  clPx   = array.new<float>()   // clustered zones (what we draw/score)
+var array<string> clTag  = array.new<string>()
+var array<bool>   clNk   = array.new<bool>()
+var array<int>    clCnt  = array.new<int>()
+var array<float>  snapUsed = array.new<float>()
+
+f_addDol(bool en, float px, string tag, bool nk) =>
+    if en and showDOL and not na(px)
+        array.push(dolPx, px)
+        array.push(dolTag, tag)
+        array.push(dolNk, nk)
+
+// ICS boost from each confluence CLUSTER within the band (bigger stack = bigger boost).
+f_dolBoost(float px) =>
+    band = px * dolBandPct / 100.0
+    float bst = 0.0
+    if showDOL and array.size(clPx) > 0
+        for i = 0 to array.size(clPx) - 1
+            if math.abs(array.get(clPx, i) - px) <= band
+                bst := bst + dolBoost * array.get(clCnt, i) + (array.get(clNk, i) ? nakedBoost : 0.0)
+    bst
+
+// Nearest cluster to a price → [snapped price (cluster mid), combined tag, pool count].
+f_dolInfo(float px) =>
+    band = px * dolBandPct / 100.0
+    float snapPx = px
+    float bestD = band + 1.0
+    string tag = ""
+    int cnt = 0
+    if showDOL and array.size(clPx) > 0
+        for i = 0 to array.size(clPx) - 1
+            d = math.abs(array.get(clPx, i) - px)
+            if d <= band and d < bestD
+                bestD := d
+                cnt := array.get(clCnt, i)
+                tag := array.get(clTag, i)
+                snapPx := dolSnap ? array.get(clPx, i) : px
+    [snapPx, tag, cnt]
+
+ph = ta.pivothigh(high, pivLen, pivLen)
+pl = ta.pivotlow(low, pivLen, pivLen)
+
+// Register a swing pivot into the nearest price cluster (or open a new one),
+// updating touch count, side flags, reaction size, volume and last-seen bar.
+f_touch(float pv, bool isHigh, float rct, float vol) =>
+    if not na(pv)
+        band = pv * bandPct / 100.0
+        int best = -1
+        float bestD = band
+        if array.size(book) > 0
+            for i = 0 to array.size(book) - 1
+                d = math.abs(array.get(book, i).price - pv)
+                if d <= bestD
+                    bestD := d
+                    best := i
+        if best >= 0
+            L = array.get(book, best)
+            c = L.touch
+            L.price := (L.price * c + pv) / (c + 1)
+            L.touch := c + 1
+            if isHigh
+                L.hi := true
+            else
+                L.lo := true
+            L.last := bar_index
+            L.reactSum := L.reactSum + rct
+            L.reactN := L.reactN + 1
+            L.volSum := L.volSum + vol
+            array.set(book, best, L)
+        else
+            array.push(book, Lvl.new(price=pv, touch=1, hi=isHigh, lo=not isHigh, first=bar_index, last=bar_index, reactSum=rct, reactN=1, volSum=vol, retest=0, bounce=0, brk=0, lastReact=0, was=false, hist=array.new<int>(), testHi=na, testLo=na))
+
+rctH = (na(atr) or atr <= 0) ? 0.0 : math.abs(ph - close) / atr
+rctL = (na(atr) or atr <= 0) ? 0.0 : math.abs(pl - close) / atr
+if not na(ph)
+    f_touch(ph, true, rctH, volume[pivLen])
+if not na(pl)
+    f_touch(pl, false, rctL, volume[pivLen])
+
+// prune stale clusters (untouched for longer than the lookback)
+if array.size(book) > 0
+    for i = array.size(book) - 1 to 0
+        if bar_index - array.get(book, i).last > histBars
+            array.remove(book, i)
+
+// per-bar MEMORY: retest on entry, bounce/break classified on exit, last reaction.
+if array.size(book) > 0
+    for i = 0 to array.size(book) - 1
+        L = array.get(book, i)
+        bnd = L.price * zoneBandPct / 100.0
+        zt = L.price + bnd
+        zb = L.price - bnd
+        isT = high >= zb and low <= zt
+        if isT
+            L.testHi := na(L.testHi) ? high : math.max(L.testHi, high)
+            L.testLo := na(L.testLo) ? low : math.min(L.testLo, low)
+        else
+            L.testHi := na
+            L.testLo := na
+        if isT and not L.was
+            L.retest := L.retest + 1
+        if L.was and not isT
+            enteredBelow = close[2] < zb
+            enteredAbove = close[2] > zt
+            exitAbove = close > zt
+            exitBelow = close < zb
+            isBounce = (enteredBelow and exitBelow) or (enteredAbove and exitAbove)
+            isBreak  = (enteredBelow and exitAbove) or (enteredAbove and exitBelow)
+            if isBounce
+                L.bounce := L.bounce + 1
+                L.lastReact := 1
+                array.push(L.hist, 1)
+            else if isBreak
+                L.brk := L.brk + 1
+                L.lastReact := -1
+                array.push(L.hist, -1)
+            if array.size(L.hist) > 5
+                array.shift(L.hist)
+        L.was := isT
+
+// Institutional Confidence Score — weighted blend of memory + structure (0-100).
+// bScore = weighted HTF bias [-1,1]; px = current close (level side vs price).
+f_ics(Lvl L, float bScore, float px) =>
+    touchF = math.min(L.touch / touchNorm, 1.0)
+    flipF  = (L.hi and L.lo) ? 1.0 : 0.0
+    reactF = L.reactN > 0 ? math.min((L.reactSum / L.reactN) / reactNorm, 1.0) : 0.0
+    tot    = L.bounce + L.brk
+    winF   = tot > 0 ? L.bounce / tot : 0.5
+    spanF  = math.min((L.last - L.first) / spanNorm, 1.0)
+    volF   = (avgVol > 0 and L.touch > 0) ? math.min((L.volSum / L.touch) / (avgVol * 1.5), 1.0) : 0.3
+    isSup  = L.price < px
+    aligned = (isSup and bScore > 0) or (not isSup and bScore < 0)
+    structF = aligned ? math.min(math.abs(bScore), 1.0) : 0.0
+    wSum   = wTouch + wFlip + wReact + wWin + wSpan + wVol + wStruct
+    raw    = wSum > 0 ? (touchF*wTouch + flipF*wFlip + reactF*wReact + winF*wWin + spanF*wSpan + volF*wVol + structF*wStruct) / wSum : 0.0
+    math.min(math.max(raw * 100.0, 0.0), 100.0)
+
+// Is a level with the bias? (support in a bull / resistance in a bear)
+f_aligned(Lvl L, float px, int dir) =>
+    isSup = L.price < px
+    (isSup and dir > 0) or (not isSup and dir < 0)
+
+// Expected behaviour, derived from the memory — the "why".
+f_expect(Lvl L) =>
+    tot = L.bounce + L.brk
+    win = tot > 0 ? L.bounce / tot : 0.5
+    L.lastReact < 0 ? "RETEST likely" : (win >= 0.6 and tot >= 1) ? "HOLD expected" : (win <= 0.35 and tot >= 2) ? "WEAK / breaks" : "NEUTRAL"
+
+// Last-5 interactions rendered oldest→newest: ✓ = bounce (held), ✗ = break.
+f_form(Lvl L) =>
+    string s = ""
+    if array.size(L.hist) > 0
+        for i = 0 to array.size(L.hist) - 1
+            s := s + (array.get(L.hist, i) == 1 ? "✓" : "✗")
+    s == "" ? "—" : s
+
+var array<line>  dLine = array.new<line>()
+var array<label> dLab  = array.new<label>()
+var array<box>   dBox  = array.new<box>()
+var table        panel = table.new(position.top_right, 2, 8, border_color=color.new(color.gray, 60), border_width=1)
+
+if barstate.islast
+    while array.size(dLine) > 0
+        line.delete(array.pop(dLine))
+    while array.size(dLab) > 0
+        label.delete(array.pop(dLab))
+    while array.size(dBox) > 0
+        box.delete(array.pop(dBox))
+    // rebuild the raw DOL pool set for this bar
+    array.clear(dolPx)
+    array.clear(dolTag)
+    array.clear(dolNk)
+    array.clear(snapUsed)
+    f_addDol(dolDay,   pdH,   "PDH",   pdHn)
+    f_addDol(dolDay,   pdL,   "PDL",   pdLn)
+    f_addDol(dolWeek,  pwH,   "PWH",   pwHn)
+    f_addDol(dolWeek,  pwL,   "PWL",   pwLn)
+    f_addDol(dolMonth, pmH,   "PMH",   pmHn)
+    f_addDol(dolMonth, pmL,   "PML",   pmLn)
+    f_addDol(dolEQ,    wEQ,   "wEQ",   false)
+    f_addDol(dolEQ,    mEQ,   "mEQ",   false)
+    f_addDol(dolOpens, dOpen, "midEQ", false)
+    f_addDol(dolOpens, wOpen, "wOpen", false)
+    f_addDol(dolOpens, mOpen, "mOpen", false)
+    f_addDol(showSess and useAsia,   asiaH, "AsH", asiaHn)
+    f_addDol(showSess and useAsia,   asiaL, "AsL", asiaLn)
+    f_addDol(showSess and useLondon, lonH,  "LOH", lonHn)
+    f_addDol(showSess and useLondon, lonL,  "LOL", lonLn)
+    f_addDol(showSess and useNY,     nyH,   "NYH", nyHn)
+    f_addDol(showSess and useNY,     nyL,   "NYL", nyLn)
+    // greedy-cluster raw pools within the band into single confluence zones
+    array.clear(clPx)
+    array.clear(clTag)
+    array.clear(clNk)
+    array.clear(clCnt)
+    rawN = array.size(dolPx)
+    if rawN > 0
+        usedR = array.new_bool(rawN, false)
+        for i = 0 to rawN - 1
+            if not array.get(usedR, i)
+                seed = array.get(dolPx, i)
+                cband = seed * dolBandPct / 100.0
+                int cnt = 0
+                string tg = ""
+                bool nk = false
+                float repPx = seed          // representative = member nearest to price (exact pool)
+                float bestC = 1.0e20
+                for j = 0 to rawN - 1
+                    sameSide = (array.get(dolPx, j) > close) == (seed > close)
+                    if not array.get(usedR, j) and sameSide and math.abs(array.get(dolPx, j) - seed) <= cband
+                        array.set(usedR, j, true)
+                        cnt := cnt + 1
+                        tg := tg + (tg == "" ? "" : "+") + array.get(dolTag, j)
+                        nk := nk or array.get(dolNk, j)
+                        dcl = math.abs(array.get(dolPx, j) - close)
+                        if dcl < bestC
+                            bestC := dcl
+                            repPx := array.get(dolPx, j)
+                array.push(clPx, repPx)
+                array.push(clTag, tg)
+                array.push(clNk, nk)
+                array.push(clCnt, cnt)
+    float railUp = na
+    float railDn = na
+    n = array.size(book)
+    if n > 0
+        scores = array.new_float(n, 0.0)
+        for i = 0 to n - 1
+            array.set(scores, i, math.min(100.0, f_ics(array.get(book, i), biasScore, close) + f_dolBoost(array.get(book, i).price)))
+        used = array.new_bool(n, false)
+        sel  = array.new_int()
+        for _s = 0 to n - 1
+            if array.size(sel) >= maxLines
+                break
+            best = -1
+            bestS = -1.0
+            for i = 0 to n - 1
+                if array.get(used, i)
+                    continue
+                L = array.get(book, i)
+                if L.touch < minTouches
+                    continue
+                if array.get(scores, i) < minICS
+                    continue
+                if array.get(scores, i) > bestS
+                    bestS := array.get(scores, i)
+                    best := i
+            if best < 0
+                break
+            array.set(used, best, true)
+            pb = array.get(book, best).price
+            ok = true
+            if array.size(sel) > 0
+                for j = 0 to array.size(sel) - 1
+                    if math.abs(pb - array.get(book, array.get(sel, j)).price) < pb * sepPct / 100.0
+                        ok := false
+                        break
+            if ok
+                array.push(sel, best)
+        // find the ONE actionable level: aligned with bias, nearest to price on its side
+        int actIdx = -1
+        float actDist = 1.0e20
+        if array.size(sel) > 0 and bDir != 0
+            for k = 0 to array.size(sel) - 1
+                i = array.get(sel, k)
+                L = array.get(book, i)
+                if f_aligned(L, close, bDir)
+                    d = math.abs(close - L.price)
+                    if d < actDist
+                        actDist := d
+                        actIdx := i
+        // nudge target: the single drawn line (S/R snapped OR liquidity cluster) whose
+        // price is closest to the typed nudgePrice. Its exact price is nudgeHitPx.
+        float nudgeHitPx = na
+        if nudgePrice > 0
+            float bd = 1.0e20
+            for k = 0 to array.size(sel) - 1
+                i = array.get(sel, k)
+                [sp, spt, spc] = f_dolInfo(array.get(book, i).price)
+                d = math.abs(sp - nudgePrice)
+                if d < bd
+                    bd := d
+                    nudgeHitPx := sp
+            if array.size(clPx) > 0
+                for di = 0 to array.size(clPx) - 1
+                    dcp = array.get(clPx, di)
+                    d2 = math.abs(dcp - nudgePrice)
+                    if d2 < bd
+                        bd := d2
+                        nudgeHitPx := dcp
+        x1 = bar_index - math.min(400, bar_index)
+        x2 = bar_index + extendR
+        if array.size(sel) > 0
+            for k = 0 to array.size(sel) - 1
+                i = array.get(sel, k)
+                L = array.get(book, i)
+                ics = array.get(scores, i)
+                flip = L.hi and L.lo
+                aligned = f_aligned(L, close, bDir)
+                fights  = bDir != 0 and not aligned
+                isAct   = showAct and i == actIdx
+                // DOL confluence: snap the drawn line to the exact institutional price
+                [snapPx, dtag, dcnt] = f_dolInfo(L.price)
+                if dcnt > 0
+                    array.push(snapUsed, snapPx)   // dedup uses the un-nudged cluster price
+                // manual % nudge — applies only to the line matching the typed price; line AND zone
+                matchN = not na(nudgeHitPx) and snapPx == nudgeHitPx
+                off = matchN ? snapPx * nudgeAmt / 100.0 : 0.0
+                drawPx = snapPx + off
+                col = drawPx > close ? resCol : supCol
+                if drawPx > close
+                    railUp := na(railUp) ? drawPx : math.min(railUp, drawPx)
+                if drawPx < close
+                    railDn := na(railDn) ? drawPx : math.max(railDn, drawPx)
+                bnd = L.price * zoneBandPct / 100.0
+                tested = high >= L.price - bnd and low <= L.price + bnd
+                if tested
+                    zTop = (showExc and not na(L.testHi)) ? math.max(L.testHi + off, drawPx + bnd) : drawPx + bnd
+                    zBot = (showExc and not na(L.testLo)) ? math.min(L.testLo + off, drawPx - bnd) : drawPx - bnd
+                    array.push(dBox, box.new(x1, zTop, x2, zBot, border_color=color.new(zoneCol, 40), border_width=1, bgcolor=color.new(zoneCol, 80)))
+                else
+                    lw = isAct ? lineWidth + 2 : (dcnt > 0 ? lineWidth + 1 : (flipThick and flip ? lineWidth + 1 : lineWidth))
+                    lstyle = (dimVs and fights) ? line.style_dashed : line.style_solid
+                    lcol = (dimVs and fights) ? color.new(col, 65) : col
+                    array.push(dLine, line.new(x1, drawPx, x2, drawPx, color=lcol, width=lw, extend=extend.left, style=lstyle))
+                if showLbl
+                    tot = L.bounce + L.brk
+                    wintxt = tot > 0 ? "win " + str.tostring(math.round(L.bounce / tot * 100)) + "%" : "new"
+                    loc = drawPx > eqLvl ? "PREM" : "DISC"
+                    stag = isAct ? (bDir < 0 ? "★ SELL" : "★ BUY") : aligned ? "✓struct" : fights ? "✗vs bias" : "—"
+                    dolt = dcnt > 0 ? "  ⚡" + dtag : ""
+                    lblTxtCol = (dimVs and fights) ? color.new(color.white, 45) : color.white
+                    actBg = bDir < 0 ? color.new(#ff5252, 10) : color.new(#26c281, 10)
+                    lblBgCol  = isAct ? actBg : (dimVs and fights) ? color.new(col, 55) : color.new(col, 20)
+                    txt = str.tostring(drawPx, format.mintick) + "  ICS " + str.tostring(math.round(ics)) + (flip ? "  ⇄FLIP" : "") + dolt + "  " + stag + "\n×" + str.tostring(L.touch) + " · " + wintxt + " · " + f_expect(L) + "\nlast5 " + f_form(L) + "  ·  " + loc
+                    array.push(dLab, label.new(x2, drawPx, txt, xloc=xloc.bar_index, style=label.style_label_left, color=lblBgCol, textcolor=lblTxtCol, size=f_size(lblSizeS)))
+        // draw DOL confluence CLUSTERS — one clean line/label each, deduped vs snapped S/R
+        if showDOL and array.size(clPx) > 0
+            for di = 0 to array.size(clPx) - 1
+                dpx = array.get(clPx, di)
+                repD = false
+                if array.size(snapUsed) > 0
+                    for u = 0 to array.size(snapUsed) - 1
+                        if array.get(snapUsed, u) == dpx
+                            repD := true
+                            break
+                if not repD
+                    // manual nudge if THIS liquidity line matches the typed price
+                    dmatch = not na(nudgeHitPx) and dpx == nudgeHitPx
+                    dDraw = dpx + (dmatch ? dpx * nudgeAmt / 100.0 : 0.0)
+                    above = dDraw > close
+                    barrier = dolEmph and ((bDir < 0 and above) or (bDir > 0 and not above))
+                    dcol = above ? colCeil : colFloor
+                    ccnt = array.get(clCnt, di)
+                    dlw = barrier ? 2 : 1
+                    dstyle = barrier ? line.style_solid : line.style_dotted
+                    array.push(dLine, line.new(x1, dDraw, x2, dDraw, color=color.new(dcol, barrier ? 0 : 45), width=dlw, extend=extend.left, style=dstyle))
+                    if showLbl
+                        btag = barrier ? (above ? "🔒 " : "🛡 ") : ""
+                        xtag = ccnt > 1 ? "×" + str.tostring(ccnt) + " " : ""
+                        ntag = array.get(clNk, di) ? " (naked)" : ""
+                        array.push(dLab, label.new(x2, dDraw, btag + "⚡" + xtag + array.get(clTag, di) + " " + str.tostring(dDraw, format.mintick) + ntag, xloc=xloc.bar_index, style=label.style_label_left, color=color.new(dcol, 35), textcolor=color.white, size=f_size(lblSizeS)))
+
+    if showPanel
+        act = (bDir > 0 and not inPrem) ? "BUY zone" : (bDir < 0 and inPrem) ? "SELL zone" : (bDir > 0 and inPrem) ? "BUY (wait pullback)" : (bDir < 0 and not inPrem) ? "SELL (wait pop)" : "WAIT / no bias"
+        actCol = str.startswith(act, "BUY") ? #26c281 : str.startswith(act, "SELL") ? #ff5252 : color.gray
+        hdr = color.new(color.gray, 10)
+        table.cell(panel, 0, 0, "DECISION", text_color=color.white, bgcolor=hdr, text_size=size.small)
+        table.cell(panel, 1, 0, act, text_color=actCol, bgcolor=hdr, text_size=size.small)
+        table.cell(panel, 0, 1, "1W Bias", text_color=color.gray, text_size=size.small)
+        table.cell(panel, 1, 1, f_biasTxt(wB), text_color=wB > 0 ? #26c281 : wB < 0 ? #ff5252 : color.gray, text_size=size.small)
+        table.cell(panel, 0, 2, "1D Bias", text_color=color.gray, text_size=size.small)
+        table.cell(panel, 1, 2, f_biasTxt(dB), text_color=dB > 0 ? #26c281 : dB < 0 ? #ff5252 : color.gray, text_size=size.small)
+        table.cell(panel, 0, 3, "4H Bias", text_color=color.gray, text_size=size.small)
+        table.cell(panel, 1, 3, f_biasTxt(h4B), text_color=h4B > 0 ? #26c281 : h4B < 0 ? #ff5252 : color.gray, text_size=size.small)
+        table.cell(panel, 0, 4, "1H Bias", text_color=color.gray, text_size=size.small)
+        table.cell(panel, 1, 4, f_biasTxt(h1B), text_color=h1B > 0 ? #26c281 : h1B < 0 ? #ff5252 : color.gray, text_size=size.small)
+        table.cell(panel, 0, 5, "Location", text_color=color.gray, text_size=size.small)
+        table.cell(panel, 1, 5, inPrem ? "PREMIUM" : "DISCOUNT", text_color=inPrem ? #ff5252 : #26c281, text_size=size.small)
+        table.cell(panel, 0, 6, "Rail Above", text_color=color.gray, text_size=size.small)
+        table.cell(panel, 1, 6, na(railUp) ? "—" : str.tostring(railUp, format.mintick), text_color=color.white, text_size=size.small)
+        table.cell(panel, 0, 7, "Rail Below", text_color=color.gray, text_size=size.small)
+        table.cell(panel, 1, 7, na(railDn) ? "—" : str.tostring(railDn, format.mintick), text_color=color.white, text_size=size.small)

@@ -1,0 +1,1094 @@
+// © Institutional Setup Engine — Phase 1 · Deterministic Micro-Structure Core
+//
+// Builds the chart-timeframe market-structure spine that the full Setup Engine
+// (see docs/architecture/setup-engine-spec.md) is assembled on. This phase covers
+// spec §1 (structure) + §12 (determinism / band-based freeze test) ONLY:
+//   · pivots as the DETECTION layer (close-based), then ATR / min-distance / close
+//     / strength filters promote a candidate to a structural swing
+//   · internal vs external structure · strong vs weak highs/lows
+//   · HH / HL / LH / LL · BOS / CHoCH / MSS (MSS = CHoCH + displacement)
+//   · noise filtering · non-repaint (confirmed close only)
+//   · order-independent identity hash + BAND-based replay/freeze test (A=B=C on
+//     every timeframe, incl. 3m/15m where the old "everything-older-than-cut"
+//     definition failed)
+// No sweeps, bias vote, scoring, sessions, or trade management yet — those are
+// Phases 2-9. Nothing here changes the S/R, Event, or Structure POC engines.
+
+//@version=6
+indicator("IA-Setup · Structure Core [P1]", "IA-Setup", overlay = true,
+     max_lines_count = 300, max_labels_count = 300, max_bars_back = 80, calc_bars_count = 1600)
+
+// ─── Detection inputs (change the DATABASE → change the hash) ────────────────
+autoPiv     = input.bool(true, "Auto pivot length (3 on Daily/Weekly, 5 below)", group = "Structure",
+     tooltip = "Higher timeframes print far fewer bars, so a shorter pivot leg keeps structure responsive there. When on: Daily & Weekly use 3, every lower timeframe uses 5. Turn off to use the manual value below.")
+pivotLenIn  = input.int(5, "Pivot length (manual, when Auto is off)", minval = 2, maxval = 30, group = "Structure",
+     tooltip = "Detection layer only: a candidate swing is the highest/lowest CLOSE across this many bars each side. Filters below decide if it becomes structure. Non-repaint: confirmed pivotLen bars later.")
+pivotLen    = autoPiv ? (timeframe.in_seconds() >= 86400 ? 3 : 5) : pivotLenIn
+atrLen      = input.int(14, "ATR length", minval = 5, maxval = 50, group = "Structure")
+minSwingATR = input.float(0.50, "Min swing distance (× ATR)", minval = 0.0, maxval = 5.0, step = 0.05, group = "Structure",
+     tooltip = "A candidate must sit at least this far (in ATR) from the last same-side swing, else it is noise and discarded.")
+extSwingATR = input.float(1.50, "External swing threshold (× ATR)", minval = 0.3, maxval = 10.0, step = 0.1, group = "Structure",
+     tooltip = "A swing whose leg from the last opposite EXTERNAL swing is ≥ this × ATR is EXTERNAL (major); smaller = INTERNAL (minor). BOS/CHoCH/MSS use external swings.")
+noiseATR    = input.float(0.15, "Noise floor (× ATR)", minval = 0.0, maxval = 2.0, step = 0.05, group = "Structure",
+     tooltip = "A pivot bar whose range is below this × ATR (a doji) cannot create a swing.")
+dispBodyATR = input.float(0.55, "MSS displacement body (× ATR)", minval = 0.1, maxval = 5.0, step = 0.05, group = "Structure",
+     tooltip = "A CHoCH whose breaking candle body ≥ this × ATR (or range ≥ 1×ATR) is upgraded to an MSS. Full displacement-quality model arrives in Phase 3.")
+dispRngATR  = input.float(1.00, "MSS displacement range (× ATR)", minval = 0.1, maxval = 6.0, step = 0.1, group = "Structure")
+MAXPT       = 600   // per-side safety cap; calc_bars_count keeps the real count well under it
+
+// ─── ATR asset preset (spec §16) — one switch loads intelligent per-asset defaults
+//     for the sweep + displacement thresholds; "Manual" uses the fields below. ────
+gPre     = "Sweep · ATR preset"
+assetPre = input.string("Auto", "Asset preset", options = ["Auto", "Crypto", "Forex", "Gold", "Indices", "Manual"], group = gPre,
+     tooltip = "Auto picks by syminfo.type (crypto/forex/index → its column; anything else → Crypto). Gold isn't auto-detectable — pick it manually for XAUUSD. Manual uses the sliders below.")
+// Auto → concrete asset column
+preAuto  = syminfo.type == "crypto" ? "Crypto" : syminfo.type == "forex" ? "Forex" : syminfo.type == "index" ? "Indices" : "Crypto"
+preSel   = assetPre == "Auto" ? preAuto : assetPre
+// per-asset defaults: [sweepATR, dispBody, dispRange, volMult]
+pSweep   = preSel == "Forex" ? 0.20 : preSel == "Gold" ? 0.25 : preSel == "Indices" ? 0.25 : 0.30
+pBody    = preSel == "Forex" ? 0.50 : preSel == "Gold" ? 0.55 : preSel == "Indices" ? 0.55 : 0.60
+pDispR   = preSel == "Forex" ? 0.90 : preSel == "Gold" ? 1.00 : preSel == "Indices" ? 1.00 : 1.10
+pVol     = preSel == "Indices" ? 1.40 : 1.50
+
+// ─── Liquidity sweep (spec §2 sweep) ────────────────────────────────────────
+gSwp     = "Sweep detection"
+sweepATRm= input.float(0.0, "Sweep pierce (× ATR, 0 = use preset)", minval = 0.0, maxval = 3.0, step = 0.05, group = gSwp,
+     tooltip = "A wick must pierce the level by at least this × ATR to count as a sweep. 0 = use the asset preset value.")
+sweepATR = sweepATRm > 0 ? sweepATRm : pSweep
+rejFrac  = input.float(0.55, "Rejection — close in far X of candle", minval = 0.1, maxval = 1.0, step = 0.05, group = gSwp,
+     tooltip = "After the wick pierces, the CLOSE must finish this fraction of the candle back on the origin side (0.55 = close in the far 55%). Confirms the level rejected price.")
+sweepLook= input.int(6, "Only sweep levels within (× ATR) of price", minval = 1, maxval = 40, group = gSwp,
+     tooltip = "Ignore far-away levels: only levels within this × ATR of the current close can register a sweep. Keeps sweeps local and cheap.")
+// which liquidity pools COUNT as institutional sweep targets (detection — also
+// gates the entry engine, so unchecking a group removes its setups too)
+swpPDok  = input.bool(true,  "Prev Day",  inline = "sg1", group = gSwp)
+swpPWok  = input.bool(true,  "Prev Week", inline = "sg1", group = gSwp)
+swpEQok  = input.bool(true,  "EQH/EQL",   inline = "sg1", group = gSwp)
+swpSEok  = input.bool(true,  "Sessions",  inline = "sg2", group = gSwp)
+swpSWok  = input.bool(false, "Swing BSL/SSL", inline = "sg2", group = gSwp)
+swpCool  = input.int(20, "One sweep per level per (bars)", minval = 0, maxval = 200, group = gSwp,
+     tooltip = "Cooldown/dedupe: after a level is swept, the SAME level+direction cannot register again for this many bars — chop re-sweeping one line no longer stacks marks. 0 = off.")
+showSwp  = input.bool(true, "Show sweep markers", group = gSwp)
+swpShowQ = input.float(0.40, "Hide marks below quality (0-1)", minval = 0.0, maxval = 1.0, step = 0.05, group = gSwp,
+     tooltip = "Display filter: only draw ⚡ marks whose displacement quality is at least this. Low-quality pokes stay in the database (HUD/entries use their own threshold) but stop cluttering the chart.")
+swpMaxAge= input.int(300, "Hide marks older than (bars)", minval = 10, maxval = 5000, group = gSwp)
+colSwpB  = input.color(#26a69a, "Bullish sweep (took a low)", inline = "sw", group = gSwp)
+colSwpS  = input.color(#ef5350, "Bearish sweep (took a high)", inline = "sw", group = gSwp)
+
+// ─── Displacement quality (spec §3) ─────────────────────────────────────────
+gDsp     = "Displacement quality"
+dispBodyM= input.float(0.0, "Body (× ATR, 0 = preset)", minval = 0.0, maxval = 5.0, step = 0.05, inline = "d1", group = gDsp)
+dispRngM = input.float(0.0, "Range (× ATR, 0 = preset)", minval = 0.0, maxval = 6.0, step = 0.05, inline = "d1", group = gDsp)
+dBody    = dispBodyM > 0 ? dispBodyM : pBody
+dRange   = dispRngM  > 0 ? dispRngM  : pDispR
+impSeq   = input.int(2, "Consecutive impulse candles", minval = 1, maxval = 5, group = gDsp)
+bodyDom  = input.float(0.60, "Body dominance (body/range ≥)", minval = 0.1, maxval = 1.0, step = 0.05, group = gDsp)
+closeFrac= input.float(0.66, "Close at extreme (fraction)", minval = 0.1, maxval = 1.0, step = 0.02, group = gDsp)
+expMult  = input.float(1.20, "ATR expansion (range ≥ × ATR)", minval = 0.5, maxval = 5.0, step = 0.1, group = gDsp)
+volMultM = input.float(0.0, "Rel-volume (≥ × avg, 0 = preset)", minval = 0.0, maxval = 10.0, step = 0.1, group = gDsp)
+volMult  = volMultM > 0 ? volMultM : pVol
+dispQualMin = input.float(0.60, "Min displacement quality (0-1) to confirm", minval = 0.0, maxval = 1.0, step = 0.05, group = gDsp,
+     tooltip = "The reclaim after a sweep must reach this displacement-quality score to be a valid impulsive move.")
+
+// ─── Bias & Filters (spec §4, §6) ───────────────────────────────────────────
+gFlt     = "Bias & Filters"
+adxLen   = input.int(14, "ADX / DMI length", minval = 3, maxval = 50, group = gFlt)
+emaLen   = input.int(50, "EMA slope length", minval = 5, maxval = 200, group = gFlt)
+slopeLen = input.int(10, "EMA slope lookback (bars)", minval = 2, maxval = 100, group = gFlt)
+slopeRef = input.float(2.0, "EMA slope full-strength (× ATR)", minval = 0.2, maxval = 20.0, step = 0.1, group = gFlt)
+trendMin = input.float(0.30, "Weak-trend floor (0-1)", minval = 0.0, maxval = 1.0, step = 0.05, group = gFlt,
+     tooltip = "Below this trend-strength the trend is 'weak' — Trending demotes to Pullback and the trend score factor drops.")
+volFloorLen = input.int(50, "Volatility floor SMA length", minval = 10, maxval = 200, group = gFlt)
+volFloorMult= input.float(0.60, "Volatility floor (× ATR SMA)", minval = 0.1, maxval = 2.0, step = 0.05, group = gFlt,
+     tooltip = "Hard gate: when ATR is below this × its own SMA the market is too dead — no setups armed.")
+atrHi    = input.float(1.30, "Expansion (ATR ≥ × ATR SMA)", minval = 1.0, maxval = 4.0, step = 0.05, group = gFlt)
+atrLo    = input.float(0.70, "Compression (ATR ≤ × ATR SMA)", minval = 0.2, maxval = 1.0, step = 0.05, group = gFlt)
+rangeLen = input.int(50, "Premium/Discount range (bars)", minval = 10, maxval = 500, group = gFlt,
+     tooltip = "The dealing range = highest high / lowest low over N bars; equilibrium = its midpoint. Longs favoured in discount, shorts in premium.")
+
+// ─── Entry engine (spec §7 state machine, §8 invalidation/expiration) ────────
+gEnt     = "Entry engine"
+entOn    = input.bool(true, "Enable setup engine", group = gEnt)
+reqBias  = input.bool(true, "Require MTF bias alignment", group = gEnt,
+     tooltip = "Only take setups in the weighted W/D/4H bias direction. Off = the chart-TF structure trend gates direction instead.")
+reqPD    = input.bool(true, "Require premium/discount alignment", group = gEnt,
+     tooltip = "Hard gate (spec D9): longs only in DISCOUNT, shorts only in PREMIUM. A long at premium is chasing.")
+confirmBars = input.int(10, "Confirm window after sweep (bars)", minval = 2, maxval = 60, group = gEnt,
+     tooltip = "After a valid sweep, a micro structural confirmation (a close breaking the trigger swing in the trade direction, with displacement quality ≥ threshold) must print within this many bars, else the setup expires.")
+slBufATR = input.float(0.10, "SL buffer beyond sweep extreme (× ATR)", minval = 0.0, maxval = 2.0, step = 0.05, group = gEnt)
+partialR = input.float(1.0, "Partial target (R)", minval = 0.5, maxval = 5.0, step = 0.25, group = gEnt,
+     tooltip = "TP1 = entry + this many R in the trade direction (spec: take 50% and move SL to break-even — management is manual in this phase).")
+maxTgtR  = input.float(3.0, "Max final target (R)", minval = 1.0, maxval = 10.0, step = 0.5, group = gEnt,
+     tooltip = "Final target = the next opposing liquidity level, capped at this many R; if none exists within the cap, the cap itself is the target.")
+showSetup= input.bool(true, "Draw entry / SL / TP lines", group = gEnt)
+colEntry = input.color(#42a5f5, "Entry", inline = "e", group = gEnt)
+colSL    = input.color(#ef5350, "SL", inline = "e", group = gEnt)
+colTP    = input.color(#26a69a, "TP", inline = "e", group = gEnt)
+
+// ─── Display (read-only — never changes the database or the hash) ───────────
+showHH   = input.bool(true, "HH", inline = "t", group = "Display")
+showHL   = input.bool(true, "HL", inline = "t", group = "Display")
+showLH   = input.bool(true, "LH", inline = "t", group = "Display")
+showLL   = input.bool(true, "LL", inline = "t", group = "Display")
+extOnly  = input.bool(false, "External swings only", group = "Display",
+     tooltip = "Hide internal (minor) structure; show only major external swings.")
+markSW   = input.bool(true, "Mark strong/weak (● strong · ○ weak)", group = "Display")
+maxPts   = input.int(8, "Max labels per side", minval = 1, maxval = 60, group = "Display")
+lblSizeS = input.string("Small", "Label size", options = ["Tiny", "Small", "Normal"], group = "Display")
+colBull  = input.color(#26a69a, "Bullish structure (HH/HL)", group = "Display")
+colBear  = input.color(#ef5350, "Bearish structure (LH/LL)", group = "Display")
+
+// ─── Pivot lines ────────────────────────────────────────────────────────────
+gPiv     = "Pivot lines"
+showPivLines = input.bool(false, "Show pivot-point lines", group = gPiv,
+     tooltip = "Draw a horizontal line at each shown swing point (HH/HL/LH/LL).")
+pivExt   = input.string("Right", "Pivot line extend", options = ["None", "Left", "Right", "Both"], group = gPiv)
+pivStyleS= input.string("Dotted", "Pivot line style", options = ["Solid", "Dashed", "Dotted"], group = gPiv)
+pivWid   = input.int(1, "Pivot line width", minval = 1, maxval = 4, group = gPiv)
+
+// ─── Break lines (BOS / CHoCH / MSS) — anchored broken-swing → breaking candle ─
+gBrk     = "Break lines (BOS / CHoCH / MSS)"
+showBOS   = input.bool(true, "BOS",   inline = "b1", group = gBrk)
+showChoCH = input.bool(true, "CHoCH", inline = "b1", group = gBrk)
+showMSS   = input.bool(true, "MSS",   inline = "b1", group = gBrk)
+showBrkExt = input.bool(true, "External (major)", inline = "b2", group = gBrk)
+showBrkInt = input.bool(false, "Internal (minor)", inline = "b2", group = gBrk)
+brkExt   = input.string("None", "Extend past the break", options = ["None", "Left", "Right", "Both"], group = gBrk,
+     tooltip = "Institutional anchoring: each line runs FROM the broken swing's candle TO the candle that closed through it. None = exactly that segment; Right extends beyond the break.")
+brkWid   = input.int(1, "Line width", minval = 1, maxval = 4, inline = "b3", group = gBrk)
+colMSS   = input.color(#ffd54f, "MSS color", inline = "b3", group = gBrk)
+showBrkLbl = input.bool(true, "Labels", inline = "b4", group = gBrk)
+brkLblSz = input.string("Tiny", "Label size", options = ["Tiny", "Small", "Normal"], inline = "b4", group = gBrk)
+maxBrk   = input.int(12, "Max break lines shown", minval = 1, maxval = 40, group = gBrk)
+
+// ═══ LIQUIDITY MAP — visual customization is per-group and NEVER alters a level's
+//     calculated price (calc/visual separation). Each group has its own section. ══
+gLM      = "Liquidity Map · Global"
+showLiq  = input.bool(true, "Show liquidity map (master switch)", group = gLM)
+lblPosS  = input.string("Right", "Label position (all groups)", options = ["Left", "Right"], group = gLM)
+powerTol = input.float(0.50, "AT-LEVEL tolerance (× daily ATR)", minval = 0.1, maxval = 10.0, step = 0.1, group = gLM,
+     tooltip = "Reads AT LEVEL when price is within this × daily-ATR of the nearest liquidity level — where price tends to make an outstanding reaction. (The Power Line proper lives in the S/R engine.)")
+eqTol    = input.float(0.10, "Equal H/L tolerance (× ATR)", minval = 0.0, maxval = 2.0, step = 0.02, group = gLM,
+     tooltip = "Two same-side external swings within this × ATR are treated as EQUAL (stacked liquidity — EQH/EQL).")
+
+// Prior Day (PDH / PDL)
+gPD  = "LIQ · Previous Day"
+pdOn = input.bool(true,  "Show PDH / PDL", group = gPD)
+pdC  = input.color(#ffb300, "Color", inline = "pd", group = gPD)
+pdSt = input.string("Solid", "Style", options = ["Solid", "Dashed", "Dotted"], inline = "pd", group = gPD)
+pdW  = input.int(1, "Width", minval = 1, maxval = 4, inline = "pd", group = gPD)
+pdTr = input.int(0, "Transparency", minval = 0, maxval = 100, inline = "pd2", group = gPD)
+pdEx = input.string("Right", "Extend", options = ["None", "Left", "Right", "Both"], inline = "pd2", group = gPD)
+pdLb = input.bool(true, "Label", inline = "pd3", group = gPD)
+pdLz = input.string("Small", "Label size", options = ["Tiny", "Small", "Normal"], inline = "pd3", group = gPD)
+pdPr = input.int(8, "Draw priority (1 low → 10 top)", minval = 1, maxval = 10, group = gPD)
+
+// Prior Week (PWH / PWL)
+gPW  = "LIQ · Previous Week"
+pwOn = input.bool(true,  "Show PWH / PWL", group = gPW)
+pwC  = input.color(#ff6d00, "Color", inline = "pw", group = gPW)
+pwSt = input.string("Solid", "Style", options = ["Solid", "Dashed", "Dotted"], inline = "pw", group = gPW)
+pwW  = input.int(2, "Width", minval = 1, maxval = 4, inline = "pw", group = gPW)
+pwTr = input.int(0, "Transparency", minval = 0, maxval = 100, inline = "pw2", group = gPW)
+pwEx = input.string("Right", "Extend", options = ["None", "Left", "Right", "Both"], inline = "pw2", group = gPW)
+pwLb = input.bool(true, "Label", inline = "pw3", group = gPW)
+pwLz = input.string("Small", "Label size", options = ["Tiny", "Small", "Normal"], inline = "pw3", group = gPW)
+pwPr = input.int(9, "Draw priority (1 low → 10 top)", minval = 1, maxval = 10, group = gPW)
+
+// Sessions (London / New York / Asian / Sydney) — per-session enable+color+time, shared style
+gSe  = "LIQ · Sessions"
+loOn = input.bool(true,  "London",   inline = "s1", group = gSe)
+loTm = input.session("0800-1600", "", inline = "s1", group = gSe)
+loC  = input.color(#42a5f5, "", inline = "s1", group = gSe)
+nyOn = input.bool(true,  "New York", inline = "s2", group = gSe)
+nyTm = input.session("1300-2100", "", inline = "s2", group = gSe)
+nyC  = input.color(#ab47bc, "", inline = "s2", group = gSe)
+asOn = input.bool(false, "Asian",    inline = "s3", group = gSe)
+asTm = input.session("0000-0800", "", inline = "s3", group = gSe)
+asC  = input.color(#26c6da, "", inline = "s3", group = gSe)
+syOn = input.bool(false, "Sydney",   inline = "s4", group = gSe)
+syTm = input.session("2100-0600", "", inline = "s4", group = gSe)
+syC  = input.color(#9ccc65, "", inline = "s4", group = gSe)
+seSt = input.string("Dashed", "Style", options = ["Solid", "Dashed", "Dotted"], inline = "s5", group = gSe)
+seW  = input.int(1, "Width", minval = 1, maxval = 4, inline = "s5", group = gSe)
+seTr = input.int(10, "Transparency", minval = 0, maxval = 100, inline = "s6", group = gSe)
+seEx = input.string("Right", "Extend", options = ["None", "Left", "Right", "Both"], inline = "s6", group = gSe)
+seLb = input.bool(true, "Label", inline = "s7", group = gSe)
+seLz = input.string("Tiny", "Label size", options = ["Tiny", "Small", "Normal"], inline = "s7", group = gSe)
+sePr = input.int(5, "Draw priority (1 low → 10 top)", minval = 1, maxval = 10, group = gSe)
+
+// Equal Highs / Lows (EQH / EQL)
+gEQ  = "LIQ · Equal Highs / Lows"
+eqOn = input.bool(true,  "Show EQH / EQL", group = gEQ)
+eqC  = input.color(#ec407a, "Color", inline = "eq", group = gEQ)
+eqSt = input.string("Dotted", "Style", options = ["Solid", "Dashed", "Dotted"], inline = "eq", group = gEQ)
+eqW  = input.int(1, "Width", minval = 1, maxval = 4, inline = "eq", group = gEQ)
+eqTr = input.int(0, "Transparency", minval = 0, maxval = 100, inline = "eq2", group = gEQ)
+eqEx = input.string("Right", "Extend", options = ["None", "Left", "Right", "Both"], inline = "eq2", group = gEQ)
+eqLb = input.bool(true, "Label", inline = "eq3", group = gEQ)
+eqLz = input.string("Small", "Label size", options = ["Tiny", "Small", "Normal"], inline = "eq3", group = gEQ)
+eqPr = input.int(7, "Draw priority (1 low → 10 top)", minval = 1, maxval = 10, group = gEQ)
+
+// Swing liquidity (BSL above / SSL below)
+gSw  = "LIQ · Swing liquidity (BSL/SSL)"
+swOn = input.bool(false, "Show BSL / SSL", group = gSw)
+swCb = input.color(#ef5350, "BSL color", inline = "sw", group = gSw)
+swCs = input.color(#26a69a, "SSL color", inline = "sw", group = gSw)
+swSt = input.string("Dotted", "Style", options = ["Solid", "Dashed", "Dotted"], inline = "sw2", group = gSw)
+swW  = input.int(1, "Width", minval = 1, maxval = 4, inline = "sw2", group = gSw)
+swTr = input.int(30, "Transparency", minval = 0, maxval = 100, inline = "sw3", group = gSw)
+swEx = input.string("Right", "Extend", options = ["None", "Left", "Right", "Both"], inline = "sw3", group = gSw)
+swLb = input.bool(true, "Label", inline = "sw4", group = gSw)
+swLz = input.string("Tiny", "Label size", options = ["Tiny", "Small", "Normal"], inline = "sw4", group = gSw)
+swPr = input.int(4, "Draw priority (1 low → 10 top)", minval = 1, maxval = 10, group = gSw)
+
+// ─── Validation (proof instruments — affect only the debug panel) ───────────
+canonBars  = input.int(500, "Canonical hash window (bars)", minval = 50, group = "Validation",
+     tooltip = "Identity hash covers structural points born in the last N chart bars.")
+windowBars = input.int(1200, "Replay window (bars, must exceed 1000)", minval = 1050, group = "Validation")
+bandBars   = input.int(300, "Freeze band width (bars)", minval = 50, maxval = 1000, group = "Validation",
+     tooltip = "The freeze test hashes points born in the fixed band [last−windowBars−bandBars, last−windowBars]. A bounded band is immune to book aging, so A=B=C holds on every timeframe (fixes the 3m/15m FAIL).")
+
+PRIME = 99999989
+
+// shared line helpers (used by the liquidity map and the structure renderer)
+f_ext(string s)    => s == "Both" ? extend.both : s == "Left" ? extend.left : s == "Right" ? extend.right : extend.none
+f_lstyle(string s) => s == "Dashed" ? line.style_dashed : s == "Dotted" ? line.style_dotted : line.style_solid
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 1 · STRUCTURE DETECTION — pivots detect, filters decide. Confirmed close only.
+// ═══════════════════════════════════════════════════════════════════════════
+var array<float> sP     = array.new<float>()   // structure price (a CLOSE extreme — identity)
+var array<int>   sTy    = array.new<int>()     // 0 HH · 1 HL · 2 LH · 3 LL (frozen)
+var array<int>   sBt    = array.new<int>()     // birth time (frozen)
+var array<int>   sBar   = array.new<int>()     // birth bar_index (frozen — freeze band)
+var array<bool>  sExt   = array.new<bool>()    // external? (frozen)
+var array<int>   sStr   = array.new<int>()     // strength 0-100 (frozen)
+var array<int>   sState = array.new<int>()     // 0 unknown · 1 strong · 2 weak (LIVE overlay)
+var array<bool>  sBroken= array.new<bool>()    // taken by a close beyond it (LIVE)
+
+var float prevSwingHigh = na    // last structural swing high (any class)
+var float prevSwingLow  = na
+var int   prevHiT       = na    // its birth time (break-line origin anchor)
+var int   prevLoT       = na
+var bool  prevHiExt     = false // was it external? (tags the break internal/external)
+var bool  prevLoExt     = false
+var bool  prevHiBroken  = false // already close-broken? (each swing breaks ONCE)
+var bool  prevLoBroken  = false
+var float extHi         = na    // last EXTERNAL swing high
+var float extLo         = na    // last EXTERNAL swing low
+var float protHigh      = na    // PROTECTED high: a close above it = bullish BOS/CHoCH
+var float protLow       = na    // PROTECTED low:  a close below it = bearish BOS/CHoCH
+var int   trend         = 0     // +1 bull · -1 bear · 0 unset (from HH/LL sequence)
+
+// break-event registry — each event = a horizontal ray FROM the broken swing
+// (origin eOt) TO the candle that closed through it (eBt): true institutional
+// BOS/CHoCH/MSS anchoring, detected in REAL TIME on the breaking close.
+var array<float> eLv  = array.new<float>()     // broken swing price
+var array<int>   eOt  = array.new<int>()       // ORIGIN time (the broken swing's candle)
+var array<int>   eBar = array.new<int>()       // break bar_index
+var array<int>   eBt  = array.new<int>()       // break time (the breaking candle)
+var array<int>   eKind= array.new<int>()       // 0 BOS · 1 CHoCH · 2 MSS
+var array<int>   eDir = array.new<int>()       // +1 bull · -1 bear
+var array<bool>  eExt = array.new<bool>()      // broken swing was external (major)?
+MAXEVT = 300
+
+atr = ta.atr(atrLen)
+// ta.* every bar (never conditional). Close-based pivots → wicks never make structure.
+ph = ta.pivothigh(close, pivotLen, pivotLen)
+pl = ta.pivotlow(close,  pivotLen, pivotLen)
+pRange = high[pivotLen] - low[pivotLen]        // the pivot bar's range (noise filter)
+pBt = time[pivotLen]
+pBr = bar_index[pivotLen]
+
+f_strength(float legMove) => int(math.round(50.0 + 50.0 * math.min(1.0, legMove / (extSwingATR * atr * 2.0))))
+
+bullBreak = false
+bearBreak = false
+if barstate.isconfirmed
+    // 1a · register a new swing HIGH. A HIGHER HIGH (ty == HH) is a bullish structural
+    //      break (BOS with trend, CHoCH/MSS against); an LH is just a pullback high.
+    //      The trend flips on ANY HH/LL (same classification as the labels), so it
+    //      ALWAYS agrees with the visible HH/HL/LH/LL on every timeframe — including
+    //      the weekly, whose recent down-swings are too small vs the huge weekly ATR
+    //      to be "external". The internal/external flag still only tags the events.
+    //      protHigh/protLow are still tracked for the entry engine.
+    if not na(ph) and pRange >= noiseATR * atr
+        okDist = na(prevSwingHigh) or math.abs(ph - prevSwingHigh) >= minSwingATR * atr
+        if okDist
+            isExt = na(extLo) or math.abs(ph - extLo) >= extSwingATR * atr
+            brokeLvl = prevSwingHigh
+            ty = na(prevSwingHigh) or ph > prevSwingHigh ? 0 : 2      // HH or LH
+            legMove = na(extLo) ? extSwingATR * atr : math.abs(ph - extLo)
+            sP.push(ph), sTy.push(ty), sBt.push(pBt), sBar.push(pBr), sExt.push(isExt)
+            sStr.push(f_strength(legMove)), sState.push(0), sBroken.push(false)
+            prevSwingHigh := ph
+            prevHiT := pBt
+            prevHiExt := isExt
+            prevHiBroken := false
+            if isExt
+                if not na(extLo)
+                    protLow := extLo
+                extHi := ph
+            // trend follows the HH/LL label sequence (user-validated on all TFs)
+            if ty == 0 and not na(brokeLvl)
+                trend := 1
+    // 1b · register a new swing LOW. A LOWER LOW (LL) is a bearish structural break.
+    if not na(pl) and pRange >= noiseATR * atr
+        okDist = na(prevSwingLow) or math.abs(pl - prevSwingLow) >= minSwingATR * atr
+        if okDist
+            isExt = na(extHi) or math.abs(pl - extHi) >= extSwingATR * atr
+            brokeLvl = prevSwingLow
+            ty = na(prevSwingLow) or pl < prevSwingLow ? 3 : 1        // LL or HL
+            legMove = na(extHi) ? extSwingATR * atr : math.abs(pl - extHi)
+            sP.push(pl), sTy.push(ty), sBt.push(pBt), sBar.push(pBr), sExt.push(isExt)
+            sStr.push(f_strength(legMove)), sState.push(0), sBroken.push(false)
+            prevSwingLow := pl
+            prevLoT := pBt
+            prevLoExt := isExt
+            prevLoBroken := false
+            if isExt
+                if not na(extHi)
+                    protHigh := extHi
+                extLo := pl
+            // trend follows the HH/LL label sequence (user-validated on all TFs)
+            if ty == 3 and not na(brokeLvl)
+                trend := -1
+
+    // 1c · BOS / CHoCH / MSS — REAL-TIME on the breaking CLOSE (institutional
+    //      anchoring). The moment a confirmed close crosses the last swing high/low,
+    //      the event prints, anchored FROM that swing's candle (origin) TO this
+    //      breaking candle. Each swing breaks once. BOS = with trend; CHoCH =
+    //      against; MSS = against + displacement on the breaking candle. Internal/
+    //      external is inherited from the BROKEN swing's degree.
+    dispB = math.abs(close - open) >= dispBodyATR * atr or (high - low) >= dispRngATR * atr
+    if not na(prevSwingHigh) and not prevHiBroken and close > prevSwingHigh
+        kind = trend < 0 ? (dispB ? 2 : 1) : 0                    // MSS/CHoCH vs BOS
+        eLv.push(prevSwingHigh), eOt.push(prevHiT), eBar.push(bar_index), eBt.push(time), eKind.push(kind), eDir.push(1), eExt.push(prevHiExt)
+        prevHiBroken := true
+        bullBreak := true
+    if not na(prevSwingLow) and not prevLoBroken and close < prevSwingLow
+        kind = trend > 0 ? (dispB ? 2 : 1) : 0
+        eLv.push(prevSwingLow), eOt.push(prevLoT), eBar.push(bar_index), eBt.push(time), eKind.push(kind), eDir.push(-1), eExt.push(prevLoExt)
+        prevLoBroken := true
+        bearBreak := true
+
+    // 1d · strong/weak maintenance (LIVE): a high taken by a close → weak; unbroken
+    //      highs at a bearish break → strong (mirror for lows). Identity never changes.
+    if sP.size() > 0
+        for i = 0 to sP.size() - 1
+            if not sBroken.get(i)
+                isHi = sTy.get(i) == 0 or sTy.get(i) == 2
+                if (isHi and close > sP.get(i)) or (not isHi and close < sP.get(i))
+                    sBroken.set(i, true)
+                    sState.set(i, 2)
+                else if bearBreak and isHi
+                    sState.set(i, 1)
+                else if bullBreak and not isHi
+                    sState.set(i, 1)
+
+    // 1e · bound memory (safety; calc_bars_count keeps the real count under MAXPT)
+    if sP.size() > MAXPT
+        sP.remove(0), sTy.remove(0), sBt.remove(0), sBar.remove(0), sExt.remove(0)
+        sStr.remove(0), sState.remove(0), sBroken.remove(0)
+    if eLv.size() > MAXEVT
+        eLv.remove(0), eOt.remove(0), eBar.remove(0), eBt.remove(0), eKind.remove(0), eDir.remove(0), eExt.remove(0)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 2 · IDENTITY HASH (canonical window) + BAND-BASED FREEZE / REPLAY TEST
+// ═══════════════════════════════════════════════════════════════════════════
+f_id(int i) => int(math.round(sP.get(i) / syminfo.mintick)) * 131 + sTy.get(i) * 17 + (sExt.get(i) ? 1 : 0) * 7
+
+f_hash() =>
+    h = 0
+    cut = last_bar_index - canonBars
+    if sP.size() > 0
+        for i = 0 to sP.size() - 1
+            if sBar.get(i) >= cut
+                h := int(math.abs((h + f_id(i)) % PRIME))
+    h
+dbHash = f_hash()
+
+// Freeze band: points born in the FIXED range [last−windowBars−bandBars, last−windowBars].
+// The band is bounded and old-but-not-ancient, so book aging (which trims the very
+// oldest records) never touches it → its hash is identical whenever sampled ⇒ A=B=C.
+f_whash() =>
+    h = 0
+    hi = last_bar_index - windowBars
+    lo = hi - bandBars
+    if sP.size() > 0
+        for i = 0 to sP.size() - 1
+            b = sBar.get(i)
+            if b >= lo and b <= hi
+                h := int(math.abs((h + f_id(i)) % PRIME))
+    h
+wHash = f_whash()
+var int rA = na
+var int rB = na
+var int rC = na
+if bar_index == last_bar_index
+    rA := wHash
+if bar_index == last_bar_index - 500
+    rB := wHash
+if bar_index == last_bar_index - 1000
+    rC := wHash
+replayPass = not na(rC) and rA == rB and rB == rC
+
+// per-type counts (display only)
+cHH = 0
+cHL = 0
+cLH = 0
+cLL = 0
+cExt = 0
+if sP.size() > 0
+    for i = 0 to sP.size() - 1
+        t = sTy.get(i)
+        cHH += t == 0 ? 1 : 0
+        cHL += t == 1 ? 1 : 0
+        cLH += t == 2 ? 1 : 0
+        cLL += t == 3 ? 1 : 0
+        cExt += sExt.get(i) ? 1 : 0
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 2b · LIQUIDITY MAP (spec §2) — prior day/week H-L, session H-L, equal H/L,
+//      swing pools. The POWER LINE is derived here as the nearest liquidity
+//      level to price, so it snaps to the level you are actually trading (not a
+//      far-off HTF pivot). Determinism: all levels are prior-bar / confirmed
+//      values via lookahead-off security or frozen swings — never the live bar.
+// ═══════════════════════════════════════════════════════════════════════════
+// CALCULATION — every level's PRICE is a prior-bar / confirmed / frozen value
+// (never the live bar); ANCHOR TIME points to the originating candle/session.
+// Prior day / week: price and anchor (previous bar's high/low and open time) are
+// pulled with lookahead_off, so they are identical on every chart timeframe.
+// SUB-CHART GUARD (fixes the 1W/1D + deep-history runtime error). Requesting a
+// timeframe BELOW the chart TF forces request.security to replay that lower TF's
+// entire history — which blows TradingView's memory/time limit (RE10139/RE10110)
+// on 1D/1W charts (4H/Daily are sub-chart there) and is amplified on deep-history
+// forex. f_reqtf clamps any requested TF up to at least the chart TF, so the call
+// is never a sub-chart replay. On charts at/below the requested TF (all the crypto
+// intraday cases that already work) it returns the SAME tf → identical data, so
+// the STRUCT HASH and freeze test are byte-unchanged there.
+f_reqtf(simple string tf) => timeframe.in_seconds(tf) < timeframe.in_seconds() ? timeframe.period : tf
+pdh = request.security(syminfo.tickerid, f_reqtf("D"), high[1], lookahead = barmerge.lookahead_off)
+pdl = request.security(syminfo.tickerid, f_reqtf("D"), low[1],  lookahead = barmerge.lookahead_off)
+pdA = request.security(syminfo.tickerid, f_reqtf("D"), time[1], lookahead = barmerge.lookahead_off)   // prev-day start
+pwh = request.security(syminfo.tickerid, f_reqtf("W"), high[1], lookahead = barmerge.lookahead_off)
+pwl = request.security(syminfo.tickerid, f_reqtf("W"), low[1],  lookahead = barmerge.lookahead_off)
+pwA = request.security(syminfo.tickerid, f_reqtf("W"), time[1], lookahead = barmerge.lookahead_off)   // prev-week start
+atrDaily = request.security(syminfo.tickerid, f_reqtf("D"), ta.atr(14), lookahead = barmerge.lookahead_off)
+atrRef = na(atrDaily) or atrDaily <= 0 ? atr : atrDaily
+
+// Session highs/lows — the extreme and the TIME it printed are tracked live and
+// FROZEN when the session closes (previous session). Anchor = the extreme's candle.
+f_sess(simple string s) =>
+    var float hi = na
+    var float lo = na
+    var int   hiT = na
+    var int   loT = na
+    var float phi = na
+    var float plo = na
+    var int   phiT = na
+    var int   ploT = na
+    inS = not na(time(timeframe.period, s, syminfo.timezone))
+    if inS and not inS[1]
+        hi := high
+        lo := low
+        hiT := time
+        loT := time
+    else if inS
+        if high > hi
+            hi := high
+            hiT := time
+        if low < lo
+            lo := low
+            loT := time
+    if not inS and inS[1]
+        phi := hi
+        plo := lo
+        phiT := hiT
+        ploT := loT
+    [phi, plo, phiT, ploT]
+[lonH, lonL, lonHT, lonLT] = f_sess(loTm)
+[nyH,  nyL,  nyHT,  nyLT ] = f_sess(nyTm)
+[asH,  asL,  asHT,  asLT ] = f_sess(asTm)
+[syH,  syL,  syHT,  syLT ] = f_sess(syTm)
+
+// Equal highs / lows — two same-side external swings within eqTol×ATR; anchor = the
+// EARLIER swing's candle (where the pool originated).
+f_hasEqual(int side) =>       // side 1 = highs, 0 = lows
+    found = false
+    price = 0.0
+    anchor = 0
+    if sP.size() > 1
+        for i = sP.size() - 1 to math.max(1, sP.size() - 20)
+            hi = sTy.get(i) == 0 or sTy.get(i) == 2
+            match = side == 1 ? hi : not hi
+            if match and sExt.get(i) and not found
+                lo = math.max(0, i - 12)
+                for j = i - 1 to lo
+                    hj = sTy.get(j) == 0 or sTy.get(j) == 2
+                    mj = side == 1 ? hj : not hj
+                    if mj and sExt.get(j) and not found and math.abs(sP.get(i) - sP.get(j)) <= eqTol * atr
+                        found := true
+                        price := side == 1 ? math.max(sP.get(i), sP.get(j)) : math.min(sP.get(i), sP.get(j))
+                        anchor := math.min(sBt.get(i), sBt.get(j))
+    [found, price, anchor]
+[hasEQH, eqhP, eqhA] = f_hasEqual(1)
+[hasEQL, eqlP, eqlA] = f_hasEqual(0)
+
+// Nearest unbroken external swing above / below price = swing liquidity; anchor =
+// that swing's own candle.
+swBSL = float(na)
+swSSL = float(na)
+swBSLa = 0
+swSSLa = 0
+if sP.size() > 0
+    for i = 0 to sP.size() - 1
+        if sExt.get(i) and not sBroken.get(i)
+            p = sP.get(i)
+            hi = sTy.get(i) == 0 or sTy.get(i) == 2
+            if hi and p > close and (na(swBSL) or p < swBSL)
+                swBSL := p
+                swBSLa := sBt.get(i)
+            if not hi and p < close and (na(swSSL) or p > swSSL)
+                swSSL := p
+                swSSLa := sBt.get(i)
+
+// Assemble levels: price, tag, anchor-time, group-id (drives per-group visuals).
+// Group ids: 0 PrevDay · 1 PrevWeek · 2 London · 3 NY · 4 Asian · 5 Sydney ·
+//            6 Equal · 7 Swing.
+var array<float>  Lp = array.new<float>()
+var array<string> Lt = array.new<string>()
+var array<int>    LaT= array.new<int>()
+var array<int>    Lg = array.new<int>()
+var array<bool>   Ls = array.new<bool>()      // true = buy-side (a HIGH) · false = sell-side (a LOW)
+f_add(bool on, float p, string t, int at, int g, bool hiSide) =>
+    if on and not na(p)
+        Lp.push(p), Lt.push(t), LaT.push(at), Lg.push(g), Ls.push(hiSide)
+Lp.clear()
+Lt.clear()
+LaT.clear()
+Lg.clear()
+Ls.clear()
+f_add(pdOn, pdh, "PDH", pdA, 0, true)
+f_add(pdOn, pdl, "PDL", pdA, 0, false)
+f_add(pwOn, pwh, "PWH", pwA, 1, true)
+f_add(pwOn, pwl, "PWL", pwA, 1, false)
+f_add(loOn, lonH, "London H", lonHT, 2, true)
+f_add(loOn, lonL, "London L", lonLT, 2, false)
+f_add(nyOn, nyH, "NY H", nyHT, 3, true)
+f_add(nyOn, nyL, "NY L", nyLT, 3, false)
+f_add(asOn, asH, "Asia H", asHT, 4, true)
+f_add(asOn, asL, "Asia L", asLT, 4, false)
+f_add(syOn, syH, "Sydney H", syHT, 5, true)
+f_add(syOn, syL, "Sydney L", syLT, 5, false)
+f_add(eqOn and hasEQH, eqhP, "EQH", eqhA, 6, true)
+f_add(eqOn and hasEQL, eqlP, "EQL", eqlA, 6, false)
+f_add(swOn, swBSL, "BSL", swBSLa, 7, true)
+f_add(swOn, swSSL, "SSL", swSSLa, 7, false)
+
+// Key level (AT LEVEL) = nearest liquidity level above and below price; pl1 = closer.
+plAbove = float(na)
+plAboveT = ""
+plBelow = float(na)
+plBelowT = ""
+if Lp.size() > 0
+    for i = 0 to Lp.size() - 1
+        p = Lp.get(i)
+        if p >= close and (na(plAbove) or p < plAbove)
+            plAbove := p
+            plAboveT := Lt.get(i)
+        if p < close and (na(plBelow) or p > plBelow)
+            plBelow := p
+            plBelowT := Lt.get(i)
+dAbove = na(plAbove) ? na : plAbove - close
+dBelow = na(plBelow) ? na : close - plBelow
+pl1 = na(plAbove) ? plBelow : na(plBelow) ? plAbove : (dAbove <= dBelow ? plAbove : plBelow)
+pl1T = na(plAbove) ? plBelowT : na(plBelow) ? plAboveT : (dAbove <= dBelow ? plAboveT : plBelowT)
+pl1Dist = na(pl1) ? na : math.abs(close - pl1) / atrRef
+atLevel = not na(pl1Dist) and pl1Dist <= powerTol
+alertcondition(atLevel, "Price AT LEVEL", "Price is at the nearest liquidity level (outstanding-reaction zone)")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 2c · LIQUIDITY SWEEP + DISPLACEMENT QUALITY (spec §2 sweep, §3). A sweep = a
+//      wick that pierces a mapped level by ≥ sweepATR×ATR and CLOSES back inside
+//      with a rejection; the reclaim is scored 0-1 for displacement quality.
+//      Confirmed-bar only (non-repaint). This feeds the Phase-5 entry engine.
+// ═══════════════════════════════════════════════════════════════════════════
+// SMAs computed EVERY bar (ta.* must never be conditional); read inside f_dispQual.
+volSma = ta.sma(volume, 20)
+rngSma = ta.sma(high - low, 20)
+f_dispQual(int dir) =>       // dir +1 bullish reclaim · -1 bearish reclaim → 0..1
+    rng  = high - low
+    body = math.abs(close - open)
+    b_ok = body >= dBody * atr
+    r_ok = rng  >= dRange * atr
+    dom  = rng > 0 and body / rng >= bodyDom
+    ce   = rng > 0 and (dir > 0 ? (close - low) / rng >= closeFrac : (high - close) / rng >= closeFrac)
+    exp  = rng >= expMult * atr
+    imp = true
+    for k = 0 to impSeq - 1
+        bk = math.abs(close[k] - open[k])
+        dk = dir > 0 ? close[k] > open[k] : close[k] < open[k]
+        if not (bk >= dBody * atr and dk)
+            imp := false
+    vok = na(volume) or na(volSma) ? (not na(rngSma) and rng >= volMult * rngSma) : (volume >= volMult * volSma)
+    ((b_ok ? 1 : 0) + (r_ok ? 1 : 0) + (dom ? 1 : 0) + (ce ? 1 : 0) + (exp ? 1 : 0) + (imp ? 1 : 0) + (vok ? 1 : 0)) / 7.0
+
+var array<float>  swpP   = array.new<float>()   // swept level price
+var array<int>    swpT   = array.new<int>()     // sweep bar time
+var array<int>    swpB   = array.new<int>()     // sweep bar index (age / cooldown)
+var array<int>    swpDir = array.new<int>()     // +1 bullish · -1 bearish
+var array<string> swpTag = array.new<string>()  // which level
+var array<float>  swpQ   = array.new<float>()   // displacement quality 0-1 (frozen)
+// which liquidity groups count as institutional sweep targets (group ids in §2b)
+f_swpAllowed(int g) => g == 0 ? swpPDok : g == 1 ? swpPWok : (g >= 2 and g <= 5) ? swpSEok : g == 6 ? swpEQok : swpSWok
+// cooldown/dedupe: has this same level+direction already swept within swpCool bars?
+f_dupSweep(string tag, int dir) =>
+    dup = false
+    if swpCool > 0 and swpP.size() > 0
+        for k = swpP.size() - 1 to math.max(0, swpP.size() - 12)
+            if not dup and swpTag.get(k) == tag and swpDir.get(k) == dir and bar_index - swpB.get(k) <= swpCool
+                dup := true
+    dup
+bullSweep = false
+bearSweep = false
+if barstate.isconfirmed and Lp.size() > 0
+    rng = high - low
+    for i = 0 to Lp.size() - 1
+        p = Lp.get(i)
+        if rng > 0 and math.abs(close - p) <= sweepLook * atr and f_swpAllowed(Lg.get(i))
+            if Ls.get(i)
+                // buy-side liquidity (a high) taken: wick above, close back below → BEARISH sweep
+                if not bearSweep and high > p + sweepATR * atr and close < p and (high - close) / rng >= rejFrac and not f_dupSweep(Lt.get(i), -1)
+                    swpP.push(p), swpT.push(time), swpB.push(bar_index), swpDir.push(-1), swpTag.push(Lt.get(i)), swpQ.push(f_dispQual(-1))
+                    bearSweep := true
+            else
+                // sell-side liquidity (a low) taken: wick below, close back above → BULLISH sweep
+                if not bullSweep and low < p - sweepATR * atr and close > p and (close - low) / rng >= rejFrac and not f_dupSweep(Lt.get(i), 1)
+                    swpP.push(p), swpT.push(time), swpB.push(bar_index), swpDir.push(1), swpTag.push(Lt.get(i)), swpQ.push(f_dispQual(1))
+                    bullSweep := true
+    if swpP.size() > 200
+        swpP.remove(0), swpT.remove(0), swpB.remove(0), swpDir.remove(0), swpTag.remove(0), swpQ.remove(0)
+alertcondition(bullSweep, "Bullish liquidity sweep", "A sell-side liquidity level was swept and reclaimed (bullish)")
+alertcondition(bearSweep, "Bearish liquidity sweep", "A buy-side liquidity level was swept and reclaimed (bearish)")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 2d · FILTERS (spec §4, §6) — weighted MTF bias · trend strength · volatility
+//      gate · market phase · premium/discount. All display/context here; the
+//      entry engine (Phase 5) and scoring (Phase 6) consume them. Non-repaint:
+//      HTF trends via lookahead_off security; everything else on confirmed data.
+// ═══════════════════════════════════════════════════════════════════════════
+f_sgn(float x) => x > 0 ? 1 : x < 0 ? -1 : 0
+// lightweight HTF trend: flips on HH/LL of its own pivots (matches the main engine).
+f_htrend(simple int L) =>
+    var float psh = na
+    var float psl = na
+    var int tr = 0
+    hh = ta.pivothigh(close, L, L)
+    ll = ta.pivotlow(close,  L, L)
+    if barstate.isconfirmed
+        if not na(hh)
+            if not na(psh) and hh > psh
+                tr := 1
+            psh := hh
+        if not na(ll)
+            if not na(psl) and ll < psl
+                tr := -1
+            psl := ll
+    tr
+wTr  = request.security(syminfo.tickerid, f_reqtf("W"),   f_htrend(3), lookahead = barmerge.lookahead_off)
+dTr  = request.security(syminfo.tickerid, f_reqtf("D"),   f_htrend(3), lookahead = barmerge.lookahead_off)
+h4Tr = request.security(syminfo.tickerid, f_reqtf("240"), f_htrend(5), lookahead = barmerge.lookahead_off)
+// Weighted bias: Weekly 3 · Daily 2 · 4H 1 → W+D outrank D+4H (spec §4).
+dirScore = 3 * f_sgn(wTr) + 2 * f_sgn(dTr) + 1 * f_sgn(h4Tr)
+mtfBias  = dirScore >= 3 ? 1 : dirScore <= -3 ? -1 : 0
+
+// Trend strength (0-1): max of normalised ADX and EMA-slope (spec §6.1).
+[_dip, _dim, adxv] = ta.dmi(adxLen, adxLen)
+ema_s   = ta.ema(close, emaLen)
+slopeN  = na(atr) or atr <= 0 ? 0.0 : math.min(1.0, math.abs(ema_s - ema_s[slopeLen]) / (slopeRef * atr))
+adxN    = na(adxv) ? 0.0 : math.min(1.0, adxv / 40.0)
+trendStrength = math.max(adxN, slopeN)
+
+// Volatility gate (spec §6.2) — HARD gate for the entry engine.
+atrFloor = ta.sma(atr, volFloorLen)
+volOK    = not na(atrFloor) and atr >= volFloorMult * atrFloor
+
+// Premium / Discount (spec §6.4): dealing range over rangeLen, equilibrium = mid.
+dealHi = ta.highest(high, rangeLen)
+dealLo = ta.lowest(low,  rangeLen)
+eqm    = (dealHi + dealLo) / 2.0
+pdPct  = dealHi > dealLo ? (close - dealLo) / (dealHi - dealLo) : 0.5   // 0 low … 1 high
+inDiscount = close < eqm
+
+// Market phase (spec §6.3), first match wins by priority.
+atrSma50 = ta.sma(atr, 50)
+dispNow  = math.abs(close - open) >= dBody * atr or (high - low) >= dRange * atr
+phaseCode = 0    // 0 Range · 1 Trending · 2 Pullback · 3 Compression · 4 Accumulation · 5 Distribution · 6 Expansion
+if not na(atrSma50) and atrSma50 > 0
+    if atr >= atrHi * atrSma50 and dispNow
+        phaseCode := 6
+    else if atr <= atrLo * atrSma50
+        phaseCode := inDiscount and trend <= 0 ? 4 : (not inDiscount and trend >= 0 ? 5 : 3)
+    else if trend != 0 and trendStrength >= trendMin
+        phaseCode := 1
+    else if trend != 0
+        phaseCode := 2
+    else
+        phaseCode := 0
+f_phaseName(int c) => c == 6 ? "Expansion" : c == 1 ? "Trending" : c == 2 ? "Pullback" : c == 3 ? "Compression" : c == 4 ? "Accumulation" : c == 5 ? "Distribution" : "Range"
+// phase favours trend-continuation setups (Trending/Pullback/Expansion)
+phaseFav = phaseCode == 1 or phaseCode == 2 or phaseCode == 6
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 2e · ENTRY STATE MACHINE (spec §7) — IDLE → SWEPT → TRIGGERED, with hard
+//      gates, invalidation and expiration (spec §8). Deterministic: every
+//      transition happens on a confirmed bar from already-confirmed inputs.
+//      ARMED is implicit (bias + AT LEVEL + gates all live on the HUD); a state
+//      RECORD is created at the SWEEP because that is the first frozen event.
+//
+//      Confirmation = micro structural break: after a bullish sweep, a CLOSE
+//      above the sweep candle's high (the trigger level) with displacement
+//      quality ≥ dispQualMin, within confirmBars. Mirror for bearish.
+//      Invalidation (spec §8): close beyond the sweep extreme · opposite sweep ·
+//      MTF bias flip. Expiration: no confirm within confirmBars.
+// ═══════════════════════════════════════════════════════════════════════════
+// setup state: 0 IDLE · 1 SWEPT (awaiting confirm) · 2 TRIGGERED (levels valid)
+var int   stState   = 0
+var int   stDir     = 0        // +1 long · -1 short
+var float stLevel   = na       // swept liquidity level
+var float stExtreme = na       // sweep wick extreme (SL anchor)
+var string stTag    = ""       // which level was swept
+var int   stBarSw   = na       // bar of the sweep
+var int   stBias0   = 0        // MTF bias captured at the sweep (sync check)
+var float stEntry   = na
+var float stSL      = na
+var float stTP1     = na
+var float stTP2     = na
+var float stTrig    = na       // micro trigger level (sweep candle's far side)
+justTriggered = false
+justInvalid   = false
+
+// direction gates (recomputed every bar; hard gates per spec §9.1)
+biasDir = reqBias ? mtfBias : trend
+longOK  = biasDir > 0 and volOK and (not reqPD or inDiscount)
+shortOK = biasDir < 0 and volOK and (not reqPD or not inDiscount)
+
+if entOn and barstate.isconfirmed
+    // ── state 1 → confirm / invalidate / expire ─────────────────────────────
+    if stState == 1
+        expired = bar_index - stBarSw > confirmBars
+        // invalidation: close back beyond the sweep extreme = the level truly broke
+        broke = stDir > 0 ? close < stExtreme : close > stExtreme
+        biasFlip = reqBias and mtfBias != stBias0
+        if expired or broke or biasFlip
+            stState := 0
+            justInvalid := true
+        else
+            confd = stDir > 0 ? close > stTrig : close < stTrig
+            if confd and f_dispQual(stDir) >= dispQualMin
+                // TRIGGERED — freeze the trade map
+                stEntry := close
+                stSL := stDir > 0 ? stExtreme - slBufATR * atr : stExtreme + slBufATR * atr
+                risk = math.abs(stEntry - stSL)
+                stTP1 := stDir > 0 ? stEntry + partialR * risk : stEntry - partialR * risk
+                // final target: next opposing liquidity level within maxTgtR, else cap
+                cap = stDir > 0 ? stEntry + maxTgtR * risk : stEntry - maxTgtR * risk
+                best = cap
+                if Lp.size() > 0
+                    for i = 0 to Lp.size() - 1
+                        p = Lp.get(i)
+                        if stDir > 0 and p > stEntry + risk and p < best
+                            best := p
+                        if stDir < 0 and p < stEntry - risk and p > best
+                            best := p
+                stTP2 := best
+                stState := 2
+                justTriggered := true
+    // ── state 2 → keep until SL or TP2 is crossed (map completes) ───────────
+    else if stState == 2
+        done = stDir > 0 ? (close < stSL or close > stTP2) : (close > stSL or close < stTP2)
+        if done
+            stState := 0
+    // ── state 0 → a fresh valid sweep arms a setup record ────────────────────
+    if stState == 0
+        if bullSweep and longOK
+            n1 = swpP.size() - 1
+            stDir := 1
+            stLevel := swpP.get(n1)
+            stTag := swpTag.get(n1)
+            stExtreme := low
+            stTrig := high
+            stBarSw := bar_index
+            stBias0 := mtfBias
+            stState := 1
+        else if bearSweep and shortOK
+            n1 = swpP.size() - 1
+            stDir := -1
+            stLevel := swpP.get(n1)
+            stTag := swpTag.get(n1)
+            stExtreme := high
+            stTrig := low
+            stBarSw := bar_index
+            stBias0 := mtfBias
+            stState := 1
+alertcondition(justTriggered, "Setup TRIGGERED", "Sweep + reclaim confirmed with displacement — entry map frozen (entry/SL/TP on chart)")
+alertcondition(justInvalid, "Setup invalidated", "Pending setup expired or was invalidated (level broke / bias flip / timeout)")
+
+// ── Per-group VISUAL settings (display only — never touches Lp price) ────────
+f_gCol(int g, bool above) => g == 0 ? pdC : g == 1 ? pwC : g == 2 ? loC : g == 3 ? nyC : g == 4 ? asC : g == 5 ? syC : g == 6 ? eqC : (above ? swCb : swCs)
+f_gStyS(int g) => g == 0 ? pdSt : g == 1 ? pwSt : (g >= 2 and g <= 5) ? seSt : g == 6 ? eqSt : swSt
+f_gW(int g)    => g == 0 ? pdW : g == 1 ? pwW : (g >= 2 and g <= 5) ? seW : g == 6 ? eqW : swW
+f_gTr(int g)   => g == 0 ? pdTr : g == 1 ? pwTr : (g >= 2 and g <= 5) ? seTr : g == 6 ? eqTr : swTr
+f_gExtS(int g) => g == 0 ? pdEx : g == 1 ? pwEx : (g >= 2 and g <= 5) ? seEx : g == 6 ? eqEx : swEx
+f_gLbl(int g)  => g == 0 ? pdLb : g == 1 ? pwLb : (g >= 2 and g <= 5) ? seLb : g == 6 ? eqLb : swLb
+f_gLzS(int g)  => g == 0 ? pdLz : g == 1 ? pwLz : (g >= 2 and g <= 5) ? seLz : g == 6 ? eqLz : swLz
+f_gPri(int g)  => g == 0 ? pdPr : g == 1 ? pwPr : (g >= 2 and g <= 5) ? sePr : g == 6 ? eqPr : swPr
+f_size(string s) => s == "Normal" ? size.normal : s == "Small" ? size.small : size.tiny
+
+// ── Liquidity renderer (read-only). Draws by ascending priority so higher-priority
+//    groups paint on top; each line anchored to its originating candle time. ──────
+var array<line>  liqLn = array.new<line>()
+var array<label> liqLb = array.new<label>()
+if barstate.islast and showLiq
+    if liqLn.size() > 0
+        for i = 0 to liqLn.size() - 1
+            line.delete(liqLn.get(i))
+    if liqLb.size() > 0
+        for i = 0 to liqLb.size() - 1
+            label.delete(liqLb.get(i))
+    liqLn.clear()
+    liqLb.clear()
+    tfMs2 = timeframe.in_seconds() * 1000
+    for pr = 1 to 10
+        if Lp.size() > 0
+            for i = 0 to Lp.size() - 1
+                g = Lg.get(i)
+                if f_gPri(g) == pr
+                    p = Lp.get(i)
+                    above = p >= close
+                    isPL = not na(pl1) and math.abs(p - pl1) < syminfo.mintick / 2
+                    baseC = f_gCol(g, above)
+                    extV = f_ext(f_gExtS(g))
+                    x1 = na(LaT.get(i)) or LaT.get(i) <= 0 ? time : LaT.get(i)
+                    x2 = extV == extend.none ? time : x1 + tfMs2
+                    liqLn.push(line.new(x1, p, x2, p, xloc = xloc.bar_time, extend = extV,
+                         color = color.new(baseC, isPL ? 0 : f_gTr(g)), width = isPL ? math.max(2, f_gW(g)) : f_gW(g),
+                         style = f_lstyle(f_gStyS(g))))
+                    if f_gLbl(g) or isPL
+                        lx = lblPosS == "Left" ? x1 : time + tfMs2 * 3
+                        lsty = lblPosS == "Left" ? label.style_label_right : label.style_label_left
+                        liqLb.push(label.new(lx, p, Lt.get(i) + (isPL ? " ◄ AT LEVEL" : ""), xloc = xloc.bar_time, yloc = yloc.price,
+                             style = lsty, color = color.new(baseC, isPL ? 0 : math.max(0, f_gTr(g) - 20)),
+                             textcolor = color.white, size = isPL ? size.small : f_size(f_gLzS(g))))
+
+// ── Sweep markers (read-only): ⚡ at each recent sweep, coloured by direction; a
+//    hollow mark when displacement quality is below the confirm threshold. ────────
+var array<label> swpLbl = array.new<label>()
+if barstate.islast and showSwp
+    if swpLbl.size() > 0
+        for i = 0 to swpLbl.size() - 1
+            label.delete(swpLbl.get(i))
+    swpLbl.clear()
+    if swpP.size() > 0
+        showN = math.min(swpP.size(), 40)
+        for j = swpP.size() - showN to swpP.size() - 1
+            q = swpQ.get(j)
+            // display filters: quality floor + age limit (institutional marks only)
+            if q >= swpShowQ and bar_index - swpB.get(j) <= swpMaxAge
+                up = swpDir.get(j) > 0
+                conf = q >= dispQualMin
+                c  = up ? colSwpB : colSwpS
+                txt = "⚡ " + swpTag.get(j) + " " + str.tostring(math.round(q * 100)) + "%"
+                swpLbl.push(label.new(swpT.get(j), swpP.get(j), txt, xloc = xloc.bar_time, yloc = yloc.price,
+                     style = up ? label.style_label_up : label.style_label_down,
+                     color = color.new(c, conf ? 0 : 65), textcolor = conf ? color.white : color.new(c, 0),
+                     size = size.tiny))
+
+// ── Trade map (read-only): entry / SL / TP1 / final-target lines while a setup
+//    is TRIGGERED; pending setups show the trigger + invalidation guide. ─────────
+var array<line>  stLn = array.new<line>()
+var array<label> stLb = array.new<label>()
+f_tradeLine(float y, color c, string t, bool dash) =>     // global scope (Pine bans local fns)
+    stLn.push(line.new(bar_index - 8, y, bar_index, y, extend = extend.right, color = c, width = 2,
+         style = dash ? line.style_dashed : line.style_solid))
+    stLb.push(label.new(bar_index + 2, y, t, xloc = xloc.bar_index, style = label.style_label_left,
+         color = color.new(c, 15), textcolor = color.white, size = size.small))
+if barstate.islast
+    if stLn.size() > 0
+        for i = 0 to stLn.size() - 1
+            line.delete(stLn.get(i))
+    if stLb.size() > 0
+        for i = 0 to stLb.size() - 1
+            label.delete(stLb.get(i))
+    stLn.clear()
+    stLb.clear()
+    if showSetup and stState > 0
+        if stState == 2
+            rr = math.abs(stEntry - stSL) > 0 ? math.abs(stTP2 - stEntry) / math.abs(stEntry - stSL) : 0.0
+            f_tradeLine(stEntry, colEntry, (stDir > 0 ? "LONG " : "SHORT ") + "ENTRY " + str.tostring(stEntry, format.mintick), false)
+            f_tradeLine(stSL, colSL, "SL " + str.tostring(stSL, format.mintick), false)
+            f_tradeLine(stTP1, colTP, "TP1 (" + str.tostring(partialR, "#.##") + "R) " + str.tostring(stTP1, format.mintick), true)
+            f_tradeLine(stTP2, colTP, "TARGET " + str.tostring(stTP2, format.mintick) + "  (" + str.tostring(rr, "#.#") + "R)", false)
+        else
+            f_tradeLine(stTrig, colEntry, (stDir > 0 ? "▲" : "▼") + " confirm @ " + str.tostring(stTrig, format.mintick), true)
+            f_tradeLine(stExtreme, colSL, "invalid beyond " + str.tostring(stExtreme, format.mintick), true)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 3 · RENDERER — READ-ONLY. Structure labels + BOS/CHoCH/MSS markers.
+// ═══════════════════════════════════════════════════════════════════════════
+f_tyname(int t) => t == 0 ? "HH" : t == 1 ? "HL" : t == 2 ? "LH" : "LL"
+f_tyshow(int t) => t == 0 ? showHH : t == 1 ? showHL : t == 2 ? showLH : showLL
+f_tycol(int t)  => (t == 0 or t == 1) ? colBull : colBear
+lblSize = lblSizeS == "Normal" ? size.normal : lblSizeS == "Tiny" ? size.tiny : size.small
+pivStyle = f_lstyle(pivStyleS)
+pivExtV  = f_ext(pivExt)
+brkExtV  = f_ext(brkExt)
+f_kindShow(int k) => k == 0 ? showBOS : k == 1 ? showChoCH : showMSS
+
+var array<label> drawn = array.new<label>()
+var array<line>  drawnB = array.new<line>()
+
+if barstate.islast
+    if drawn.size() > 0
+        for i = 0 to drawn.size() - 1
+            label.delete(drawn.get(i))
+    if drawnB.size() > 0
+        for i = 0 to drawnB.size() - 1
+            line.delete(drawnB.get(i))
+    drawn.clear(), drawnB.clear()
+
+    n = sP.size()
+    // LABEL budget: most recent maxPts per side among label-eligible (type toggles apply)
+    cutHi = 0
+    cutLo = 0
+    tmpHi = array.new<int>()
+    tmpLo = array.new<int>()
+    // PIVOT-LINE budget: independent of the HH/HL/LH/LL label toggles, so the lines
+    // survive with all labels unchecked (only extOnly filters them)
+    cutHiL = 0
+    cutLoL = 0
+    tmpHiL = array.new<int>()
+    tmpLoL = array.new<int>()
+    if n > 0
+        for i = 0 to n - 1
+            isHi0 = sTy.get(i) == 0 or sTy.get(i) == 2
+            degOK = not extOnly or sExt.get(i)
+            if f_tyshow(sTy.get(i)) and degOK
+                if isHi0
+                    tmpHi.push(sBar.get(i))
+                else
+                    tmpLo.push(sBar.get(i))
+            if degOK
+                if isHi0
+                    tmpHiL.push(sBar.get(i))
+                else
+                    tmpLoL.push(sBar.get(i))
+    if tmpHi.size() > maxPts
+        tmpHi.sort(order.descending)
+        cutHi := tmpHi.get(maxPts - 1)
+    if tmpLo.size() > maxPts
+        tmpLo.sort(order.descending)
+        cutLo := tmpLo.get(maxPts - 1)
+    if tmpHiL.size() > maxPts
+        tmpHiL.sort(order.descending)
+        cutHiL := tmpHiL.get(maxPts - 1)
+    if tmpLoL.size() > maxPts
+        tmpLoL.sort(order.descending)
+        cutLoL := tmpLoL.get(maxPts - 1)
+
+    tfMs = timeframe.in_seconds() * 1000
+    if n > 0
+        for i = 0 to n - 1
+            ty = sTy.get(i)
+            isHi = ty == 0 or ty == 2
+            degOK = not extOnly or sExt.get(i)
+            col = f_tycol(ty)
+            // structure LABEL (type toggles + label budget)
+            if f_tyshow(ty) and degOK and sBar.get(i) >= (isHi ? cutHi : cutLo)
+                mark = markSW ? (sState.get(i) == 1 ? " ●" : sState.get(i) == 2 ? " ○" : "") : ""
+                txt = f_tyname(ty) + (sExt.get(i) ? "" : "·") + mark
+                drawn.push(label.new(sBt.get(i), sP.get(i), txt, xloc = xloc.bar_time, yloc = yloc.price,
+                     style = isHi ? label.style_label_down : label.style_label_up,
+                     color = color.new(col, sExt.get(i) ? 0 : 45), textcolor = color.white, size = lblSize))
+            // PIVOT LINE — independent of label toggles (own budget)
+            if showPivLines and degOK and sBar.get(i) >= (isHi ? cutHiL : cutLoL)
+                drawnB.push(line.new(sBt.get(i), sP.get(i), sBt.get(i) + tfMs, sP.get(i), xloc = xloc.bar_time,
+                     extend = pivExtV, color = color.new(col, sExt.get(i) ? 30 : 55), width = pivWid, style = pivStyle))
+
+    // Break lines — TRUE institutional anchoring: each ray runs FROM the broken
+    // swing's candle (origin) TO the candle that closed through it, at the broken
+    // price. Filtered by type (BOS/CHoCH/MSS) and degree (internal/external).
+    brkSize = f_size(brkLblSz)
+    if eLv.size() > 0
+        show = math.min(eLv.size(), maxBrk)
+        shown = 0
+        for j = eLv.size() - 1 to 0
+            if shown < show
+                k = eKind.get(j)
+                ext = eExt.get(j)
+                if f_kindShow(k) and (ext ? showBrkExt : showBrkInt)
+                    dir = eDir.get(j)
+                    kcol = k == 2 ? colMSS : dir > 0 ? colBull : colBear
+                    ktxt = (k == 0 ? "BOS" : k == 1 ? "CHoCH" : "MSS") + (ext ? "" : "·")
+                    drawnB.push(line.new(eOt.get(j), eLv.get(j), eBt.get(j), eLv.get(j), xloc = xloc.bar_time,
+                         extend = brkExtV, color = color.new(kcol, ext ? 0 : 40), width = brkWid,
+                         style = k == 0 ? line.style_solid : line.style_dashed))
+                    if showBrkLbl
+                        drawn.push(label.new(eBt.get(j), eLv.get(j), ktxt, xloc = xloc.bar_time, yloc = yloc.price,
+                             style = dir > 0 ? label.style_label_up : label.style_label_down,
+                             color = color.new(kcol, ext ? 20 : 50), textcolor = color.black, size = brkSize))
+                    shown += 1
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 4 · DEBUG PANEL — hash · trend · counts · freeze test (band)
+// ═══════════════════════════════════════════════════════════════════════════
+trendStr = trend > 0 ? "BULLISH" : trend < 0 ? "BEARISH" : "RANGE / UNSET"
+trendCol = trend > 0 ? colBull : trend < 0 ? colBear : color.gray
+plStr = na(pl1) ? "—" : pl1T + " " + str.tostring(pl1, format.mintick) + (na(pl1Dist) ? "" : "  " + str.tostring(pl1Dist, "#.##") + "×ATR")
+plCol = atLevel ? #ffb300 : color.silver
+nSw = swpP.size()
+swLast = nSw == 0 ? "—" : (swpDir.get(nSw - 1) > 0 ? "▲ " : "▼ ") + swpTag.get(nSw - 1) + "  " + str.tostring(math.round(swpQ.get(nSw - 1) * 100)) + "% disp" + (swpQ.get(nSw - 1) >= dispQualMin ? " ✓" : "")
+swCol = nSw == 0 ? color.gray : swpQ.get(nSw - 1) < dispQualMin ? color.gray : (swpDir.get(nSw - 1) > 0 ? colBull : colBear)
+f_ar(int t) => t > 0 ? "▲" : t < 0 ? "▼" : "•"
+mtfStr = "W" + f_ar(wTr) + " D" + f_ar(dTr) + " 4H" + f_ar(h4Tr) + " → " + (mtfBias > 0 ? "BULL" : mtfBias < 0 ? "BEAR" : "NEUT")
+mtfCol = mtfBias > 0 ? colBull : mtfBias < 0 ? colBear : color.gray
+pdStr  = (inDiscount ? "Discount" : "Premium") + " " + str.tostring(math.round(pdPct * 100)) + "%"
+pdCol  = inDiscount ? colBull : colBear
+setupStr = not entOn ? "off" : stState == 0 ? "IDLE — waiting for sweep" : stState == 1 ? (stDir > 0 ? "▲ SWEPT " : "▼ SWEPT ") + stTag + " — awaiting confirm" : (stDir > 0 ? "▲ LONG ACTIVE @ " : "▼ SHORT ACTIVE @ ") + str.tostring(stEntry, format.mintick)
+setupCol = stState == 0 ? color.gray : stState == 1 ? #ffb300 : (stDir > 0 ? colBull : colBear)
+var table hud = table.new(position.top_right, 2, 16, bgcolor = color.new(#0a1a3a, 10), border_width = 1, border_color = color.new(color.gray, 60))
+if barstate.islast
+    table.cell(hud, 0, 0, "STRUCT HASH", text_color = color.white, text_size = size.normal)
+    table.cell(hud, 1, 0, str.tostring(dbHash), text_color = #00e676, text_size = size.normal)
+    table.cell(hud, 0, 1, "Structure trend", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 1, trendStr, text_color = trendCol, text_size = size.normal)
+    table.cell(hud, 0, 15, "SETUP", text_color = color.white, text_size = size.small)
+    table.cell(hud, 1, 15, setupStr, text_color = setupCol, text_size = size.normal)
+    table.cell(hud, 0, 2, "MTF bias (3·2·1)", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 2, mtfStr, text_color = mtfCol, text_size = size.small)
+    table.cell(hud, 0, 3, "Market phase", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 3, f_phaseName(phaseCode), text_color = phaseFav ? #00e676 : color.silver, text_size = size.small)
+    table.cell(hud, 0, 4, "Premium/Discount", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 4, pdStr, text_color = pdCol, text_size = size.small)
+    table.cell(hud, 0, 5, "Trend strength", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 5, str.tostring(math.round(trendStrength * 100)) + "%" + (trendStrength >= trendMin ? "" : " weak"), text_color = trendStrength >= trendMin ? color.silver : #ff9800, text_size = size.small)
+    table.cell(hud, 0, 6, "Volatility", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 6, volOK ? "OK" : "TOO LOW (no setups)", text_color = volOK ? color.silver : #ff1744, text_size = size.small)
+    table.cell(hud, 0, 7, "Key level", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 7, plStr, text_color = plCol, text_size = size.normal)
+    table.cell(hud, 0, 8, "AT LEVEL", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 8, na(pl1) ? "—" : atLevel ? "YES ✓" : "approaching", text_color = atLevel ? #ffb300 : color.silver, text_size = size.small)
+    table.cell(hud, 0, 9, "Last sweep", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 9, swLast, text_color = swCol, text_size = size.small)
+    table.cell(hud, 0, 10, "HH/HL/LH/LL", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 10, str.tostring(cHH) + "/" + str.tostring(cHL) + "/" + str.tostring(cLH) + "/" + str.tostring(cLL), text_color = color.silver, text_size = size.small)
+    table.cell(hud, 0, 11, "External / total", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 11, str.tostring(cExt) + " / " + str.tostring(sP.size()), text_color = color.silver, text_size = size.small)
+    table.cell(hud, 0, 12, "Breaks (BOS/CH/MSS)", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 12, str.tostring(eLv.size()), text_color = color.silver, text_size = size.small)
+    table.cell(hud, 0, 13, "Replay A/B/C", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 13, str.tostring(rA) + "/" + (na(rB) ? "—" : str.tostring(rB)) + "/" + (na(rC) ? "—" : str.tostring(rC)), text_color = color.silver, text_size = size.small)
+    table.cell(hud, 0, 14, "Freeze test", text_color = color.gray, text_size = size.small)
+    table.cell(hud, 1, 14, na(rC) ? "need 1000+ bars" : replayPass ? "PASS ✓" : "FAIL ✗", text_color = na(rC) ? color.gray : replayPass ? #00e676 : #ff1744, text_size = size.normal)

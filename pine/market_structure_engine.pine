@@ -1,0 +1,345 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+// INSTITUTIONAL MARKET STRUCTURE ENGINE — Module 2 (STANDALONE)
+//
+//  A dedicated market-structure STATE MACHINE. It consumes PRICE ONLY (never the
+//  S/R engine) and does NOT draw support/resistance. Its job is to detect and
+//  maintain structure, then expose a clean machine-readable contract that every
+//  downstream module (Liquidity, Order Blocks, Execution, Cortex) can consume.
+//
+//  Built as cooperating SUB-ENGINES feeding one "structure brain":
+//    1. SWING EXTRACTION      — confirmed fractal pivots, two tiers (internal/external)
+//    2. HIERARCHY             — HH / HL / LH / LL classification per tier
+//    3. TREND + EVENTS        — protected-swing state machine → BOS / CHoCH / MSS
+//    4. PROTECTED / STRONG-WEAK — the swing that must hold; strong vs weak points
+//    5. CONFIDENCE SCORING    — swing strength + structure confidence (0..1 / 0..100)
+//    6. MTF RECONCILIATION    — external trend on W / D / 4H (non-repaint cascade)
+//  → BRAIN consolidates: Trend · Internal/External · Phase (Impulse/Pullback) ·
+//    Protected levels · Events · Confidence · MTF alignment.
+//
+//  DETERMINISTIC + NON-REPAINTING: pivots confirm N bars back (fractal), breaks
+//  confirm on CLOSE only (barstate.isconfirmed), MTF via f_*Prev()[1] + lookahead_on
+//  (last CLOSED HTF bar). No MA / oscillator anywhere — pure structure.
+// ═══════════════════════════════════════════════════════════════════════════
+indicator("Market Structure Engine [Module 2]", shorttitle="MS-Engine", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=200, max_bars_back=5000)
+
+// ── INPUTS ───────────────────────────────────────────────────────────────────
+gS = "Structure tiers"
+iLen     = input.int(5,  "Internal swing size (pivot L/R)",  minval=2, maxval=50, group=gS, tooltip="Short pivot = INTERNAL structure (the near-term legs inside the larger swing).")
+xLen     = input.int(25, "External swing size (pivot L/R)",  minval=3, maxval=100, group=gS, tooltip="Long pivot = EXTERNAL / swing structure (the levels that define the real trend). BOS/CHoCH on this tier = MSS.")
+useClose = input.bool(false, "Confirm swings on CLOSE (off = wick)", group=gS, tooltip="Wick = swings sit at the real high/low where liquidity rests (institutional default). The BREAK is always confirmed on close either way.")
+
+gE = "Events"
+showInternal = input.bool(true,  "Show INTERNAL BOS / CHoCH",  group=gE)
+showExternal = input.bool(true,  "Show EXTERNAL BOS / MSS",    group=gE)
+showSwings   = input.bool(true,  "Show HH / HL / LH / LL (external)", group=gE)
+showISwings  = input.bool(false, "Show internal swings (faint)", group=gE)
+showProt     = input.bool(true,  "Show protected high / low",   group=gE)
+
+gCf = "Confidence scoring"
+atrLen   = input.int(14, "ATR length (swing-strength normalization)", minval=2, maxval=100, group=gCf)
+strDisp  = input.float(2.0, "ATR displacement for full swing strength", minval=0.3, maxval=10.0, step=0.1, group=gCf, tooltip="A break whose close clears the broken level by this many ATRs scores swing strength = 1.0.")
+erLen    = input.int(20, "Efficiency-ratio lookback (structure cleanliness)", minval=5, maxval=200, group=gCf)
+wAlign   = input.float(0.40, "Weight: internal/external alignment", minval=0.0, maxval=1.0, step=0.05, group=gCf)
+wEff     = input.float(0.35, "Weight: move efficiency (clean vs choppy)", minval=0.0, maxval=1.0, step=0.05, group=gCf)
+wStr     = input.float(0.25, "Weight: last swing strength", minval=0.0, maxval=1.0, step=0.05, group=gCf)
+
+gM = "Multi-timeframe reconciliation"
+showMTF  = input.bool(true, "Reconcile W / D / 4H structure", group=gM)
+mtfLen   = input.int(15, "MTF swing size (per HTF)", minval=3, maxval=100, group=gM, tooltip="Pivot L/R used inside each HTF context for the MTF external-trend read.")
+
+gV = "Panel / colors"
+showPanel = input.bool(true, "Show structure panel", group=gV)
+panelPos  = input.string("Bottom Right", "Panel position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=gV)
+lblSize   = input.string("Small", "Label size", options=["Tiny", "Small", "Normal"], group=gV)
+colBull   = input.color(#26a69a, "Bullish", group=gV)
+colBear   = input.color(#ef5350, "Bearish", group=gV)
+colBOS    = input.color(#787b86, "BOS", group=gV)
+colCHoCH  = input.color(#ffd24a, "CHoCH (internal)", group=gV)
+colMSS    = input.color(#c07cff, "MSS (external)", group=gV)
+colProt   = input.color(#5b9cf6, "Protected level", group=gV)
+
+f_lsize(s) => s == "Tiny" ? size.tiny : s == "Normal" ? size.normal : size.small
+f_tpos(s)  => s == "Top Left" ? position.top_left : s == "Bottom Right" ? position.bottom_right : s == "Bottom Left" ? position.bottom_left : position.top_right
+
+srcH = useClose ? close : high
+srcL = useClose ? close : low
+atr  = ta.atr(atrLen)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SHARED PRIMITIVE — protected-swing trend machine (reused for MTF, validated)
+//   Returns the EXTERNAL trend (1 bull / -1 bear / 0 none) using the same rule as
+//   the on-chart external tier: a break (close) of the protected reference is a
+//   CONTINUATION (with trend) or a FLIP (against trend); trend follows the flip.
+// ═══════════════════════════════════════════════════════════════════════════
+f_dir(int L) =>
+    _ph = ta.pivothigh(srcH, L, L)
+    _pl = ta.pivotlow(srcL, L, L)
+    var float _up = na          // protected high (break up = bull event)
+    var float _dn = na          // protected low  (break dn = bear event)
+    var float _lastH = na
+    var float _lastL = na
+    var int   _d = 0
+    if not na(_ph)
+        _lastH := _ph
+        if na(_up)
+            _up := _ph
+    if not na(_pl)
+        _lastL := _pl
+        if na(_dn)
+            _dn := _pl
+    if not na(_up) and close > _up
+        _d := 1
+        _dn := _lastL
+        _up := na
+    if not na(_dn) and close < _dn
+        _d := -1
+        _up := _lastH
+        _dn := na
+    _d
+f_dirPrev(int L) =>
+    _x = f_dir(L)
+    _x[1]
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SUB-ENGINE 1+2+3 — INTERNAL tier: swing extraction · hierarchy · events
+// ═══════════════════════════════════════════════════════════════════════════
+phI = ta.pivothigh(srcH, iLen, iLen)
+plI = ta.pivotlow(srcL, iLen, iLen)
+var float iPrevH = na
+var float iPrevL = na
+var float iLastH = na
+var float iLastL = na
+var float iUp = na
+var float iDn = na
+var int   dirI = 0
+if not na(phI)
+    isHHi = na(iPrevH) or phI > iPrevH
+    if showISwings
+        label.new(bar_index - iLen, phI, isHHi ? "h" : "l", xloc=xloc.bar_index, style=label.style_label_down, color=color.new(color.gray, 40), textcolor=color.white, size=size.tiny)
+    iPrevH := phI
+    iLastH := phI
+    if na(iUp)
+        iUp := phI
+if not na(plI)
+    if showISwings
+        label.new(bar_index - iLen, plI, (na(iPrevL) or plI < iPrevL) ? "l" : "h", xloc=xloc.bar_index, style=label.style_label_up, color=color.new(color.gray, 40), textcolor=color.white, size=size.tiny)
+    iPrevL := plI
+    iLastL := plI
+    if na(iDn)
+        iDn := plI
+bosI  = false
+chochI = false
+if barstate.isconfirmed and not na(iUp) and close > iUp
+    chochI := dirI == -1
+    bosI   := dirI != -1
+    dirI := 1
+    iDn := iLastL
+    iUp := na
+if barstate.isconfirmed and not na(iDn) and close < iDn
+    chochI := dirI == 1
+    bosI   := dirI != 1
+    dirI := -1
+    iUp := iLastH
+    iDn := na
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SUB-ENGINE 1+2+3 — EXTERNAL tier: swing extraction · hierarchy · events (MSS)
+// ═══════════════════════════════════════════════════════════════════════════
+phX = ta.pivothigh(srcH, xLen, xLen)
+plX = ta.pivotlow(srcL, xLen, xLen)
+var float xPrevH = na
+var float xPrevL = na
+var float xLastH = na
+var int   xLastHb = na
+var float xLastL = na
+var int   xLastLb = na
+var float xUp = na
+var int   xUpb = na
+var float xDn = na
+var int   xDnb = na
+var int   dirX = 0
+// hierarchy outputs
+var float lastHH = na
+var float lastHL = na
+var float lastLH = na
+var float lastLL = na
+
+if not na(phX)
+    isHH = na(xPrevH) or phX > xPrevH
+    if isHH
+        lastHH := phX
+    else
+        lastLH := phX
+    if showSwings
+        label.new(bar_index - xLen, phX, isHH ? "HH" : "LH", xloc=xloc.bar_index, style=label.style_label_down, color=isHH ? color.new(colBull, 30) : color.new(colBear, 30), textcolor=color.white, size=f_lsize(lblSize))
+    xPrevH := phX
+    xLastH := phX
+    xLastHb := bar_index - xLen
+    if na(xUp)
+        xUp := phX
+        xUpb := bar_index - xLen
+if not na(plX)
+    isLL = na(xPrevL) or plX < xPrevL
+    if isLL
+        lastLL := plX
+    else
+        lastHL := plX
+    if showSwings
+        label.new(bar_index - xLen, plX, isLL ? "LL" : "HL", xloc=xloc.bar_index, style=label.style_label_up, color=isLL ? color.new(colBear, 30) : color.new(colBull, 30), textcolor=color.white, size=f_lsize(lblSize))
+    xPrevL := plX
+    xLastL := plX
+    xLastLb := bar_index - xLen
+    if na(xDn)
+        xDn := plX
+        xDnb := bar_index - xLen
+
+// external break machine → BOS (continuation) / MSS (flip = change of external character)
+bosX = false
+mss  = false
+var float lastStrength = na
+var float protHigh = na
+var float protLow  = na
+if barstate.isconfirmed and not na(xUp) and close > xUp
+    mss  := dirX == -1
+    bosX := dirX != -1
+    ev = mss ? "MSS" : "BOS"
+    lastStrength := math.min(1.0, math.abs(close - xUp) / (atr * strDisp))
+    if showExternal
+        line.new(xUpb, xUp, bar_index, xUp, xloc=xloc.bar_index, color=mss ? colMSS : colBOS, width=mss ? 2 : 1, style=line.style_dashed)
+        label.new(bar_index, xUp, ev, xloc=xloc.bar_index, style=label.style_label_down, color=mss ? color.new(colMSS, 10) : color.new(colBOS, 20), textcolor=color.white, size=f_lsize(lblSize))
+    dirX := 1
+    protLow  := xLastL
+    protHigh := na
+    xDn := xLastL
+    xDnb := xLastLb
+    xUp := na
+if barstate.isconfirmed and not na(xDn) and close < xDn
+    mss  := dirX == 1
+    bosX := dirX != 1
+    ev = mss ? "MSS" : "BOS"
+    lastStrength := math.min(1.0, math.abs(close - xDn) / (atr * strDisp))
+    if showExternal
+        line.new(xDnb, xDn, bar_index, xDn, xloc=xloc.bar_index, color=mss ? colMSS : colBOS, width=mss ? 2 : 1, style=line.style_dashed)
+        label.new(bar_index, xDn, ev, xloc=xloc.bar_index, style=label.style_label_up, color=mss ? color.new(colMSS, 10) : color.new(colBOS, 20), textcolor=color.white, size=f_lsize(lblSize))
+    dirX := -1
+    protHigh := xLastH
+    protLow  := na
+    xUp := xLastH
+    xUpb := xLastHb
+    xDn := na
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SUB-ENGINE 4 — PROTECTED / STRONG-WEAK
+//   Strong (protected) point = the swing that must hold to keep the trend:
+//     bull → protected LOW (strong low) · bear → protected HIGH (strong high).
+//   Weak point = the opposing latest external swing (the liquidity likely taken).
+// ═══════════════════════════════════════════════════════════════════════════
+weakHigh = dirX == 1 ? xLastH : na     // in a bull trend the swing high is weak (target)
+weakLow  = dirX == -1 ? xLastL : na
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SUB-ENGINE 5 — CONFIDENCE SCORING
+// ═══════════════════════════════════════════════════════════════════════════
+er = math.sum(math.abs(ta.change(close)), erLen) == 0 ? 0.0 : math.abs(close - close[erLen]) / math.sum(math.abs(ta.change(close)), erLen)
+align = dirX != 0 and dirI == dirX ? 1.0 : dirX != 0 ? 0.4 : 0.0
+strengthNow = na(lastStrength) ? 0.0 : lastStrength
+wSum = wAlign + wEff + wStr
+confidence = wSum == 0 ? 0.0 : 100.0 * (wAlign * align + wEff * er + wStr * strengthNow) / wSum
+swingStrength = strengthNow
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SUB-ENGINE 6 — MTF RECONCILIATION (non-repaint external trend per HTF)
+// ═══════════════════════════════════════════════════════════════════════════
+mtfW = showMTF ? request.security(syminfo.tickerid, "W",   f_dirPrev(mtfLen), lookahead=barmerge.lookahead_on) : 0
+mtfD = showMTF ? request.security(syminfo.tickerid, "D",   f_dirPrev(mtfLen), lookahead=barmerge.lookahead_on) : 0
+mtf4 = showMTF ? request.security(syminfo.tickerid, "240", f_dirPrev(mtfLen), lookahead=barmerge.lookahead_on) : 0
+mtfAligned = dirX != 0 and mtfW == dirX and mtfD == dirX and mtf4 == dirX
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STRUCTURE BRAIN — consolidated state
+// ═══════════════════════════════════════════════════════════════════════════
+trendTxt = dirX == 1 ? "BULLISH" : dirX == -1 ? "BEARISH" : "RANGE"
+// phase: internal aligned with external = IMPULSE · internal against external = PULLBACK
+phase = dirX == 0 ? 0 : dirI == dirX ? 1 : 2
+phaseTxt = phase == 1 ? "IMPULSE" : phase == 2 ? "PULLBACK" : "—"
+
+// ── protected-level lines (structure, NOT S/R) ──
+var line protHiLn = na
+var line protLoLn = na
+if barstate.islast and showProt
+    if not na(protHiLn)
+        line.delete(protHiLn)
+    if not na(protLoLn)
+        line.delete(protLoLn)
+    ph0 = dirX == -1 ? protHigh : na
+    pl0 = dirX == 1 ? protLow : na
+    if not na(ph0)
+        protHiLn := line.new(bar_index - 50, ph0, bar_index + 10, ph0, xloc=xloc.bar_index, color=colProt, width=1, style=line.style_dotted)
+        label.new(bar_index + 10, ph0, " protected high", xloc=xloc.bar_index, style=label.style_label_left, color=color.new(colProt, 20), textcolor=color.white, size=f_lsize(lblSize))
+    if not na(pl0)
+        protLoLn := line.new(bar_index - 50, pl0, bar_index + 10, pl0, xloc=xloc.bar_index, color=colProt, width=1, style=line.style_dotted)
+        label.new(bar_index + 10, pl0, " protected low", xloc=xloc.bar_index, style=label.style_label_left, color=color.new(colProt, 20), textcolor=color.white, size=f_lsize(lblSize))
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PUBLISH — clean machine-readable API (data window) for downstream modules
+// ═══════════════════════════════════════════════════════════════════════════
+plot(dirX,          "ms.trend",          display=display.data_window)
+plot(dirI,          "ms.trendInternal",  display=display.data_window)
+plot(phase,         "ms.phase",          display=display.data_window)
+plot(lastHH,        "ms.lastHH",         display=display.data_window)
+plot(lastHL,        "ms.lastHL",         display=display.data_window)
+plot(lastLH,        "ms.lastLH",         display=display.data_window)
+plot(lastLL,        "ms.lastLL",         display=display.data_window)
+plot(protHigh,      "ms.protectedHigh",  display=display.data_window)
+plot(protLow,       "ms.protectedLow",   display=display.data_window)
+plot(bosX ? 1 : 0,  "ms.bosExternal",    display=display.data_window)
+plot(bosI ? 1 : 0,  "ms.bosInternal",    display=display.data_window)
+plot(chochI ? 1 : 0,"ms.choch",          display=display.data_window)
+plot(mss ? 1 : 0,   "ms.mss",            display=display.data_window)
+plot(swingStrength, "ms.swingStrength",  display=display.data_window)
+plot(confidence,    "ms.confidence",     display=display.data_window)
+plot(mtfW,          "ms.mtfW",           display=display.data_window)
+plot(mtfD,          "ms.mtfD",           display=display.data_window)
+plot(mtf4,          "ms.mtf4",           display=display.data_window)
+plot(mtfAligned ? 1 : 0, "ms.mtfAligned", display=display.data_window)
+
+alertcondition(bosX,   "External BOS", "MS-Engine: EXTERNAL Break of Structure (trend continuation)")
+alertcondition(bosI,   "Internal BOS", "MS-Engine: INTERNAL Break of Structure")
+alertcondition(chochI, "CHoCH",        "MS-Engine: internal Change of Character")
+alertcondition(mss,    "MSS",          "MS-Engine: Market Structure Shift (external character change)")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PANEL — the structure brain, one glance
+// ═══════════════════════════════════════════════════════════════════════════
+f_dTxt(int d) => d == 1 ? "BULL" : d == -1 ? "BEAR" : "—"
+f_dCol(int d) => d == 1 ? colBull : d == -1 ? colBear : color.new(color.gray, 30)
+var table pt = table.new(f_tpos(panelPos), 2, 11, border_width=1)
+if showPanel and barstate.islast
+    tCol = dirX == 1 ? colBull : dirX == -1 ? colBear : color.new(color.gray, 15)
+    hdr = color.new(color.black, 10)
+    row = color.new(color.black, 40)
+    lastEvTxt = mss ? "MSS" : bosX ? "BOS ext" : chochI ? "CHoCH" : bosI ? "BOS int" : "—"
+    table.cell(pt, 0, 0, "TREND",       text_color=color.white, bgcolor=hdr, text_size=size.small)
+    table.cell(pt, 1, 0, trendTxt,      text_color=color.white, bgcolor=tCol, text_size=size.small)
+    table.cell(pt, 0, 1, "PHASE",       text_color=color.white, bgcolor=row, text_size=size.small)
+    table.cell(pt, 1, 1, phaseTxt,      text_color=color.white, bgcolor=row, text_size=size.small)
+    table.cell(pt, 0, 2, "INTERNAL",    text_color=color.white, bgcolor=row, text_size=size.small)
+    table.cell(pt, 1, 2, f_dTxt(dirI),  text_color=color.white, bgcolor=f_dCol(dirI), text_size=size.small)
+    table.cell(pt, 0, 3, "Last HH",     text_color=color.white, bgcolor=row, text_size=size.small)
+    table.cell(pt, 1, 3, na(lastHH) ? "—" : str.tostring(lastHH, format.mintick), text_color=color.white, bgcolor=row, text_size=size.small)
+    table.cell(pt, 0, 4, "Last HL",     text_color=color.white, bgcolor=row, text_size=size.small)
+    table.cell(pt, 1, 4, na(lastHL) ? "—" : str.tostring(lastHL, format.mintick), text_color=color.white, bgcolor=row, text_size=size.small)
+    table.cell(pt, 0, 5, "Protected Lo",text_color=color.white, bgcolor=row, text_size=size.small)
+    table.cell(pt, 1, 5, na(protLow) ? "—" : str.tostring(protLow, format.mintick), text_color=color.white, bgcolor=row, text_size=size.small)
+    table.cell(pt, 0, 6, "Protected Hi",text_color=color.white, bgcolor=row, text_size=size.small)
+    table.cell(pt, 1, 6, na(protHigh) ? "—" : str.tostring(protHigh, format.mintick), text_color=color.white, bgcolor=row, text_size=size.small)
+    table.cell(pt, 0, 7, "Last event",  text_color=color.white, bgcolor=row, text_size=size.small)
+    table.cell(pt, 1, 7, lastEvTxt,     text_color=color.white, bgcolor=lastEvTxt == "MSS" ? color.new(colMSS, 10) : lastEvTxt == "CHoCH" ? color.new(colCHoCH, 10) : row, text_size=size.small)
+    table.cell(pt, 0, 8, "Swing str",   text_color=color.white, bgcolor=row, text_size=size.small)
+    table.cell(pt, 1, 8, str.tostring(swingStrength, "#.00"), text_color=color.white, bgcolor=row, text_size=size.small)
+    table.cell(pt, 0, 9, "Confidence",  text_color=color.white, bgcolor=row, text_size=size.small)
+    table.cell(pt, 1, 9, str.tostring(confidence, "#") + "%", text_color=color.white, bgcolor=row, text_size=size.small)
+    mtfTxt = showMTF ? f_dTxt(mtfW) + " / " + f_dTxt(mtfD) + " / " + f_dTxt(mtf4) : "off"
+    table.cell(pt, 0, 10, "MTF W/D/4H", text_color=color.white, bgcolor=row, text_size=size.small, tooltip="External-structure trend on each HTF (non-repaint). Aligned = all agree with chart trend.")
+    table.cell(pt, 1, 10, mtfTxt,       text_color=color.white, bgcolor=mtfAligned ? tCol : row, text_size=size.small, tooltip="External-structure trend on each HTF (non-repaint). Aligned = all agree with chart trend.")
