@@ -1,0 +1,1031 @@
+//@version=6
+indicator("SWINGTECH V6", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500, max_bars_back=500)
+
+// ============================================================================
+// SWINGTECH V5 = V4 engine (untouched) + confluence layer
+//   V4 core: structure labels, BOS-defined leg, fib, FVG boxes
+//   Added:   liquidity sweep, fixed-range volume profile (POC) on the leg,
+//            daily HTF bias, full checklist
+// ============================================================================
+
+// ---------------- INPUTS ----------------
+gS = "Structure"
+pivLen     = input.int(4, "Swing strength", minval=1, group=gS, tooltip="Bars each side that define a confirmed swing.")
+showTri    = input.bool(true,  "Swing triangles", group=gS)
+showLbl    = input.bool(true,  "HH / HL / LH / LL labels", group=gS)
+eqTolATR   = input.float(0.15, "Equal high/low tolerance (× ATR)", minval=0.0, step=0.05, group=gS)
+
+gF = "Fib"
+showFib    = input.bool(true, "Show fib on latest BOS leg", group=gF)
+oteLevel   = input.float(0.71, "OTE level", minval=0.1, maxval=0.9, step=0.01, group=gF)
+fibExtend  = input.int(15, "Extend right (bars)", minval=0, maxval=200, group=gF)
+showBosLn  = input.bool(true, "Show BOS marker", group=gF)
+oteTol     = input.float(0.06, "OTE confluence tolerance (± fib ratio)", minval=0.0, maxval=0.5, step=0.01, group=gF, tooltip="How close an FVG or the POC must sit to the OTE level to count as lining up.")
+
+gV = "FVG"
+showFVG    = input.bool(true, "Show FVGs inside the leg", group=gV)
+fvgMinATR  = input.float(0.0, "Min FVG size (× ATR)", minval=0.0, step=0.1, group=gV)
+fvgWidth   = input.int(4, "FVG box width (bars)", minval=1, maxval=50, group=gV)
+// --- FVG 50% mid line (additive; nothing above is affected) ---
+showFvgMid = input.bool(true, "FVG 50% mid line", group=gV, tooltip="Draws the midpoint (50%) of each FVG inside the leg. Green when the FVG is bullish (leg up), red when bearish (leg down). Purely additive — the FVG boxes themselves are unchanged.")
+colFvgMidBull = input.color(color.new(color.green, 20), "Mid line · bullish FVG", group=gV)
+colFvgMidBear = input.color(color.new(color.red,   20), "Mid line · bearish FVG", group=gV)
+fvgMidW    = input.int(1, "Mid line width", minval=1, maxval=4, group=gV)
+fvgMidSty  = input.string("Dashed", "Mid line style", options=["Solid","Dashed","Dotted"], group=gV)
+fvgMidExt  = input.int(0, "Mid line extra length (bars)", minval=0, maxval=200, group=gV, tooltip="0 = the mid line spans exactly the FVG box width. Raise it to project the level further right. Ignored when 'extend right' is on.")
+fvgMidExtM = input.string("None", "Mid line extend", options=["None","Right","Left","Both"], group=gV, tooltip="None = the 50% line spans only the box width (plus any extra bars above). Right = runs to the chart's right edge as a live reference. Left = runs back to the left edge. Both = full-width horizontal level across the whole chart.")
+
+gL = "Liquidity Sweep"
+showLS     = input.bool(true, "Mark liquidity sweep (if present)", group=gL, tooltip="Optional. Present when the leg's origin RAIDED a prior level — took it out with the wick and closed back inside. Never required, it just adds a check.")
+lsMode     = input.string("Standing level taken", "Sweep type", options=["Standing level taken", "Wick raid (strict close-back)"], group=gL, tooltip="Standing level taken (default): the origin's wick took out a level that was still standing, and the BOS itself proves the raid failed — price reversed and broke structure. Strict: additionally requires the sweep candle to close back inside the level. Use strict only if you want fewer, harder sweeps.")
+lsPivLen   = input.int(2, "Sweep level sensitivity", minval=1, maxval=5, group=gL, tooltip="Pivot strength used ONLY to find raidable levels — deliberately lighter than the triangle strength so sweeps of small unlabeled highs/lows are caught. Nothing extra is drawn on the chart. Lower = more levels considered.")
+lsLookback = input.int(120, "Sweep lookback (bars)", minval=10, maxval=400, group=gL, tooltip="How far back to look for the level the origin raided. Raise it to catch sweeps of levels from weeks ago.")
+lsMinPen   = input.float(0.0, "Min penetration (× ATR)", minval=0.0, step=0.05, group=gL, tooltip="How far past the level the wick must reach to count. 0 = any exceedance. Raise slightly to ignore sub-tick grazes.")
+
+gP = "Volume Profile"
+vpMode     = input.string("On", "Profile", options=["On", "Off"], group=gP)
+vpBins     = input.int(35, "Profile rows", minval=10, maxval=100, group=gP)
+vpLTF      = input.timeframe("15", "Intrabar timeframe", group=gP, tooltip="Volume is spread across each intrabar's range for accurate node placement, like TradingView's own FRVP.")
+vpWidth    = input.int(18, "Max profile width (bars)", minval=5, maxval=100, group=gP)
+vpOffset   = input.int(8, "Distance right of price (bars)", minval=0, maxval=100, group=gP)
+
+gH = "HTF Bias"
+biasTf     = input.timeframe("D", "Bias timeframe", group=gH)
+htfPiv     = input.int(3, "HTF swing strength", minval=2, group=gH)
+
+gC = "Colors"
+colStruct  = input.color(color.new(color.gray, 15),   "Structure labels", group=gC)
+colFibLn   = input.color(color.new(color.gray, 10),   "Fib 0 / 1", group=gC)
+colOte     = input.color(color.new(color.yellow, 25), "OTE line", group=gC)
+colBos     = input.color(color.new(color.gray, 30),   "BOS", group=gC)
+colFvgBox  = input.color(color.new(color.gray, 80),   "FVG box", group=gC)
+colLSc     = input.color(color.new(color.red, 20),    "Liquidity sweep", group=gC)
+colVP      = input.color(color.new(color.gray, 70),   "Profile", group=gC)
+colPOC     = input.color(color.new(color.orange, 20), "POC", group=gC)
+
+gK = "Checklist"
+showChk    = input.bool(true, "Show checklist", group=gK)
+
+// ============================================================================
+// MTF FROZEN LEVELS (additive; original engine untouched)
+//   Detect BOS / LIQ / EQH / EQL on 1W, 1D, 4H via request.security and draw
+//   full-width horizontal lines at their exact prices. Because the detection
+//   runs on the fixed HTFs, the lines sit at IDENTICAL prices regardless of
+//   the chart TF you view (1H, 15m, 5m, ...). Non-repaint: lookahead_off.
+// ============================================================================
+gMT = "MTF Frozen Levels"
+mtfOn    = input.bool(true, "Enable MTF frozen levels", group=gMT)
+useTf3M  = input.bool(true, "Detect on 3M", group=gMT)
+useTfM   = input.bool(true, "Detect on 1M", group=gMT)
+useTfW   = input.bool(true, "Detect on 1W", group=gMT)
+useTf2D  = input.bool(true, "Detect on 2D", group=gMT)
+useTfD   = input.bool(true, "Detect on 1D", group=gMT)
+useTf4H  = input.bool(true, "Detect on 4H", group=gMT)
+useTf1H  = input.bool(true, "Detect on 1H", group=gMT)
+useTf30  = input.bool(true, "Detect on 30m", group=gMT)
+useTf15  = input.bool(true, "Detect on 15m", group=gMT)
+useTf5   = input.bool(true, "Detect on 5m", group=gMT)
+showBos  = input.bool(true, "Show BOS lines",        group=gMT)
+showLs   = input.bool(true, "Show LIQ (sweep) lines", group=gMT)
+showEqh  = input.bool(true, "Show EQH lines",         group=gMT)
+showEql  = input.bool(true, "Show EQL lines",         group=gMT)
+mtfShowTag    = input.bool(true, "Show source-TF tag (W / D / 4H)", group=gMT)
+mtfLineW      = input.int(1, "Line width", minval=1, maxval=4, group=gMT)
+mtfLblOff     = input.int(5, "Label offset from right edge (bars)", minval=1, maxval=30, group=gMT)
+
+// ============================================================================
+// MTF FVG MID LINES (additive) — the 50% of each timeframe's latest bullish /
+// bearish FVG, frozen at chart-invariant prices. This is the imbalance grid:
+// the gap is where price moved too fast to transact, so its midpoint is where
+// the unfilled business sits — which is why it acts as magnet then wall.
+// Colour is by FVG DIRECTION (green = bullish gap, red = bearish gap), NOT by
+// position vs price, so overhead unfilled demand still reads green.
+// ============================================================================
+gMF = "MTF FVG Mid Lines"
+mtfFvgOn  = input.bool(true, "Enable MTF FVG 50% lines", group=gMF, tooltip="Detects FVGs on every enabled source TF (1W…5m) and draws the 50% of the latest bullish and bearish gap from each. Uses the same per-TF toggles as the MTF structure lines.")
+mtfFvgBull = input.bool(true, "Show bullish FVG 50%", group=gMF)
+mtfFvgBear = input.bool(true, "Show bearish FVG 50%", group=gMF)
+mtfFvgW    = input.int(1, "Line width", minval=1, maxval=4, group=gMF)
+mtfFvgSty  = input.string("Dashed", "Line style", options=["Solid","Dashed","Dotted"], group=gMF)
+mtfFvgTag  = input.bool(true, "Show source-TF tag", group=gMF)
+mtfFvgColMode = input.string("FVG direction", "FVG line colour by", options=["FVG direction","Price position"], group=gMF, tooltip="FVG direction (default) = green for a bullish gap, red for a bearish one, fixed for the level's life — so unfilled demand overhead still reads green. Price position = red whenever the level sits ABOVE current price, green when BELOW, so the line flips the moment price crosses it. Applies to the chart-TF FVG mid lines too.")
+
+// ============================================================================
+// CONFLUENCE (additive) — when two or more source TFs mark the SAME level of
+// the same type within tolerance, that agreement is worth more than either
+// level alone. Thickens the line and merges the tags into one (e.g. 1H+15m BOS).
+// ============================================================================
+gCf = "Confluence"
+conflOn       = input.bool(true, "Highlight confluence (2+ TFs at one level)", group=gCf, tooltip="A level marked independently by several timeframes is stronger than a single-TF level. This thickens those lines and, optionally, merges their labels so you see '1H+15m BOS' instead of two stacked tags.")
+conflATR      = input.float(0.15, "Confluence tolerance (× ATR)", minval=0.01, maxval=2.0, step=0.05, group=gCf, tooltip="How close two levels must be to count as the same level. Measured in chart-TF ATR.")
+conflW        = input.int(3, "Confluence line width", minval=1, maxval=8, group=gCf)
+conflMergeLbl = input.bool(true, "Merge labels into one tag", group=gCf)
+conflUseCol   = input.bool(false, "Override colour on confluence", group=gCf)
+conflCol      = input.color(color.new(color.yellow, 0), "Confluence colour", group=gCf)
+conflCrossType = input.bool(true, "Cross-type confluence (BOS + FVG + EQH at one price)", group=gCf, tooltip="OFF = only levels of the SAME type group (BOS with BOS). ON = group by price regardless of type, so a structural break sitting on an imbalance midpoint sitting on a liquidity shelf registers as one high-authority level — which is the strongest signal the engine can produce.")
+conflShowScore = input.bool(true, "Show weighted score in tag (★)", group=gCf, tooltip="Each source TF carries a weight (3M=10 · 1M=8 · W=6 · 2D=5 · D=4 · 4H=3 · 1H=2 · 30m=1.5 · 15m=1 · 5m=0.5). The group's score is the sum, so 2D+W = 11. Lets you rank every level by how much authority actually agrees on it.")
+conflMinScore  = input.float(0.0, "Hide levels below score", minval=0.0, maxval=40.0, step=0.5, group=gCf, tooltip="0 = show everything (default). Raise it to keep only high-authority levels: e.g. 5 drops everything below Weekly weight unless it is confluent. This is the cleanest density control in the engine — it filters by MEANING rather than by timeframe.")
+
+gMTc = "MTF Colors & Labels"
+colAbovePrice = input.color(color.new(color.red,   15), "Line ABOVE current price", group=gMTc, tooltip="Red for resistance (line sitting above current price).")
+colBelowPrice = input.color(color.new(color.green, 15), "Line BELOW current price", group=gMTc, tooltip="Green for support (line sitting below current price).")
+mtfLblSize    = input.string("Tiny", "Label size", options=["Tiny","Small","Normal","Large"], group=gMTc)
+mtfLblTextCol = input.color(color.white, "Label text color", group=gMTc)
+mtfLblMatch   = input.bool(true, "Label background matches line color (red/green)", group=gMTc, tooltip="On (default): the label's background badge uses the same red/green as its line. Off: uses the custom color below.")
+mtfLblBgCol   = input.color(color.new(color.black, 25), "Custom label background (when Match is OFF)", group=gMTc)
+
+atr = ta.atr(14)
+
+// intrabar data for the profile (global scope requirement)
+ltfH = request.security_lower_tf(syminfo.tickerid, vpLTF, high)
+ltfL = request.security_lower_tf(syminfo.tickerid, vpLTF, low)
+ltfV = request.security_lower_tf(syminfo.tickerid, vpLTF, volume)
+
+// ---------------- HTF BIAS (readout only) ----------------
+f_htfBias() =>
+    float hp = ta.pivothigh(high, htfPiv, htfPiv)
+    float lp = ta.pivotlow(low, htfPiv, htfPiv)
+    var float lH = na
+    var float pH = na
+    var float lL = na
+    var float pL = na
+    var int   hc = 0
+    var int   lc = 0
+    if not na(hp)
+        pH := lH
+        lH := hp
+        hc := na(pH) ? 0 : hp > pH ? 1 : -1
+    if not na(lp)
+        pL := lL
+        lL := lp
+        lc := na(pL) ? 0 : lp > pL ? 1 : -1
+    int b = hc == 1 and lc == 1 ? 1 : hc == -1 and lc == -1 ? -1 : 0
+    b
+
+htfBias = request.security(syminfo.tickerid, biasTf, f_htfBias(), lookahead=barmerge.lookahead_off)
+
+// ---------------- MTF EVENT DETECTOR (mirror of the chart engine, callable) ----
+// Returns [bosPx, bosDir, eqhPx, eqlPx, lsPx, lsDir] — each value is set ONLY
+// on the HTF bar where that event fires, na otherwise. Same rules as the chart
+// engine below (which stays untouched); this exists so we can run it on 1W /
+// 1D / 4H via request.security and freeze the levels at chart-invariant prices.
+// Byte-perfect port of the base engine's detection (lines 111-271 of swingtech
+// original). Every branch, threshold, scan bound and break condition matches so
+// events fired on 1W / 1D / 4H via request.security are IDENTICAL to what the
+// base engine would fire if the chart were on that TF.
+f_stEvents() =>
+    float _atr = ta.atr(14)
+    float _ph  = ta.pivothigh(high, pivLen, pivLen)
+    float _pl  = ta.pivotlow(low,  pivLen, pivLen)
+
+    var float _lastPH    = na
+    var int   _lastPHbar = na
+    var float _prevPH    = na
+    var float _lastPL    = na
+    var int   _lastPLbar = na
+    var float _prevPL    = na
+    var bool  _phBroken  = false
+    var bool  _plBroken  = false
+    var float _legAnchor  = na
+    var int   _legAnchorB = na
+    var int   _legDir     = 0
+
+    // LATCHED state (mirrors the engine's var bosLevel / lsLevel / leg state).
+    // These persist across bars and are what the engine itself would draw, so
+    // the MTF lines are a mirror of engine state — not an event history.
+    var float _eqhOut = na
+    var float _eqlOut = na
+    var float _bosOut = na
+    var int   _bosDirOut = 0
+    var float _lsOut  = na
+    var int   _lsDirOut = 0
+
+    // pivot bookkeeping + EQH / EQL (same rule as base engine, incl. lastPHbar)
+    if not na(_ph)
+        _prevPH    := _lastPH
+        _lastPH    := _ph
+        _lastPHbar := bar_index - pivLen
+        _phBroken  := false
+        if not na(_prevPH) and math.abs(_ph - _prevPH) <= eqTolATR * _atr
+            _eqhOut := _ph
+    if not na(_pl)
+        _prevPL    := _lastPL
+        _lastPL    := _pl
+        _lastPLbar := bar_index - pivLen
+        _plBroken  := false
+        if not na(_prevPL) and math.abs(_pl - _prevPL) <= eqTolATR * _atr
+            _eqlOut := _pl
+
+    // BOS — anchor scan is bounded by the previous confirmed opposite pivot bar
+    // (matches base line 175 / 192: aScan = math.min(bar_index - lastPHbar, 480))
+    bool _newBos = false
+
+    if not na(_lastPL) and not _plBroken and close < _lastPL and not na(_lastPH) and not na(_lastPHbar)
+        _plBroken := true
+        _legDir   := -1
+        float _aP = _lastPH
+        int   _aB = _lastPHbar
+        int   _aScan = math.min(bar_index - _lastPHbar, 480)
+        for i = 0 to _aScan
+            if high[i] > _aP
+                _aP := high[i]
+                _aB := bar_index - i
+        _legAnchor  := _aP
+        _legAnchorB := _aB
+        _bosOut     := _lastPL
+        _bosDirOut  := -1
+        _newBos     := true
+
+    if not na(_lastPH) and not _phBroken and close > _lastPH and not na(_lastPL) and not na(_lastPLbar)
+        _phBroken := true
+        _legDir   := 1
+        float _aP = _lastPL
+        int   _aB = _lastPLbar
+        int   _aScan = math.min(bar_index - _lastPLbar, 480)
+        for i = 0 to _aScan
+            if low[i] < _aP
+                _aP := low[i]
+                _aB := bar_index - i
+        _legAnchor  := _aP
+        _legAnchorB := _aB
+        _bosOut     := _lastPH
+        _bosDirOut  := 1
+        _newBos     := true
+
+    // LS — same scan (aOff+1 .. min(aOff+lsLookback, 450)) and same accept rules.
+    // Engine resets lsLevel to na on every new BOS (line 229), so the latch only
+    // ever holds the CURRENT leg's sweep — or nothing if this leg had none.
+    if _newBos and not na(_legAnchorB)
+        _lsOut    := na
+        _lsDirOut := 0
+        int   _aOff   = math.max(0, bar_index - _legAnchorB)
+        float _aClose = close[_aOff]
+        float _runMax = na
+        float _runMin = na
+        for j = _aOff + 1 to math.min(_aOff + lsLookback, 450)
+            if na(high[j]) or j < lsPivLen
+                break
+            bool _minorHi = true
+            bool _minorLo = true
+            for w = 1 to lsPivLen
+                if na(high[j + w]) or na(high[j - w])
+                    _minorHi := false
+                    _minorLo := false
+                else
+                    if high[j] < high[j + w] or high[j] < high[j - w]
+                        _minorHi := false
+                    if low[j]  > low[j + w]  or low[j]  > low[j - w]
+                        _minorLo := false
+            if _legDir == -1 and _minorHi
+                bool _standing = na(_runMax) or high[j] > _runMax
+                bool _took     = _legAnchor > high[j] + lsMinPen * _atr
+                bool _failed   = lsMode == "Standing level taken" or _aClose < high[j]
+                if _standing and _took and _failed
+                    _lsOut    := high[j]
+                    _lsDirOut := -1
+                    break
+            else if _legDir == 1 and _minorLo
+                bool _standing = na(_runMin) or low[j] < _runMin
+                bool _took     = _legAnchor < low[j] - lsMinPen * _atr
+                bool _failed   = lsMode == "Standing level taken" or _aClose > low[j]
+                if _standing and _took and _failed
+                    _lsOut    := low[j]
+                    _lsDirOut := 1
+                    break
+            _runMax := na(_runMax) ? high[j] : math.max(_runMax, high[j])
+            _runMin := na(_runMin) ? low[j]  : math.min(_runMin, low[j])
+
+    [_bosOut, _bosDirOut, _eqhOut, _eqlOut, _lsOut, _lsDirOut]
+
+// ---------------- MTF FVG MID DETECTOR (callable, latched) ----------------
+// Same 3-candle rule and same min-gap filter the engine uses (see the FVG block
+// in the draw section): bullish gap = low > high[2], bearish = high < low[2].
+// Detects on EVERY bar of the source TF (not leg-gated) so the imbalance grid
+// is complete, and latches the most recent of each direction.
+f_fvgMids() =>
+    float _atrF = ta.atr(14)
+    var float _bullMid = na
+    var float _bearMid = na
+    if not na(high[2]) and low > high[2] and (low - high[2]) >= fvgMinATR * _atrF
+        _bullMid := math.avg(low, high[2])
+    if not na(low[2]) and high < low[2] and (low[2] - high) >= fvgMinATR * _atrF
+        _bearMid := math.avg(low[2], high)
+    [_bullMid, _bearMid]
+
+// ---------------- MTF SECURITY CALLS + FROZEN LINE RENDERER ----------------
+[bosPxW,  bosDirW,  eqhPxW,  eqlPxW,  lsPxW,  lsDirW ] = request.security(syminfo.tickerid, "W",   f_stEvents(), lookahead=barmerge.lookahead_off)
+[bosPxD,  bosDirD,  eqhPxD,  eqlPxD,  lsPxD,  lsDirD ] = request.security(syminfo.tickerid, "D",   f_stEvents(), lookahead=barmerge.lookahead_off)
+[bosPx4H, bosDir4H, eqhPx4H, eqlPx4H, lsPx4H, lsDir4H] = request.security(syminfo.tickerid, "240", f_stEvents(), lookahead=barmerge.lookahead_off)
+[bosPx1H, bosDir1H, eqhPx1H, eqlPx1H, lsPx1H, lsDir1H] = request.security(syminfo.tickerid, "60",  f_stEvents(), lookahead=barmerge.lookahead_off)
+[bosPx15, bosDir15, eqhPx15, eqlPx15, lsPx15, lsDir15] = request.security(syminfo.tickerid, "15",  f_stEvents(), lookahead=barmerge.lookahead_off)
+[bosPx2D, bosDir2D, eqhPx2D, eqlPx2D, lsPx2D, lsDir2D] = request.security(syminfo.tickerid, "2D",  f_stEvents(), lookahead=barmerge.lookahead_off)
+[bosPx30, bosDir30, eqhPx30, eqlPx30, lsPx30, lsDir30] = request.security(syminfo.tickerid, "30",  f_stEvents(), lookahead=barmerge.lookahead_off)
+[bosPx5,  bosDir5,  eqhPx5,  eqlPx5,  lsPx5,  lsDir5 ] = request.security(syminfo.tickerid, "5",   f_stEvents(), lookahead=barmerge.lookahead_off)
+[bosPx3M, bosDir3M, eqhPx3M, eqlPx3M, lsPx3M, lsDir3M] = request.security(syminfo.tickerid, "3M",  f_stEvents(), lookahead=barmerge.lookahead_off)
+[bosPxM,  bosDirM,  eqhPxM,  eqlPxM,  lsPxM,  lsDirM ] = request.security(syminfo.tickerid, "M",   f_stEvents(), lookahead=barmerge.lookahead_off)
+
+// MTF FVG 50% levels — one bullish + one bearish latch per source TF
+[fvgBullW,  fvgBearW ] = request.security(syminfo.tickerid, "W",   f_fvgMids(), lookahead=barmerge.lookahead_off)
+[fvgBull2D, fvgBear2D] = request.security(syminfo.tickerid, "2D",  f_fvgMids(), lookahead=barmerge.lookahead_off)
+[fvgBullD,  fvgBearD ] = request.security(syminfo.tickerid, "D",   f_fvgMids(), lookahead=barmerge.lookahead_off)
+[fvgBull4H, fvgBear4H] = request.security(syminfo.tickerid, "240", f_fvgMids(), lookahead=barmerge.lookahead_off)
+[fvgBull1H, fvgBear1H] = request.security(syminfo.tickerid, "60",  f_fvgMids(), lookahead=barmerge.lookahead_off)
+[fvgBull30, fvgBear30] = request.security(syminfo.tickerid, "30",  f_fvgMids(), lookahead=barmerge.lookahead_off)
+[fvgBull15, fvgBear15] = request.security(syminfo.tickerid, "15",  f_fvgMids(), lookahead=barmerge.lookahead_off)
+[fvgBull5,  fvgBear5 ] = request.security(syminfo.tickerid, "5",   f_fvgMids(), lookahead=barmerge.lookahead_off)
+[fvgBull3M, fvgBear3M] = request.security(syminfo.tickerid, "3M",  f_fvgMids(), lookahead=barmerge.lookahead_off)
+[fvgBullM,  fvgBearM ] = request.security(syminfo.tickerid, "M",   f_fvgMids(), lookahead=barmerge.lookahead_off)
+
+
+// ONE persistent slot per (source TF, event type). Each slot MIRRORS the
+// engine's latched state for that TF: when the engine's bosLevel / lsLevel /
+// EQH / EQL changes, the slot's line moves to the new price. Nothing
+// accumulates and nothing is deleted on a price cross — exactly what the
+// base engine draws on its own chart, replicated for W / D / 4H.
+type MtfSlot
+    line   ln
+    label  lb
+    float  px
+    string src
+    string typ
+
+var array<MtfSlot> mtfSlots = array.new<MtfSlot>()
+
+// color rule: red above current price, green below (re-evaluated every bar)
+f_lvlCol(float _px) =>
+    _px > close ? colAbovePrice : colBelowPrice
+
+// Authority weight per source TF — a 3M level is not the same animal as a 5m
+// one, so confluence is scored by summed weight, not by a raw count of TFs.
+f_tfWeight(string _src) =>
+    _src == "3M" ? 10.0 : _src == "1M" ? 8.0 : _src == "W" ? 6.0 : _src == "2D" ? 5.0 : _src == "D" ? 4.0 : _src == "4H" ? 3.0 : _src == "1H" ? 2.0 : _src == "30m" ? 1.5 : _src == "15m" ? 1.0 : 0.5
+
+// FVG mid-line colour: either fixed by the gap's direction, or flipped live by
+// where the level sits relative to price (so it changes the bar price crosses).
+f_fvgCol(bool _isBull, float _px) =>
+    mtfFvgColMode == "Price position" ? (_px > close ? colAbovePrice : colBelowPrice) : (_isBull ? colFvgMidBull : colFvgMidBear)
+
+// label size + background helpers driven by the "Colors & Labels" inputs
+f_lblSz(string s) =>
+    s == "Tiny" ? size.tiny : s == "Small" ? size.small : s == "Normal" ? size.normal : size.large
+
+f_lblBg(color _lineCol) =>
+    mtfLblMatch ? _lineCol : mtfLblBgCol
+
+// find a slot's index by (src, typ); -1 when absent
+f_slotIdx(string src, string typ) =>
+    int _r = -1
+    if array.size(mtfSlots) > 0
+        for i = 0 to array.size(mtfSlots) - 1
+            MtfSlot _s = array.get(mtfSlots, i)
+            if _s.src == src and _s.typ == typ
+                _r := i
+                break
+    _r
+
+// Sync one (src, typ) slot to the engine's current latched price.
+//   px na or type disabled -> slot removed
+//   px changed             -> slot's line + label move to the new price
+//   px same                -> refresh colour / label position only
+// NOTE: written as three INDEPENDENT if-statements (no if/else pairing).
+// Pine types every branch of an if/else and requires them to match; a branch
+// ending in a bare inner `if` has no value while its sibling does -> CE10235.
+// Mutually-exclusive standalone ifs sidestep that entirely.
+f_syncSlot(float px, string src, string typ, bool enabled) =>
+    int  _idx  = f_slotIdx(src, typ)
+    bool _want = enabled and not na(px)
+
+    // 1. REMOVE — disabled or engine latch went na
+    if not _want and _idx >= 0
+        MtfSlot _sd = array.get(mtfSlots, _idx)
+        line.delete(_sd.ln)
+        label.delete(_sd.lb)
+        MtfSlot _rm = array.remove(mtfSlots, _idx)
+
+    // 2. CREATE — first time this (src, typ) has a level
+    if _want and _idx < 0
+        color _cn = f_lvlCol(px)
+        line  _l  = line.new(bar_index - 1, px, bar_index, px, xloc=xloc.bar_index, extend=extend.both, color=_cn, width=mtfLineW)
+        label _b  = na
+        if mtfShowTag
+            _b := label.new(bar_index + mtfLblOff, px, src + " " + typ, xloc.bar_index, yloc.price, f_lblBg(_cn), label.style_label_left, mtfLblTextCol, f_lblSz(mtfLblSize))
+        array.push(mtfSlots, MtfSlot.new(_l, _b, px, src, typ))
+
+    // 3. UPDATE — move to the latch's current price, refresh colour/label
+    if _want and _idx >= 0
+        color   _cu = f_lvlCol(px)
+        MtfSlot _s  = array.get(mtfSlots, _idx)
+        if _s.px != px
+            line.set_y1(_s.ln, px)
+            line.set_y2(_s.ln, px)
+            _s.px := px
+        line.set_color(_s.ln, _cu)
+        line.set_width(_s.ln, mtfLineW)
+        if mtfShowTag and na(_s.lb)
+            _s.lb := label.new(bar_index + mtfLblOff, px, src + " " + typ, xloc.bar_index, yloc.price, f_lblBg(_cu), label.style_label_left, mtfLblTextCol, f_lblSz(mtfLblSize))
+        if not mtfShowTag and not na(_s.lb)
+            label.delete(_s.lb)
+            _s.lb := na
+        if not na(_s.lb)
+            label.set_x(_s.lb, bar_index + mtfLblOff)
+            label.set_y(_s.lb, px)
+            label.set_color(_s.lb, f_lblBg(_cu))
+            label.set_textcolor(_s.lb, mtfLblTextCol)
+            label.set_size(_s.lb, f_lblSz(mtfLblSize))
+        array.set(mtfSlots, _idx, _s)
+
+    int _done = 0
+
+// MTF FVG slot renderer — deliberately its own function (not a change to
+// f_syncSlot) so the structure-line layer stays byte-for-byte as validated.
+// Difference: colour comes from FVG DIRECTION, not from position vs price.
+f_mtfFvgStyle() =>
+    mtfFvgSty == "Solid" ? line.style_solid : mtfFvgSty == "Dotted" ? line.style_dotted : line.style_dashed
+
+f_syncFvgSlot(float px, string src, string typ, bool enabled, bool isBull) =>
+    int  _ix   = f_slotIdx(src, typ)
+    bool _wnt  = enabled and not na(px)
+    color _cf  = f_fvgCol(isBull, px)
+
+    if not _wnt and _ix >= 0
+        MtfSlot _sd = array.get(mtfSlots, _ix)
+        line.delete(_sd.ln)
+        label.delete(_sd.lb)
+        MtfSlot _rm = array.remove(mtfSlots, _ix)
+
+    if _wnt and _ix < 0
+        line  _l = line.new(bar_index - 1, px, bar_index, px, xloc=xloc.bar_index, extend=extend.both, color=_cf, width=mtfFvgW, style=f_mtfFvgStyle())
+        label _b = na
+        if mtfFvgTag
+            _b := label.new(bar_index + mtfLblOff, px, src + " " + typ, xloc.bar_index, yloc.price, f_lblBg(_cf), label.style_label_left, mtfLblTextCol, f_lblSz(mtfLblSize))
+        array.push(mtfSlots, MtfSlot.new(_l, _b, px, src, typ))
+
+    if _wnt and _ix >= 0
+        MtfSlot _s = array.get(mtfSlots, _ix)
+        if _s.px != px
+            line.set_y1(_s.ln, px)
+            line.set_y2(_s.ln, px)
+            _s.px := px
+        line.set_color(_s.ln, _cf)
+        line.set_width(_s.ln, mtfFvgW)
+        line.set_style(_s.ln, f_mtfFvgStyle())
+        if mtfFvgTag and na(_s.lb)
+            _s.lb := label.new(bar_index + mtfLblOff, px, src + " " + typ, xloc.bar_index, yloc.price, f_lblBg(_cf), label.style_label_left, mtfLblTextCol, f_lblSz(mtfLblSize))
+        if not mtfFvgTag and not na(_s.lb)
+            label.delete(_s.lb)
+            _s.lb := na
+        if not na(_s.lb)
+            label.set_x(_s.lb, bar_index + mtfLblOff)
+            label.set_y(_s.lb, px)
+            label.set_color(_s.lb, f_lblBg(_cf))
+            label.set_textcolor(_s.lb, mtfLblTextCol)
+            label.set_size(_s.lb, f_lblSz(mtfLblSize))
+        array.set(mtfSlots, _ix, _s)
+
+    int _fdone = 0
+
+// only draw a source TF when it is at least as large as the chart TF
+int   chartSec  = timeframe.in_seconds(timeframe.period)
+bool  showW_ok  = useTfW  and timeframe.in_seconds("W")   >= chartSec
+bool  showD_ok  = useTfD  and timeframe.in_seconds("D")   >= chartSec
+bool  show4H_ok = useTf4H and timeframe.in_seconds("240") >= chartSec
+bool  show1H_ok = useTf1H and timeframe.in_seconds("60")  >= chartSec
+bool  show15_ok = useTf15 and timeframe.in_seconds("15")  >= chartSec
+bool  show2D_ok = useTf2D and timeframe.in_seconds("2D")  >= chartSec
+bool  show30_ok = useTf30 and timeframe.in_seconds("30")  >= chartSec
+bool  show5_ok  = useTf5  and timeframe.in_seconds("5")   >= chartSec
+bool  show3M_ok = useTf3M and timeframe.in_seconds("3M")  >= chartSec
+bool  showM_ok  = useTfM  and timeframe.in_seconds("M")   >= chartSec
+
+// mirror engine state every bar: max 12 lines (3 TFs x 4 types), never more
+if mtfOn
+    f_syncSlot(bosPxW,  "W",  "BOS", showW_ok  and showBos)
+    f_syncSlot(lsPxW,   "W",  "LS",  showW_ok  and showLs)
+    f_syncSlot(eqhPxW,  "W",  "EQH", showW_ok  and showEqh)
+    f_syncSlot(eqlPxW,  "W",  "EQL", showW_ok  and showEql)
+    f_syncSlot(bosPxD,  "D",  "BOS", showD_ok  and showBos)
+    f_syncSlot(lsPxD,   "D",  "LS",  showD_ok  and showLs)
+    f_syncSlot(eqhPxD,  "D",  "EQH", showD_ok  and showEqh)
+    f_syncSlot(eqlPxD,  "D",  "EQL", showD_ok  and showEql)
+    f_syncSlot(bosPx4H, "4H", "BOS", show4H_ok and showBos)
+    f_syncSlot(lsPx4H,  "4H", "LS",  show4H_ok and showLs)
+    f_syncSlot(eqhPx4H, "4H", "EQH", show4H_ok and showEqh)
+    f_syncSlot(eqlPx4H, "4H", "EQL", show4H_ok and showEql)
+    f_syncSlot(bosPx1H, "1H", "BOS", show1H_ok and showBos)
+    f_syncSlot(lsPx1H,  "1H", "LS",  show1H_ok and showLs)
+    f_syncSlot(eqhPx1H, "1H", "EQH", show1H_ok and showEqh)
+    f_syncSlot(eqlPx1H, "1H", "EQL", show1H_ok and showEql)
+    f_syncSlot(bosPx15, "15m", "BOS", show15_ok and showBos)
+    f_syncSlot(lsPx15,  "15m", "LS",  show15_ok and showLs)
+    f_syncSlot(eqhPx15, "15m", "EQH", show15_ok and showEqh)
+    f_syncSlot(eqlPx15, "15m", "EQL", show15_ok and showEql)
+    f_syncSlot(bosPx2D, "2D", "BOS", show2D_ok and showBos)
+    f_syncSlot(lsPx2D,  "2D", "LS",  show2D_ok and showLs)
+    f_syncSlot(eqhPx2D, "2D", "EQH", show2D_ok and showEqh)
+    f_syncSlot(eqlPx2D, "2D", "EQL", show2D_ok and showEql)
+    f_syncSlot(bosPx30, "30m", "BOS", show30_ok and showBos)
+    f_syncSlot(lsPx30,  "30m", "LS",  show30_ok and showLs)
+    f_syncSlot(eqhPx30, "30m", "EQH", show30_ok and showEqh)
+    f_syncSlot(eqlPx30, "30m", "EQL", show30_ok and showEql)
+    f_syncSlot(bosPx5,  "5m", "BOS", show5_ok and showBos)
+    f_syncSlot(lsPx5,   "5m", "LS",  show5_ok and showLs)
+    f_syncSlot(eqhPx5,  "5m", "EQH", show5_ok and showEqh)
+    f_syncSlot(eqlPx5,  "5m", "EQL", show5_ok and showEql)
+    f_syncSlot(bosPx3M, "3M", "BOS", show3M_ok and showBos)
+    f_syncSlot(lsPx3M,  "3M", "LS",  show3M_ok and showLs)
+    f_syncSlot(eqhPx3M, "3M", "EQH", show3M_ok and showEqh)
+    f_syncSlot(eqlPx3M, "3M", "EQL", show3M_ok and showEql)
+    f_syncSlot(bosPxM,  "1M", "BOS", showM_ok and showBos)
+    f_syncSlot(lsPxM,   "1M", "LS",  showM_ok and showLs)
+    f_syncSlot(eqhPxM,  "1M", "EQH", showM_ok and showEqh)
+    f_syncSlot(eqlPxM,  "1M", "EQL", showM_ok and showEql)
+
+// MTF FVG 50% grid — the imbalance levels, frozen across chart TFs
+if mtfFvgOn
+    f_syncFvgSlot(fvgBullW,  "W",   "FVG+", showW_ok  and mtfFvgBull, true)
+    f_syncFvgSlot(fvgBearW,  "W",   "FVG-", showW_ok  and mtfFvgBear, false)
+    f_syncFvgSlot(fvgBull2D, "2D",  "FVG+", show2D_ok and mtfFvgBull, true)
+    f_syncFvgSlot(fvgBear2D, "2D",  "FVG-", show2D_ok and mtfFvgBear, false)
+    f_syncFvgSlot(fvgBullD,  "D",   "FVG+", showD_ok  and mtfFvgBull, true)
+    f_syncFvgSlot(fvgBearD,  "D",   "FVG-", showD_ok  and mtfFvgBear, false)
+    f_syncFvgSlot(fvgBull4H, "4H",  "FVG+", show4H_ok and mtfFvgBull, true)
+    f_syncFvgSlot(fvgBear4H, "4H",  "FVG-", show4H_ok and mtfFvgBear, false)
+    f_syncFvgSlot(fvgBull1H, "1H",  "FVG+", show1H_ok and mtfFvgBull, true)
+    f_syncFvgSlot(fvgBear1H, "1H",  "FVG-", show1H_ok and mtfFvgBear, false)
+    f_syncFvgSlot(fvgBull30, "30m", "FVG+", show30_ok and mtfFvgBull, true)
+    f_syncFvgSlot(fvgBear30, "30m", "FVG-", show30_ok and mtfFvgBear, false)
+    f_syncFvgSlot(fvgBull15, "15m", "FVG+", show15_ok and mtfFvgBull, true)
+    f_syncFvgSlot(fvgBear15, "15m", "FVG-", show15_ok and mtfFvgBear, false)
+    f_syncFvgSlot(fvgBull5,  "5m",  "FVG+", show5_ok  and mtfFvgBull, true)
+    f_syncFvgSlot(fvgBear5,  "5m",  "FVG-", show5_ok  and mtfFvgBear, false)
+    f_syncFvgSlot(fvgBull3M, "3M",  "FVG+", show3M_ok and mtfFvgBull, true)
+    f_syncFvgSlot(fvgBear3M, "3M",  "FVG-", show3M_ok and mtfFvgBear, false)
+    f_syncFvgSlot(fvgBullM,  "1M",  "FVG+", showM_ok  and mtfFvgBull, true)
+    f_syncFvgSlot(fvgBearM,  "1M",  "FVG-", showM_ok  and mtfFvgBear, false)
+
+// ---------------- CONFLUENCE PASS ----------------
+// Runs AFTER every slot has synced, so it decorates the finished set. Only on
+// the last bar: these lines extend both ways, so only their current appearance
+// matters, and this keeps the O(n²) scan off every historical bar.
+// A group = same event type, prices within tolerance, different source TFs.
+// The lowest-index member is "primary" and carries the merged tag; the rest
+// give up their label so one clean tag replaces a stack of them.
+if conflOn and barstate.islast and array.size(mtfSlots) > 0
+    float _ctol = conflATR * atr
+    for i = 0 to array.size(mtfSlots) - 1
+        MtfSlot _a = array.get(mtfSlots, i)
+        string  _tags     = _a.src
+        int     _n        = 1
+        bool    _primary  = true
+        bool    _sameType = true
+        float   _score    = f_tfWeight(_a.src)
+        for j = 0 to array.size(mtfSlots) - 1
+            if j != i
+                MtfSlot _b = array.get(mtfSlots, j)
+                bool _typeOk = conflCrossType or _b.typ == _a.typ
+                if _typeOk and math.abs(_b.px - _a.px) <= _ctol
+                    _n     += 1
+                    _score += f_tfWeight(_b.src)
+                    if _b.typ != _a.typ
+                        _sameType := false
+                    if j < i
+                        _primary := false
+                    if j > i
+                        _tags := _tags + "+" + _b.src
+        // decorate genuine groups (2+ members)
+        if _n > 1
+            line.set_width(_a.ln, conflW)
+            if conflUseCol
+                line.set_color(_a.ln, conflCol)
+            if conflMergeLbl and not na(_a.lb) and _primary
+                string _base = _sameType ? _tags + " " + _a.typ : _tags + " MULTI"
+                label.set_text(_a.lb, conflShowScore ? _base + " ★" + str.tostring(_score, "#.#") : _base)
+            if conflMergeLbl and not na(_a.lb) and not _primary
+                label.delete(_a.lb)
+                _a.lb := na
+                array.set(mtfSlots, i, _a)
+        // lone levels: still score them, so the filter below can rank everything
+        if _n == 1 and conflShowScore and not na(_a.lb)
+            label.set_text(_a.lb, _a.src + " " + _a.typ + " ★" + str.tostring(_score, "#.#"))
+        // authority filter — hide anything the market does not sufficiently agree on.
+        // Line is made transparent rather than deleted so the slot stays intact
+        // and the next bar's sync does not have to rebuild it.
+        if conflMinScore > 0 and _score < conflMinScore
+            line.set_color(_a.ln, color.new(color.white, 100))
+            if not na(_a.lb)
+                label.delete(_a.lb)
+                _a.lb := na
+                array.set(mtfSlots, i, _a)
+
+
+// ---------------- CONFIRMED SWINGS (V4 core) ----------------
+ph = ta.pivothigh(high, pivLen, pivLen)
+pl = ta.pivotlow(low,  pivLen, pivLen)
+
+plotshape(showTri and not na(ph), "Swing High", shape.triangledown, location.abovebar, color.new(color.gray, 25), size=size.tiny, offset=-pivLen)
+plotshape(showTri and not na(pl), "Swing Low",  shape.triangleup,   location.belowbar, color.new(color.gray, 25), size=size.tiny, offset=-pivLen)
+
+var float lastPH    = na
+var int   lastPHbar = na
+var float prevPH    = na
+var int   prevPHbar = na
+var float lastPL    = na
+var int   lastPLbar = na
+var float prevPL    = na
+var int   prevPLbar = na
+var bool  phBroken  = false
+var bool  plBroken  = false
+var int   lastHiCls = 0
+var int   lastLoCls = 0
+
+if not na(ph)
+    prevPH    := lastPH
+    prevPHbar := lastPHbar
+    lastPH    := ph
+    lastPHbar := bar_index - pivLen
+    phBroken  := false
+    string t = "H"
+    if not na(prevPH)
+        if math.abs(ph - prevPH) <= eqTolATR * atr
+            t := "EQH"
+            lastHiCls := 0
+        else if ph > prevPH
+            t := "HH"
+            lastHiCls := 1
+        else
+            t := "LH"
+            lastHiCls := -1
+    if showLbl
+        label.new(lastPHbar, ph, t, xloc.bar_index, yloc.abovebar, color.new(color.black, 100), label.style_label_down, colStruct, size.tiny)
+
+if not na(pl)
+    prevPL    := lastPL
+    prevPLbar := lastPLbar
+    lastPL    := pl
+    lastPLbar := bar_index - pivLen
+    plBroken  := false
+    string t = "L"
+    if not na(prevPL)
+        if math.abs(pl - prevPL) <= eqTolATR * atr
+            t := "EQL"
+            lastLoCls := 0
+        else if pl < prevPL
+            t := "LL"
+            lastLoCls := -1
+        else
+            t := "HL"
+            lastLoCls := 1
+    if showLbl
+        label.new(lastPLbar, pl, t, xloc.bar_index, yloc.belowbar, color.new(color.black, 100), label.style_label_up, colStruct, size.tiny)
+
+// ---------------- BOS -> DEFINES THE LEG (V4 core, untouched) ----------------
+var int   legDir     = 0
+var float legAnchor  = na
+var int   legAnchorB = na
+var float legExt     = na
+var int   legExtB    = na
+var float bosLevel   = na
+var int   bosLevelB  = na
+var int   bosBreakB  = na
+var float lsLevel    = na
+var int   lsLevelB   = na
+
+bool newBos = false
+
+if not na(lastPL) and not plBroken and close < lastPL and not na(lastPH)
+    plBroken   := true
+    legDir     := -1
+    // Anchor = the true extreme between the last CONFIRMED swing high and the
+    // break bar. A high made after that pivot confirmed but before the BOS
+    // fired hasn't itself confirmed yet, so lastPH alone would anchor stale.
+    // Bounded window: the anchor can only move FORWARD to a more recent
+    // extreme, never back into older structure.
+    float aP = lastPH
+    int   aB = lastPHbar
+    int   aScan = math.min(bar_index - lastPHbar, 480)
+    for i = 0 to aScan
+        if high[i] > aP
+            aP := high[i]
+            aB := bar_index - i
+    legAnchor  := aP
+    legAnchorB := aB
+    bosLevel   := lastPL
+    bosLevelB  := lastPLbar
+    bosBreakB  := bar_index
+    newBos     := true
+
+if not na(lastPH) and not phBroken and close > lastPH and not na(lastPL)
+    phBroken   := true
+    legDir     := 1
+    float aP = lastPL
+    int   aB = lastPLbar
+    int   aScan = math.min(bar_index - lastPLbar, 480)
+    for i = 0 to aScan
+        if low[i] < aP
+            aP := low[i]
+            aB := bar_index - i
+    legAnchor  := aP
+    legAnchorB := aB
+    bosLevel   := lastPH
+    bosLevelB  := lastPHbar
+    bosBreakB  := bar_index
+    newBos     := true
+
+if newBos
+    int span = math.min(bar_index - legAnchorB, 480)
+    if legDir == -1
+        legExt  := low
+        legExtB := bar_index
+        for i = 0 to span
+            if low[i] < legExt
+                legExt  := low[i]
+                legExtB := bar_index - i
+    else
+        legExt  := high
+        legExtB := bar_index
+        for i = 0 to span
+            if high[i] > legExt
+                legExt  := high[i]
+                legExtB := bar_index - i
+
+    // ---- LIQUIDITY SWEEP (optional) ----
+    // Detection is DECOUPLED from the triangle system. Triangles stay sparse
+    // (pivLen) so the structure read stays clean, but sweeps are hunted against
+    // lighter "minor levels" (lsPivLen) — small highs/lows that never earned a
+    // label but still held liquidity. Nothing extra is drawn for them.
+    // A sweep = the origin's WICK exceeded such a level and price CLOSED back
+    // inside it (closes break, wicks sweep). First qualifying level walking
+    // BACK wins (most recent), search is bounded, so the marking can't wander.
+    lsLevel  := na
+    lsLevelB := na
+    if showLS
+        int   aOff   = math.max(0, bar_index - legAnchorB)
+        float aClose = close[aOff]
+        // runMax/runMin track the extreme of everything BETWEEN the candidate
+        // level and the origin. A level only counts if it was still STANDING
+        // when the origin raided it — if intervening price already traded
+        // through it, that liquidity was consumed and the level is dead.
+        float runMax = na
+        float runMin = na
+        for j = aOff + 1 to math.min(aOff + lsLookback, 450)
+            if na(high[j]) or j < lsPivLen
+                break
+            bool minorHi = true
+            bool minorLo = true
+            for w = 1 to lsPivLen
+                if na(high[j + w]) or na(high[j - w])
+                    minorHi := false
+                    minorLo := false
+                else
+                    if high[j] < high[j + w] or high[j] < high[j - w]
+                        minorHi := false
+                    if low[j] > low[j + w] or low[j] > low[j - w]
+                        minorLo := false
+            if legDir == -1 and minorHi
+                bool standing = na(runMax) or high[j] > runMax
+                bool took     = legAnchor > high[j] + lsMinPen * atr
+                bool failed   = lsMode == "Standing level taken" or aClose < high[j]
+                if standing and took and failed
+                    lsLevel  := high[j]
+                    lsLevelB := bar_index - j
+                    break
+            else if legDir == 1 and minorLo
+                bool standing = na(runMin) or low[j] < runMin
+                bool took     = legAnchor < low[j] - lsMinPen * atr
+                bool failed   = lsMode == "Standing level taken" or aClose > low[j]
+                if standing and took and failed
+                    lsLevel  := low[j]
+                    lsLevelB := bar_index - j
+                    break
+            runMax := na(runMax) ? high[j] : math.max(runMax, high[j])
+            runMin := na(runMin) ? low[j]  : math.min(runMin, low[j])
+
+if not newBos and legDir == -1 and not na(legExt) and low < legExt
+    legExt  := low
+    legExtB := bar_index
+if not newBos and legDir == 1 and not na(legExt) and high > legExt
+    legExt  := high
+    legExtB := bar_index
+
+// ---------------- DRAW ----------------
+var line  fl1   = na
+var line  fl0   = na
+var line  flOte = na
+var label lb1   = na
+var label lb0   = na
+var label lbOte = na
+var line  bosLn = na
+var label bosLb = na
+var line  lsLn  = na
+var label lsLb  = na
+var line  pocLn = na
+var array<box>   fvgB = array.new<box>()
+var array<label> fvgL = array.new<label>()
+// FVG 50% mid lines (additive)
+var array<line>  fvgMid = array.new<line>()
+f_fvgMidStyle() =>
+    fvgMidSty == "Solid" ? line.style_solid : fvgMidSty == "Dotted" ? line.style_dotted : line.style_dashed
+f_fvgMidExtend() =>
+    fvgMidExtM == "Right" ? extend.right : fvgMidExtM == "Left" ? extend.left : fvgMidExtM == "Both" ? extend.both : extend.none
+var array<box>   vpB  = array.new<box>()
+
+// confluence results computed during draw, used by the checklist
+bool fvgAtOte = false
+var bool  pocAtOte = false
+var float pocRatio = na
+// The volume profile is expensive (leg bars × intrabars × bins). barstate.islast
+// is true on EVERY realtime tick, so recomputing it per tick grows with the leg
+// until it trips Pine's execution limit. Rebuild once per bar instead.
+var int lastVpBar = na
+bool vpRebuild = na(lastVpBar) or lastVpBar != bar_index
+
+if barstate.islast
+    line.delete(fl1)
+    line.delete(fl0)
+    line.delete(flOte)
+    label.delete(lb1)
+    label.delete(lb0)
+    label.delete(lbOte)
+    line.delete(bosLn)
+    label.delete(bosLb)
+    line.delete(lsLn)
+    label.delete(lsLb)
+    while array.size(fvgB) > 0
+        box.delete(array.pop(fvgB))
+    while array.size(fvgL) > 0
+        label.delete(array.pop(fvgL))
+    while array.size(fvgMid) > 0
+        line.delete(array.pop(fvgMid))
+
+    if legDir != 0 and not na(legAnchor) and not na(legExt)
+        int   xEnd = bar_index + fibExtend
+        float ote  = legExt + oteLevel * (legAnchor - legExt)
+        float oteA = legExt + (oteLevel - oteTol) * (legAnchor - legExt)
+        float oteB = legExt + (oteLevel + oteTol) * (legAnchor - legExt)
+        float zHi  = math.max(oteA, oteB)
+        float zLo  = math.min(oteA, oteB)
+
+        if showFib
+            fl1   := line.new(legAnchorB, legAnchor, xEnd, legAnchor, xloc.bar_index, color=colFibLn, width=1)
+            fl0   := line.new(legAnchorB, legExt,    xEnd, legExt,    xloc.bar_index, color=colFibLn, width=1)
+            flOte := line.new(legAnchorB, ote,       xEnd, ote,       xloc.bar_index, color=colOte,   width=1)
+            lb1   := label.new(xEnd, legAnchor, "1", xloc.bar_index, yloc.price, color.new(color.black, 100), label.style_label_left, colFibLn, size.small)
+            lb0   := label.new(xEnd, legExt,    "0", xloc.bar_index, yloc.price, color.new(color.black, 100), label.style_label_left, colFibLn, size.small)
+            lbOte := label.new(xEnd, ote, str.tostring(oteLevel), xloc.bar_index, yloc.price, color.new(color.black, 100), label.style_label_left, colOte, size.small)
+
+        if showBosLn and not na(bosLevel)
+            bosLn := line.new(bosLevelB, bosLevel, bosBreakB, bosLevel, xloc.bar_index, color=colBos, width=1)
+            bosLb := label.new(math.round(math.avg(bosLevelB, bosBreakB)), bosLevel, "BOS", xloc.bar_index, yloc.price, color.new(color.black, 100), legDir == -1 ? label.style_label_up : label.style_label_down, colBos, size.tiny)
+
+        // liquidity sweep (only when present)
+        if showLS and not na(lsLevel)
+            lsLn := line.new(lsLevelB, lsLevel, legAnchorB, lsLevel, xloc.bar_index, color=colLSc, width=1)
+            lsLb := label.new(math.round(math.avg(lsLevelB, legAnchorB)), lsLevel, "LS", xloc.bar_index, yloc.price, color.new(color.black, 100), legDir == -1 ? label.style_label_down : label.style_label_up, colLSc, size.tiny)
+
+        // FVGs inside the leg + OTE confluence test
+        int span = math.min(bar_index - legAnchorB, 400)
+        if span >= 2
+            for i = 0 to span - 2
+                if na(high[i + 2])
+                    break
+                float t = na
+                float b = na
+                if legDir == 1 and low[i] > high[i + 2] and (low[i] - high[i + 2]) >= fvgMinATR * atr
+                    t := low[i]
+                    b := high[i + 2]
+                else if legDir == -1 and high[i] < low[i + 2] and (low[i + 2] - high[i]) >= fvgMinATR * atr
+                    t := low[i + 2]
+                    b := high[i]
+                if not na(t)
+                    if b <= zHi and t >= zLo
+                        fvgAtOte := true
+                    if showFVG
+                        int bx = bar_index - i - 1
+                        array.push(fvgB, box.new(bx, t, bx + fvgWidth, b, xloc=xloc.bar_index, border_color=color.new(colFvgBox, 60), border_width=1, bgcolor=colFvgBox))
+                        array.push(fvgL, label.new(bx + fvgWidth, math.avg(t, b), "FVG", xloc.bar_index, yloc.price, color.new(color.black, 100), label.style_label_left, color.new(color.gray, 30), size.tiny))
+                    // FVG 50% mid line — legDir 1 = bullish FVG (green), -1 = bearish (red)
+                    if showFvgMid
+                        int   bxm = bar_index - i - 1
+                        float fmid = math.avg(t, b)
+                        array.push(fvgMid, line.new(bxm, fmid, bxm + fvgWidth + fvgMidExt, fmid, xloc=xloc.bar_index, extend=f_fvgMidExtend(), color=f_fvgCol(legDir == 1, fmid), width=fvgMidW, style=f_fvgMidStyle()))
+
+        // ---- FIXED RANGE VOLUME PROFILE over the leg ----
+        // Rebuilt once per bar, not per tick (see vpRebuild above).
+        if vpMode == "On" and span >= 3 and vpRebuild
+            lastVpBar := bar_index
+            line.delete(pocLn)
+            while array.size(vpB) > 0
+                box.delete(array.pop(vpB))
+            float minL = math.min(legAnchor, legExt)
+            float maxH = math.max(legAnchor, legExt)
+            for j = 0 to span
+                minL := math.min(minL, low[j])
+                maxH := math.max(maxH, high[j])
+            float binH = (maxH - minL) / vpBins
+            if binH > 0
+                array<float> vols = array.new<float>(vpBins, 0.0)
+                for j = 0 to span
+                    array<float> aH = ltfH[j]
+                    array<float> aL = ltfL[j]
+                    array<float> aV = ltfV[j]
+                    bool usedIntra = false
+                    if not na(aH) and array.size(aH) > 0 and array.size(aH) == array.size(aL) and array.size(aH) == array.size(aV)
+                        usedIntra := true
+                        for q = 0 to array.size(aH) - 1
+                            float ih = array.get(aH, q)
+                            float il = array.get(aL, q)
+                            float iv = nz(array.get(aV, q))
+                            if iv > 0 and not na(ih) and not na(il)
+                                float irng = ih - il
+                                if irng <= 0
+                                    int bi = math.min(vpBins - 1, math.max(0, int(math.floor((il - minL) / binH))))
+                                    array.set(vols, bi, array.get(vols, bi) + iv)
+                                else
+                                    int b0 = math.min(vpBins - 1, math.max(0, int(math.floor((il - minL) / binH))))
+                                    int b1 = math.min(vpBins - 1, math.max(0, int(math.floor((ih - minL) / binH))))
+                                    for b = b0 to b1
+                                        float lo = minL + b * binH
+                                        float hi = lo + binH
+                                        float ov = math.min(ih, hi) - math.max(il, lo)
+                                        if ov > 0
+                                            array.set(vols, b, array.get(vols, b) + iv * ov / irng)
+                    if not usedIntra
+                        float bl = low[j]
+                        float bh = high[j]
+                        float v  = nz(volume[j])
+                        float rg = bh - bl
+                        if v > 0
+                            if rg <= 0
+                                int bi = math.min(vpBins - 1, math.max(0, int(math.floor((bl - minL) / binH))))
+                                array.set(vols, bi, array.get(vols, bi) + v)
+                            else
+                                int b0 = math.min(vpBins - 1, math.max(0, int(math.floor((bl - minL) / binH))))
+                                int b1 = math.min(vpBins - 1, math.max(0, int(math.floor((bh - minL) / binH))))
+                                for b = b0 to b1
+                                    float lo = minL + b * binH
+                                    float hi = lo + binH
+                                    float ov = math.min(bh, hi) - math.max(bl, lo)
+                                    if ov > 0
+                                        array.set(vols, b, array.get(vols, b) + v * ov / rg)
+
+                float maxV = 0.0
+                int   maxI = -1
+                for b = 0 to vpBins - 1
+                    if array.get(vols, b) > maxV
+                        maxV := array.get(vols, b)
+                        maxI := b
+
+                if maxI >= 0 and maxV > 0
+                    float poc = minL + (maxI + 0.5) * binH
+                    pocRatio := (poc - legExt) / (legAnchor - legExt)
+                    pocAtOte := math.abs(pocRatio - oteLevel) <= oteTol
+                    int anchorR = bar_index + vpOffset + vpWidth
+                    for b = 0 to vpBins - 1
+                        float bv = array.get(vols, b)
+                        if bv > 0
+                            int w = math.max(1, math.round(vpWidth * bv / maxV))
+                            float lo = minL + b * binH
+                            array.push(vpB, box.new(anchorR - w, lo + binH, anchorR, lo, xloc=xloc.bar_index, border_color=color.new(colVP, 100), bgcolor=b == maxI ? color.new(colPOC, 45) : colVP))
+                    pocLn := line.new(legAnchorB, poc, anchorR, poc, xloc.bar_index, color=colPOC, style=line.style_dashed, width=1)
+
+// ---------------- CHECKLIST ----------------
+int structBias = lastHiCls == 1 and lastLoCls == 1 ? 1 : lastHiCls == -1 and lastLoCls == -1 ? -1 : 0
+
+var table t = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 25), border_width=1, border_color=color.new(color.gray, 70))
+if barstate.islast and showChk
+    color on  = color.new(color.lime, 0)
+    color off = color.new(color.gray, 45)
+    color txc = color.new(color.white, 10)
+
+    bool hasLeg   = legDir != 0
+    bool htfOk    = hasLeg and htfBias != 0 and ((legDir == 1) == (htfBias == 1))
+    bool bosFvgOk = hasLeg and fvgAtOte
+    bool lsOk     = hasLeg and not na(lsLevel)
+
+    int score = (htfOk ? 1 : 0) + (hasLeg ? 1 : 0) + (fvgAtOte ? 1 : 0) + (lsOk ? 1 : 0) + (pocAtOte ? 1 : 0)
+
+    string sTxt = structBias == 1 ? "BULLISH" : structBias == -1 ? "BEARISH" : "CONSOLIDATION"
+    color  sCol = structBias == 1 ? on : structBias == -1 ? color.new(color.red, 0) : color.new(color.orange, 0)
+    string hTxt = htfBias == 1 ? "BULL" : htfBias == -1 ? "BEAR" : "—"
+
+    table.cell(t, 0, 0, "SETUP", text_color=txc, text_size=size.small, text_halign=text.align_left)
+    table.cell(t, 1, 0, str.tostring(score) + "/5", text_color=score >= 4 ? on : txc, text_size=size.small)
+
+    table.cell(t, 0, 1, "Structure", text_color=txc, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(t, 1, 1, sTxt, text_color=sCol, text_size=size.tiny)
+
+    table.cell(t, 0, 2, "HTF " + biasTf + " aligned", text_color=txc, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(t, 1, 2, hTxt + " " + (htfOk ? "✓" : "—"), text_color=htfOk ? on : off, text_size=size.tiny)
+
+    table.cell(t, 0, 3, "BOS + FVG", text_color=txc, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(t, 1, 3, hasLeg ? "✓" : "—", text_color=hasLeg ? on : off, text_size=size.tiny)
+
+    table.cell(t, 0, 4, str.tostring(oteLevel) + " + FVG", text_color=txc, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(t, 1, 4, fvgAtOte ? "✓" : "—", text_color=fvgAtOte ? on : off, text_size=size.tiny)
+
+    table.cell(t, 0, 5, "Liquidity sweep", text_color=txc, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(t, 1, 5, lsOk ? "✓" : "—", text_color=lsOk ? on : off, text_size=size.tiny)
+
+    table.cell(t, 0, 6, "POC @ " + str.tostring(oteLevel), text_color=txc, text_size=size.tiny, text_halign=text.align_left)
+    string pTxt = na(pocRatio) ? "—" : (pocAtOte ? "✓" : "—") + " (" + str.tostring(pocRatio, "#.##") + ")"
+    table.cell(t, 1, 6, pTxt, text_color=pocAtOte ? on : off, text_size=size.tiny)
